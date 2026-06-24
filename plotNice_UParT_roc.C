@@ -9,15 +9,15 @@ void plotNice_UParT_roc(){
 
   auto *fin = new TFile("btag_roc_qcd.root");
 
-  auto *g1b = (TGraph*) fin->Get("roc_1b");
-  auto *g2b = (TGraph*) fin->Get("roc_2b");
-  auto *g2bsv = (TGraph*) fin->Get("roc_2b2sv");
-  auto *gAll = (TGraph*) fin->Get("roc_all");
+  auto *g1b = (TGraph*) fin->Get("roc_1b_r3");
+  auto *g2b = (TGraph*) fin->Get("roc_2b_r3");
+  auto *g2bsv = (TGraph*) fin->Get("roc_2b2sv_r3");
+  auto *gAll = (TGraph*) fin->Get("roc_all_r3");
   
 
   auto hFrame = new TH1F ("hFrame","hFrame",1,0.0,1);
   hFrame->GetXaxis()->SetRangeUser(0.,1.);
-  hFrame->GetYaxis()->SetRangeUser(0.00005,1.);
+  hFrame->GetYaxis()->SetRangeUser(0.00004,1.);
 
   TCanvas *c=new TCanvas("c","c",600,600);
   c->SetGridx();
@@ -68,10 +68,15 @@ void plotNice_UParT_roc(){
   latex2.SetTextSize(0.04);
   latex2.DrawLatex(0.025, 0.5,"100 < p_{T,jet} < 120 GeV, |#eta_{jet}| < 2");
 
-
+  // hard-code sig. eff. and eff. mistag rate
+  TMarker *wp = new TMarker(0.560412,0.000250118, 24);
+  wp->SetMarkerSize(1.5);
+  wp->SetMarkerColor(1);
+  wp->Draw("same");
+  
 
   
-  TLegend* leg = new TLegend(0.2, 0.55, 0.45, 0.8);
+  TLegend* leg = new TLegend(0.2, 0.5, 0.45, 0.8);
   leg->SetBorderSize(0); leg->SetFillStyle(0);
   leg->SetTextFont(42);
   leg->SetTextSize(0.04);
@@ -80,6 +85,7 @@ void plotNice_UParT_roc(){
   leg->AddEntry(g1b,   "1B", "l");
   leg->AddEntry(g2b,   "#geq2B", "l");
   leg->AddEntry(g2bsv,   "#geq2B + 2SV", "l");
+  leg->AddEntry(wp,"Analysis working point","p");
   leg->Draw();
 
 

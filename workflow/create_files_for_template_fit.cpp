@@ -11,7 +11,6 @@
 #include "TString.h"
 #include "TStyle.h"
 
-
 //To create templates
 #include <TGraph.h>
 #include <TFile.h>
@@ -36,6 +35,7 @@
 #include "TMatrixD.h"
 #include "central_selections.h"
 #include "tracking_efficiency_syst.h"
+#include "sv_sf.h"         // SV b scale factor vs aggregate pT, applied per SV (MC only)
 #include "observables.h"   // the measured observables (dr, B) and the axis abstraction
 
 // ============================================================================
@@ -107,6 +107,61 @@ inline void print()
 
 } // namespace EecWeight
 
+// ============================================================================
+// Jet energy corrections (added 2026-10-01)
+// ============================================================================
+// The 2024 pp-reference JEC, exactly as in Matt's JEC_Prompt24HIpp productions (the top-level
+// eec_2b_analysis/create_files_for_template_fit.cpp): rho-dependent L1FastJet + MC-truth
+// L2Relative on MC and data, plus the dijet L2Residual on data only, applied to rawpt. The
+// corrected pT REPLACES t.jtpt right after each event is read, so the jet-pT cut, the pT
+// bins, the response and every histogram see corrected jets; gen jets are untouched.
+//
+// Default OFF, so a caller that never mentions it reproduces the uncorrected productions
+// bit for bit. Switched on by the last argument of create_files_for_template_fit(); the run
+// scripts insist the OUT_TAG then says "jec" (eraTag() in result_paths.h), so corrected and
+// uncorrected files can never share a name.
+//
+// Text files: the Run3HeavyIonJetCalibrations git submodule at the repo top, pinned commit
+// c64293a (fetched 2026-10-01 with `git submodule update --init`).
+#include "../Run3HeavyIonJetCalibrations/include/JetCorrector.h"
+#include "TLeaf.h"     // the event rho is read through its leaf
+#include <stdexcept>
+namespace Jec {
+
+inline bool &enabled()
+{
+    static bool on = false;
+    return on;
+}
+
+inline void enable(bool on) { enabled() = on; }
+
+inline TString dir()
+{
+    return "/home/llr/cms/zaidan/analysis_lise/eec_2b_analysis/Run3HeavyIonJetCalibrations/txt/2024ppRef/";
+}
+
+// The correction levels for this sample, in the order they are applied.
+inline std::vector<std::string> files(bool isMC)
+{
+    std::vector<std::string> f = {
+        (dir() + "Prompt24HIpp_V1_MC_L1FastJet_AK4PF.txt").Data(),
+        (dir() + "Prompt24HIpp_V2_MC_L2Relative_AK4PF.txt").Data() };
+    if (!isMC) f.push_back((dir() + "Prompt24HIpp_V1_DATA_L2Residual_AK4PF.txt").Data());
+    return f;
+}
+
+inline void print(bool isMC)
+{
+    if (!enabled()) {
+        std::cout << "JEC: OFF -- jtpt as stored in the forest" << std::endl;
+        return;
+    }
+    std::cout << "JEC: ON -- jtpt recomputed from rawpt with:" << std::endl;
+    for (const std::string &s : files(isMC)) std::cout << "   " << s << std::endl;
+}
+
+} // namespace Jec
 
 // RooUnfold comes from the private build; setup_roounfold_env.sh puts it on the paths.
 
@@ -134,16 +189,13 @@ TString kinLabel(const AnalysisConfig& cfg) {
   return Form("_%g_%g_%d", cfg.kin.ptLow, jtpt_max, jtpt_binsVectorSize - 1);
 }
 
-
 struct Vertex {
     ROOT::Math::PtEtaPhiMVector p4;
     std::vector<ROOT::Math::PtEtaPhiMVector> tracks;
-    std::vector<int> trkMatchSta;
-  std::vector<int> trkSvtxId;
+    std::vector<int> trkMatchSta, trkSvtxId;
 };
 
-
-//given two vectors, computes deltaR squared 
+//given two vectors, computes deltaR squared
 auto deltaR2 = [](const ROOT::Math::PtEtaPhiMVector &a,
                   const ROOT::Math::PtEtaPhiMVector &b) {
     double dEta = a.Eta() - b.Eta();
@@ -151,6 +203,24 @@ auto deltaR2 = [](const ROOT::Math::PtEtaPhiMVector &a,
     return dEta*dEta + dPhi*dPhi;
 };
 
+// Mass of a charged particle from its |PDG id|; -1 for an id not in the list.
+inline double pdgMass(int pid) {
+  switch (pid) {
+    case 211:  return 0.139570; case 13:   return 0.105658; case 11:   return 0.000510;
+    case 2212: return 0.938272; case 321:  return 0.493677; case 3112: return 1.19744;
+    case 3222: return 1.18937;  case 3312: return 1.32171;  case 3334: return 1.67245;
+    default:   return -1.;
+  }
+}
+
+// Four-vector of reco track itrk; an id not in pdgMass() gets the pion mass (safety).
+inline ROOT::Math::PtEtaPhiMVector recoTrackP4(tTree& t, Int_t itrk) {
+  ROOT::Math::PtEtaPhiMVector v1;
+  v1.SetEta(t.trkEta[itrk]); v1.SetPt(t.trkPt[itrk]); v1.SetPhi(t.trkPhi[itrk]);
+  const double m = pdgMass(std::abs(t.trkPdgId[itrk]));
+  v1.SetM(m >= 0. ? m : 0.139570);
+  return v1;
+}
 
 // ---- disabled (kept for reference): printvtx, SV-merging debug printout ----
 #if 0
@@ -167,49 +237,40 @@ void printvtx (const Vertex& vertex,
 bool skipMC_event(double jtpt, double pthat) { // -- Since it is applied all the time, at event level, keep it general please.
   return (pthat < 0.40 * jtpt);}
 
-bool skipMC_gen(double refpt) {// Indeed, this is just a saftey check like refpt > 0 
+bool skipMC_gen(double refpt) {// Indeed, this is just a saftey check like refpt > 0
   return !(refpt > 0);}
-                                                                                                                         
+
 void PartialBsAggregation(std::vector<ROOT::Math::PtEtaPhiMVector>& hadrons_4vec, std::vector<Int_t>& hadrons_stat, tTree& t, Int_t ijet){
   // Only using gen level info
   // Add tacks of status >= 100 to make Bs.
   hadrons_4vec.clear();
-  hadrons_stat.clear();         
+  hadrons_stat.clear();
   for (Int_t itrk = 0; itrk < t.nrefTrk; itrk++) {
     // Track must belong to this jet
     if (t.refTrkJetId[itrk] != ijet) continue;
     // pT cut
-    if (t.refTrkPt[itrk] < 1) continue;    // Assign mass                                                                                                                  
-    double mass = 0.0;                                                                                                               
-    int pid = std::abs(t.refTrkPdgId[itrk]);
-    if      (pid == 211)  mass = 0.139570;                                                                                           
-    else if (pid == 13)   mass = 0.105658;                                                                                           
-    else if (pid == 11)   mass = 0.000510;                                                                                           
-    else if (pid == 2212) mass = 0.938272;                                                                                           
-    else if (pid == 321)  mass = 0.493677;                                                                                           
-    else if (pid == 3112) mass = 1.19744;                                                                                            
-    else if (pid == 3222) mass = 1.18937;                                                                                           
-    else if (pid == 3312) mass = 1.32171;                                                                                            
-    else if (pid == 3334) mass = 1.67245;                                                                                            
-    else std::cout << "PDG:" << pid << std::endl;
-    // 4 vector                                                                                                                      
+    if (t.refTrkPt[itrk] < 1) continue;
+    // Assign mass
+    const int pid = std::abs(t.refTrkPdgId[itrk]);
+    double mass = pdgMass(pid);
+    if (mass < 0.) { std::cout << "PDG:" << pid << std::endl; mass = 0.0; }
+    // 4 vector
     ROOT::Math::PtEtaPhiMVector v(t.refTrkPt [itrk], t.refTrkEta[itrk], t.refTrkPhi[itrk], mass);
-    
-    Int_t status = t.refTrkSta[itrk];                                                                                                
-    if (status < 100) continue;                                                                                                     
+
+    Int_t status = t.refTrkSta[itrk];
+    if (status < 100) continue;
     else {
       auto it = std::find(hadrons_stat.begin(), hadrons_stat.end(), status);
-      if (it == hadrons_stat.end()) {                                                                                                
+      if (it == hadrons_stat.end()) {
         hadrons_stat.push_back(status);
-	      hadrons_4vec.push_back(v);                                                                                                   
-      }                                                                                                                              
-      else {                                                                                                                         
-        size_t index = std::distance(hadrons_stat.begin(), it);                                                                      
+	      hadrons_4vec.push_back(v);
+      }
+      else {
+        size_t index = std::distance(hadrons_stat.begin(), it);
         hadrons_4vec[index] += v;}
-    }                                                                                                                                
-  }                                                                                                                                  
+    }
+  }
 }
-
 
 // ⚠️ UNCALLED since 2026-09-22: its only caller was the fnb/fb/lnfb gen block, which is
 // commented out with the rest of the fraction observables. Left compiled rather than
@@ -237,7 +298,7 @@ double genNonBTrackPt(tTree& t, Int_t ijet){
 // ---- disabled (kept for reference): MatchingTracksAggregation, unused ----
 #if 0
 void MatchingTracksAggregation(std::vector<ROOT::Math::PtEtaPhiMVector>& hadrons_4vec, std::vector<Int_t>& hadrons_stat, tTree& t, Int_t ijet, Int_t ient){
-  hadrons_4vec.clear();                                                                                                               
+  hadrons_4vec.clear();
   hadrons_stat.clear();
 
   for (Int_t itrk = 0; itrk < t.ntrk; itrk++) {       //loop over trks
@@ -247,45 +308,45 @@ void MatchingTracksAggregation(std::vector<ROOT::Math::PtEtaPhiMVector>& hadrons
     if (t.trkPt[itrk] < 1) continue;
     if (t.trkMatchSta[itrk] <100 ) continue;
     //if (t.trkSvtxId[itrk] <0 ) continue ;      //trk must be in SV
-// Assign mass                                                                                                                    
-    double mass = 0.0;                                                                                                                
+// Assign mass
+    double mass = 0.0;
     int pid = std::abs(t.trkMatchPdgId[itrk]);
-    if      (pid == 211)  mass = 0.139570;                                                                                            
-    else if (pid == 13)   mass = 0.105658;                                                                                            
-    else if (pid == 11)   mass = 0.000510;                                                                                            
-    else if (pid == 2212) mass = 0.938272;                                                                                            
-    else if (pid == 321)  mass = 0.493677;                                                                                            
-    else if (pid == 3112) mass = 1.19744;                                                                                             
-    else if (pid == 3222) mass = 1.18937;                                                                                             
-    else if (pid == 3312) mass = 1.32171;                                                                                             
-    else if (pid == 3334) mass = 1.67245;  
+    if      (pid == 211)  mass = 0.139570;
+    else if (pid == 13)   mass = 0.105658;
+    else if (pid == 11)   mass = 0.000510;
+    else if (pid == 2212) mass = 0.938272;
+    else if (pid == 321)  mass = 0.493677;
+    else if (pid == 3112) mass = 1.19744;
+    else if (pid == 3222) mass = 1.18937;
+    else if (pid == 3312) mass = 1.32171;
+    else if (pid == 3334) mass = 1.67245;
     else if (pid == 1)   continue;
-        //skip not matched                                                                                       
-    else std::cout << "PDG:" << pid << std::endl;                                                                                     
-                                                                                                                                      
-    // 4 vector                                                                                                                       
-    ROOT::Math::PtEtaPhiMVector v(t.trkPt [itrk], t.trkEta[itrk], t.trkPhi[itrk], mass);                                                                                              
-    
-    Int_t status = t.trkMatchSta[itrk];                                                                                                 
-    
-    if (status < 100) {   continue;                                                                                                            
-      // I don't aggregate, just store each particle separately                                                                       
-      //hadrons_stat.push_back(status);                                                                                                 
-      //hadrons_4vec.push_back(v);                                                                                                      
-    }                                                                                                                                 
-    else {                                                                                                                            
-      // I aggregate only if status >= 100                                                                                            
-      auto it = std::find(hadrons_stat.begin(), hadrons_stat.end(), status);      //check if status alreday exists in hadrons_stat                                                                                                           
-      if (it == hadrons_stat.end()) {                     //if not, create new hadrons                                                                             
-        hadrons_stat.push_back(status);                                                                                               
-        hadrons_4vec.push_back(v);                                                                                                    
-      }                                                                                                                               
-      else {                                                                                                                          
-        size_t index = std::distance(hadrons_stat.begin(), it);                                                                       
-        hadrons_4vec[index] += v;}                                                     //if yes, add to existing                               
-    } 
+        //skip not matched
+    else std::cout << "PDG:" << pid << std::endl;
+
+    // 4 vector
+    ROOT::Math::PtEtaPhiMVector v(t.trkPt [itrk], t.trkEta[itrk], t.trkPhi[itrk], mass);
+
+    Int_t status = t.trkMatchSta[itrk];
+
+    if (status < 100) {   continue;
+      // I don't aggregate, just store each particle separately
+      //hadrons_stat.push_back(status);
+      //hadrons_4vec.push_back(v);
+    }
+    else {
+      // I aggregate only if status >= 100
+      auto it = std::find(hadrons_stat.begin(), hadrons_stat.end(), status);      //check if status alreday exists in hadrons_stat
+      if (it == hadrons_stat.end()) {                     //if not, create new hadrons
+        hadrons_stat.push_back(status);
+        hadrons_4vec.push_back(v);
+      }
+      else {
+        size_t index = std::distance(hadrons_stat.begin(), it);
+        hadrons_4vec[index] += v;}                                                     //if yes, add to existing
+    }
   }
-  
+
 }
 #endif // ---- end disabled: MatchingTracksAggregation ----
 
@@ -318,12 +379,12 @@ void groupVertexes1(std::vector<Vertex>& vertices)
 
 	// ---- merge vertex index2 into index1 ----
 	vertices[index1].p4 += vertices[index2].p4;
-	
+
 	// merge track lists
 	auto &t1 = vertices[index1].tracks;
 	auto &t2 = vertices[index2].tracks;
 	t1.insert(t1.end(), t2.begin(), t2.end());
-	
+
 	// merge match status lists
 	auto &s1 = vertices[index1].trkMatchSta;
 	auto &s2 = vertices[index2].trkMatchSta;
@@ -334,13 +395,72 @@ void groupVertexes1(std::vector<Vertex>& vertices)
 	vertices[index1].trkSvtxId.end(),
         vertices[index2].trkSvtxId.begin(),
         vertices[index2].trkSvtxId.end());
-	
+
 	// remove merged vertex
 	vertices.erase(vertices.begin() + index2);
 
     }
 }
 
+// ---- Shared by makeSvtxs and makeSvtxs_withBDT ----
+typedef std::unordered_map<Int_t, std::vector<ROOT::Math::PtEtaPhiMVector>> SvTrackMap;
+typedef std::unordered_map<Int_t, std::vector<int>> SvStatusMap;
+
+// One Vertex per original SV id; tracks[i] <-> trkMatchSta[i] <-> trkSvtxId[i] correspond.
+// An SV whose tracks do not all come from the same B counts in sv_fail.
+std::vector<Vertex> buildVertices(SvTrackMap& secVtxs, SvStatusMap& secVtxsMatchSta, double& sv_fail) {
+    std::vector<Vertex> vertices;
+    for (auto &it : secVtxs) {           //loop over the map
+      int originalSvId = it.first;       //saves it.first = vertex ID (map key)
+      auto& v = secVtxsMatchSta[originalSvId];
+      if (std::adjacent_find(v.begin(), v.end(),std::not_equal_to<int>()) != v.end()) {      // if not all tracks in the sv come from the same B
+        sv_fail += 1.0;
+        //return empty;
+      }
+      Vertex vtx;
+      vtx.p4 = ROOT::Math::PtEtaPhiMVector();
+      vtx.tracks.reserve(it.second.size()); vtx.trkMatchSta.reserve(it.second.size()); vtx.trkSvtxId.reserve(it.second.size());
+      for (size_t i = 0; i < it.second.size(); ++i) {      //loop over tracks in this vertex (it.second)
+        vtx.p4 += it.second[i];
+        vtx.tracks.push_back(it.second[i]);
+        vtx.trkMatchSta.push_back(v[i]);  // reuse already-looked-up reference
+        vtx.trkSvtxId.push_back(originalSvId);
+      }
+      vertices.push_back(std::move(vtx));
+    }
+    return vertices;
+}
+
+// The most frequent match status among a vertex's SV tracks (the lowest on a tie) and, in
+// maxCount, how many tracks carry it. maxCount < number of tracks = a merging failure.
+int dominantStatus(const Vertex& vtx, int& maxCount) {
+    std::map<int,int> countMap;   //count nb of tracks of the same MatchSta within a reconstructed vertex
+    for (size_t i = 0; i < vtx.tracks.size(); ++i) countMap[vtx.trkMatchSta[i]]++;
+    int domSta = -1;
+    maxCount = 0;
+    for (const auto &kv : countMap)
+      if (kv.second > maxCount) { maxCount = kv.second; domSta = kv.first; }
+    return domSta;
+}
+
+// Add the particles that are not part of an SV to the nearer vertex (a tie adds to neither).
+// agg_fail counts those whose match status differs from the vertex's first SV track.
+void absorbNoSvTracks(const std::vector<ROOT::Math::PtEtaPhiMVector>& no_sv_list, const std::vector<int>& no_sv_sta_list,
+                      Vertex& vertex0, Vertex& vertex1, double& agg_fail) {
+    int i = 0;
+    for (const auto& v1 : no_sv_list) {
+      double d0 = deltaR2(v1, vertex0.p4), d1 = deltaR2(v1, vertex1.p4);
+      if (d0 < d1) {
+        vertex0.p4 += v1;
+        if (no_sv_sta_list[i] != vertex0.trkMatchSta[0]) agg_fail += 1;
+      }
+      else if (d0 > d1) {
+        vertex1.p4 += v1;
+        if (no_sv_sta_list[i] != vertex1.trkMatchSta[0]) agg_fail += 1;
+      }
+      i += 1;
+    }
+}
 
 // Track aggregation: makeSvtxs uses the status, makeSvtxs_withBDT the BDT score.
 
@@ -353,154 +473,60 @@ vector<ROOT::Math::PtEtaPhiMVector> makeSvtxs(
   double& sv_fail,
   double& merge_fail){
 
-  std::unordered_map<Int_t, std::vector<ROOT::Math::PtEtaPhiMVector>> secVtxs;
-  std::unordered_map<Int_t, std::vector<int>> secVtxsMatchSta;
-  vector<ROOT::Math::PtEtaPhiMVector> empty;
+  SvTrackMap secVtxs;
+  SvStatusMap secVtxsMatchSta;
   std::vector<ROOT::Math::PtEtaPhiMVector> no_sv_list;
   std::vector<int> no_sv_sta_list;
-  no_sv_list.reserve(t.ntrk);
-  no_sv_sta_list.reserve(t.ntrk);
+  no_sv_list.reserve(t.ntrk); no_sv_sta_list.reserve(t.ntrk);
 
     // Loop over tracks
     for (Int_t itrk = 0; itrk < t.ntrk; itrk++) {
       //cuts for tracks
         if (t.trkJetId[itrk] != ijet) continue;
         if (t.trkPt[itrk] < 1) continue;
-	if (t.trkMatchSta[itrk] <100 ) continue;
+        if (t.trkMatchSta[itrk] <100 ) continue;
         // Tracking-efficiency systematic, after the track cuts -- same convention as
         // makeSvtxs_withBDT. No-op in the nominal. See tracking_efficiency_syst.h.
         if (TrkEffSyst::dropTrack(ient, itrk)) continue;
 
-	//build v1, the 4 vec of the track
-        ROOT::Math::PtEtaPhiMVector v1;
-        v1.SetEta(t.trkEta[itrk]);
-        v1.SetPt(t.trkPt[itrk]);
-        v1.SetPhi(t.trkPhi[itrk]);
-        int pid = std::abs(t.trkPdgId[itrk]);
-        if      (pid == 211)  v1.SetM(0.139570);
-        else if (pid == 13)   v1.SetM(0.105658);
-        else if (pid == 11)   v1.SetM(0.000510);
-        else if (pid == 2212) v1.SetM(0.938272);
-        else if (pid == 321)  v1.SetM(0.493677);
-        else if (pid == 3112) v1.SetM(1.19744);                                                                                             
-	      else if (pid == 3222) v1.SetM(1.18937);                                                                                             
-	      else if (pid == 3312) v1.SetM(1.32171);                                                                                             
-	      else if (pid == 3334) v1.SetM( 1.67245);
-        else                  v1.SetM(0.139570); //  safety
-
-       // no_sv_tracks  
-        if (t.trkSvtxId[itrk] < 0) {
-	  no_sv_list.push_back(v1);
-	  no_sv_sta_list.push_back(t.trkMatchSta[itrk]); 
-	} 
-	//map vertex id to list of tracks
-	else if (t.trkSvtxId[itrk] >= 0 ) {
-	  secVtxs[t.trkSvtxId[itrk]].push_back(v1);
-	  secVtxsMatchSta[t.trkSvtxId[itrk]].push_back(t.trkMatchSta[itrk]); // store trkMatchSta of trk itrk as the itrk elem of the value associated to trkSvtxId
-	} 
+        //build v1, the 4 vec of the track
+        const ROOT::Math::PtEtaPhiMVector v1 = recoTrackP4(t, itrk);
+        // no_sv_tracks, else map vertex id to list of tracks
+        if (t.trkSvtxId[itrk] < 0) { no_sv_list.push_back(v1); no_sv_sta_list.push_back(t.trkMatchSta[itrk]); }
+        else { secVtxs[t.trkSvtxId[itrk]].push_back(v1); secVtxsMatchSta[t.trkSvtxId[itrk]].push_back(t.trkMatchSta[itrk]); }
     }
 
     if (secVtxs.size() <  2) {
       nb_sv += 1 ;
-      if (nb_sv < 15 ) {} 
-      return empty;    }
+      if (nb_sv < 15 ) {}
+      return {};    }
 
     // Build Vertex objects
-    std::vector<Vertex> vertices;
-    for (auto &it : secVtxs) {           //loop over the map
-      int originalSvId = it.first;       //saves it.first = vertex ID (map key)
-      auto& v = secVtxsMatchSta[originalSvId];
-      if (std::adjacent_find(v.begin(), v.end(),std::not_equal_to<int>()) != v.end()) {      // if not all tracks in the sv come from the same B 
-	sv_fail += 1.0;
-	//return empty;
-      }
-      Vertex vtx;
-      vtx.p4 = ROOT::Math::PtEtaPhiMVector();
-      vtx.tracks.reserve(it.second.size());
-      vtx.trkMatchSta.reserve(it.second.size());
-      vtx.trkSvtxId.reserve(it.second.size());
-      for (size_t i = 0; i < it.second.size(); ++i) {      //loop over tracks in this vertex (it.second)
-	vtx.p4 += it.second[i];
-	vtx.tracks.push_back(it.second[i]);
-	vtx.trkMatchSta.push_back(v[i]);  // reuse already-looked-up reference
-	vtx.trkSvtxId.push_back(originalSvId);
-        }
-      vertices.push_back(std::move(vtx));
-    }
-    // tracks[i] <-> trkMatchSta[i] <-> trkSvtxId[i] correspond; originalSvId = vertex.trkSvtxId[i]
-
-       
-          
+    std::vector<Vertex> vertices = buildVertices(secVtxs, secVtxsMatchSta, sv_fail);
 
     // Merge until only 2 vertices remain
     if (vertices.size() > 2) groupVertexes1(vertices);
     if (vertices.size() != 2) {
-       std::cout<<" merging pb"<<std::endl; 
+       std::cout<<" merging pb"<<std::endl;
        //return empty;
     }
 
     //vertices names
-    auto &vertex0 = vertices[0];
-    auto &vertex1 = vertices[1];
-
-    //VERTEX 0 
-    std::map<int,int> countMap0;
-    for (size_t i = 0; i < vertex0.tracks.size(); ++i) {   //count nb of tracks of the same MatchSta within a reconstructed vertex 
-        int sta0 = vertex0.trkMatchSta[i];
-        countMap0[sta0]++;
-    }
-    int totalTracks0 = vertex0.tracks.size();
-    int maxCount0 = 0;
-    for (const auto &kv : countMap0) {
-      if (kv.second > maxCount0) maxCount0 = kv.second;
-    }
-    double prop0 = double(maxCount0) / double(totalTracks0);
-    if (prop0 != 1) merge_fail += 1;
-
-    //VERTEX 1
-    std::map<int,int> countMap1;
-    for (size_t i = 0; i < vertex1.tracks.size(); ++i) {   //count nb of tracks of the same MatchSta within a reconstructed vertex
-        int sta1 = vertex1.trkMatchSta[i];
-        countMap1[sta1]++;
-    }
-    int totalTracks1 = vertex1.tracks.size();
-    // std::cout << "Vertex 1 track proportions:\n";
-    int maxCount1 = 0;
-    for (const auto &kv : countMap1) {
-      if (kv.second > maxCount1) maxCount1 = kv.second;
-    }
-    double prop1 = double(maxCount1) / double(totalTracks1);
-    if (prop1 != 1) {
+    auto &vertex0 = vertices[0], &vertex1 = vertices[1];
+    int maxCount0, maxCount1;
+    dominantStatus(vertex0, maxCount0); dominantStatus(vertex1, maxCount1);
+    if (double(maxCount0) / double(vertex0.tracks.size()) != 1) merge_fail += 1;
+    if (double(maxCount1) / double(vertex1.tracks.size()) != 1) {
       merge_fail += 1;
       //printvtx( vertex1 , " wrong merging ", 1);
       //return empty ;
     }
 
-    //Add in the particles that are not part of a sv
-    int i = 0;
-    for (const auto& v1 : no_sv_list) {
-      double d0 = deltaR2(v1, vertex0.p4);
-      double d1 = deltaR2(v1, vertex1.p4);
-      if (d0 < d1) {
-	vertex0.p4 += v1;
-	if (no_sv_sta_list[i] != vertex0.trkMatchSta[0]) agg_fail += 1;
-      }
-      else if (d0 > d1) {
-	vertex1.p4 += v1;
-	if (no_sv_sta_list[i] != vertex1.trkMatchSta[0]) agg_fail += 1;
-      }
-      i += 1;
-    }
-    no_sv_list.clear();
+    absorbNoSvTracks(no_sv_list, no_sv_sta_list, vertex0, vertex1, agg_fail);
 
     // Return summed 4-vectors of the 2 vertices
-    vector<ROOT::Math::PtEtaPhiMVector> vecFinalSecVtxs;
-    vecFinalSecVtxs.push_back(vertices[0].p4);
-    vecFinalSecVtxs.push_back(vertices[1].p4);
-
-    return vecFinalSecVtxs;
+    return {vertices[0].p4, vertices[1].p4};
 }
-
 
 // Status is used for quality plots and BDT cut for the merging.
 // pt_nonb (optional, may be null): the scalar pT sum of this jet's tracks that do NOT end up
@@ -512,6 +538,10 @@ vector<ROOT::Math::PtEtaPhiMVector> makeSvtxs(
 // track that passes but has no SV is absorbed into the nearer vertex further down. So the
 // complement is exactly "passed the jet and pT cuts, failed the BDT cut", which cannot be
 // reconstructed from the two returned four-vectors afterwards.
+// sv_sta (optional, may be null): the dominant trkMatchSta of the SV tracks of each returned
+// vertex, same order as the four-vectors. >= 100 means the SV is from a B hadron -- that is
+// what decides whether the SV b scale factor applies to it (sv_sf.h). MC only; meaningless
+// in data, where nothing reads it.
 vector<ROOT::Math::PtEtaPhiMVector> makeSvtxs_withBDT(
   tTree& t,     //event
   Int_t& ijet,  //jet nb
@@ -521,37 +551,31 @@ vector<ROOT::Math::PtEtaPhiMVector> makeSvtxs_withBDT(
   double& sv_fail,
   double& merge_fail,
   TH1D* h_score_bkg, TH1D* h_score_sg,
-  double* pt_nonb = nullptr
+  double* pt_nonb = nullptr,
+  std::vector<int>* sv_sta = nullptr
 ){
   if (pt_nonb) *pt_nonb = 0.;
+  if (sv_sta) sv_sta->clear();
 
   // Failure counters: nb_sv (fewer than 2 SVs), sv_fail / merge_fail / agg_fail (match status).
-
-  std::unordered_map<Int_t, std::vector<ROOT::Math::PtEtaPhiMVector>> secVtxs;
-  std::unordered_map<Int_t, std::vector<int>> secVtxsMatchSta;
-  vector<ROOT::Math::PtEtaPhiMVector> empty;
+  SvTrackMap secVtxs;
+  SvStatusMap secVtxsMatchSta;
   std::vector<ROOT::Math::PtEtaPhiMVector> no_sv_list;
   std::vector<int> no_sv_sta_list;
-  no_sv_list.reserve(t.ntrk);
-  no_sv_sta_list.reserve(t.ntrk);
+  no_sv_list.reserve(t.ntrk); no_sv_sta_list.reserve(t.ntrk);
 
     // Loop over tracks
-
     for (Int_t itrk = 0; itrk < t.ntrk; itrk++) {
-      //cuts for tracks 
+      //cuts for tracks
         if (t.trkJetId[itrk] != ijet) continue;
         if (t.trkPt[itrk] < 1) continue;
     //if (t.trkMatchSta[itrk] <100 ) continue;
-
     //if (t.trkMatchSta[itrk] <= 1) continue; //activate or not
-
     //control plots for the BDT score distribution in 0b and 1b jets
     //if (t.trkMatchSta[itrk] == 1)
       //{h_score_bkg->Fill(t.trkBdtScore[itrk], weight_tree);}
-    //else if (t.trkMatchSta[itrk] >= 100)      
+    //else if (t.trkMatchSta[itrk] >= 100)
      // {h_score_sg->Fill(t.trkBdtScore[itrk], weight_tree);}
-  
-
 
     // -- Add trkbdt score
     if (t.trkBdtScore[itrk]<=0.365) {
@@ -579,153 +603,58 @@ vector<ROOT::Math::PtEtaPhiMVector> makeSvtxs_withBDT(
         // depending on how many were consumed before the cuts.
         if (TrkEffSyst::dropTrack(ient, itrk)) continue;
 
-	//build v1, the 4 vec of the track 
-        ROOT::Math::PtEtaPhiMVector v1;
-        v1.SetEta(t.trkEta[itrk]);
-        v1.SetPt(t.trkPt[itrk]);
-        v1.SetPhi(t.trkPhi[itrk]);
-        int pid = std::abs(t.trkPdgId[itrk]);
-        if      (pid == 211)  v1.SetM(0.139570);
-        else if (pid == 13)   v1.SetM(0.105658);
-        else if (pid == 11)   v1.SetM(0.000510);
-        else if (pid == 2212) v1.SetM(0.938272);
-        else if (pid == 321)  v1.SetM(0.493677);
-        else if (pid == 3112) v1.SetM(1.19744);                                                                                             
-	      else if (pid == 3222) v1.SetM(1.18937);                                                                                             
-	      else if (pid == 3312) v1.SetM(1.32171);                                                                                             
-	      else if (pid == 3334) v1.SetM( 1.67245);
-        else                  v1.SetM(0.139570); //  safety
-
-       // no_sv_tracks  
-        if (t.trkSvtxId[itrk] < 0){
-	        no_sv_list.push_back(v1);
-	        no_sv_sta_list.push_back(t.trkMatchSta[itrk]); 
-	      } 
-      	//map vertex id to list of tracks
-      	else if (t.trkSvtxId[itrk] >= 0 ){
-      	  secVtxs[t.trkSvtxId[itrk]].push_back(v1);
-      	  secVtxsMatchSta[t.trkSvtxId[itrk]].push_back(t.trkMatchSta[itrk]); // store trkMatchSta of trk itrk as the itrk elem of the value associated to trkSvtxId
-      	} 
-    } // tracks loop 
+        //build v1, the 4 vec of the track
+        const ROOT::Math::PtEtaPhiMVector v1 = recoTrackP4(t, itrk);
+        // no_sv_tracks, else map vertex id to list of tracks
+        if (t.trkSvtxId[itrk] < 0) { no_sv_list.push_back(v1); no_sv_sta_list.push_back(t.trkMatchSta[itrk]); }
+        else { secVtxs[t.trkSvtxId[itrk]].push_back(v1); secVtxsMatchSta[t.trkSvtxId[itrk]].push_back(t.trkMatchSta[itrk]); }
+    } // tracks loop
 
     if (secVtxs.size() <  2) {
       nb_sv += 1 ;
-      // test: 
-      // if (nb_sv < 15 ) {} // not needed! 
-      return empty;    
+      // test: if (nb_sv < 15 ) {} // not needed!
+      return {};
     }
 
     // Build Vertex objects
-    std::vector<Vertex> vertices;
-    for (auto &it : secVtxs) {           //loop over the map
-      int originalSvId = it.first;       //saves it.first = vertex ID (map key)
-      auto& v = secVtxsMatchSta[originalSvId];
-      if (std::adjacent_find(v.begin(), v.end(),std::not_equal_to<int>()) != v.end()) {      // if not all tracks in the sv come from the same B 
-        	sv_fail += 1.0;
-        	//return empty;
-      }
-      Vertex vtx;
-      vtx.p4 = ROOT::Math::PtEtaPhiMVector();
-      vtx.tracks.reserve(it.second.size());
-      vtx.trkMatchSta.reserve(it.second.size());
-      vtx.trkSvtxId.reserve(it.second.size());
-      for (size_t i = 0; i < it.second.size(); ++i) {      //loop over tracks in this vertex (it.second)
-
-        	vtx.p4 += it.second[i];
-        	vtx.tracks.push_back(it.second[i]);
-        	vtx.trkMatchSta.push_back(v[i]);  // reuse already-looked-up reference
-        	vtx.trkSvtxId.push_back(originalSvId);
-        }
-      
-      vertices.push_back(std::move(vtx));
-    }
-    // tracks[i] <-> trkMatchSta[i] <-> trkSvtxId[i] correspond; originalSvId = vertex.trkSvtxId[i]
-
-       
-          
+    std::vector<Vertex> vertices = buildVertices(secVtxs, secVtxsMatchSta, sv_fail);
 
     // Merge until only 2 vertices remain
     if (vertices.size() > 2) groupVertexes1(vertices); // does it give 2 vertices?
     if (vertices.size() != 2) {
-       std::cout<<" merging pb"<<std::endl; 
+       std::cout<<" merging pb"<<std::endl;
        //return empty;
     }
 
-    //vertices names
-    auto &vertex0 = vertices[0];
-    auto &vertex1 = vertices[1];
-
-    //VERTEX 0 
-    std::map<int,int> countMap0;
-    for (size_t i = 0; i < vertex0.tracks.size(); ++i) {   //count nb of tracks of the same MatchSta within a reconstructed vertex 
-        int sta0 = vertex0.trkMatchSta[i];
-        countMap0[sta0]++;
-    }
-    int totalTracks0 = vertex0.tracks.size();
-    int maxCount0 = 0;
-    for (const auto &kv : countMap0) {
-      if (kv.second > maxCount0) maxCount0 = kv.second;
-    }
-    double prop0 = double(maxCount0) / double(totalTracks0);
-    if (prop0 != 1) merge_fail += 1;
-
-    //VERTEX 1
-    std::map<int,int> countMap1;
-    for (size_t i = 0; i < vertex1.tracks.size(); ++i) {   //count nb of tracks of the same MatchSta within a reconstructed vertex
-        int sta1 = vertex1.trkMatchSta[i];
-        countMap1[sta1]++;
-    }
-    int totalTracks1 = vertex1.tracks.size();
-    // std::cout << "Vertex 1 track proportions:\n";
-    int maxCount1 = 0;
-    for (const auto &kv : countMap1) {
-      if (kv.second > maxCount1) maxCount1 = kv.second;
-    }
-    double prop1 = double(maxCount1) / double(totalTracks1);
-    if (prop1 != 1) {
+    //vertices names; dominant status of each, for the SV scale factor
+    auto &vertex0 = vertices[0], &vertex1 = vertices[1];
+    int maxCount0, maxCount1;
+    const int domSta0 = dominantStatus(vertex0, maxCount0), domSta1 = dominantStatus(vertex1, maxCount1);
+    if (double(maxCount0) / double(vertex0.tracks.size()) != 1) merge_fail += 1;
+    if (sv_sta) { sv_sta->push_back(domSta0); sv_sta->push_back(domSta1); }
+    if (double(maxCount1) / double(vertex1.tracks.size()) != 1) {
       merge_fail += 1;
       //printvtx( vertex1 , " wrong merging ", 1);
       //return empty ;
     }
 
-    //Add in the particles that are not part of a sv
-    int i = 0;
-    for (const auto& v1 : no_sv_list) {
-      double d0 = deltaR2(v1, vertex0.p4);
-      double d1 = deltaR2(v1, vertex1.p4);
-      if (d0 < d1) {
-	      vertex0.p4 += v1;
-	      if (no_sv_sta_list[i] != vertex0.trkMatchSta[0]) agg_fail += 1;
-      }
-      else if (d0 > d1) {
-	      vertex1.p4 += v1;
-	      if (no_sv_sta_list[i] != vertex1.trkMatchSta[0]) agg_fail += 1;
-      }
-      i += 1;
-    }
-    no_sv_list.clear();
+    absorbNoSvTracks(no_sv_list, no_sv_sta_list, vertex0, vertex1, agg_fail);
 
     // Return summed 4-vectors of the 2 vertices
-    vector<ROOT::Math::PtEtaPhiMVector> vecFinalSecVtxs;
-    vecFinalSecVtxs.push_back(vertices[0].p4);
-    vecFinalSecVtxs.push_back(vertices[1].p4);
-
-    return vecFinalSecVtxs;
+    return {vertices[0].p4, vertices[1].p4};
 }
 
-  
 //fill_jk_resampling_response to be added
-//For 1D unfolding
-void fill_jk_resampling_1D(std::vector<TH1D *> histos, double num, double x, double w) {
-    /*
-    histos: vector of size 10
-    num:  double between 0 and 1
-    */
-    
+// Jackknife resampling: fill all but one of the 10 objects; num in [0,1) picks the one left
+// out. Works for TH1D/TH2D/TH3D (x..., w) and RooUnfoldResponse (reco..., gen..., w) alike --
+// it replaces the six fill_jk_resampling{,_response}_{1D,2D,3D} functions. Not called at the
+// moment.
+template <class H, class... X>
+void fill_jk_resampling(const std::vector<H *> &objs, double num, X... args) {
     int numRescaled = (int) (num*10); // from 0 to 9
     for (int i=0; i<10; i++) {
-        if (i==numRescaled) continue; // fill all but 1 histograms
-        histos[i]->Fill(x,w);
+        if (i==numRescaled) continue; // fill all but 1
+        objs[i]->Fill(args...);
     }
 }
 
@@ -760,131 +689,36 @@ struct AggBHadronNtupleRow {
     genPt2 = genEta2 = genPhi2 = genM2 = -999.0;
     genDr = genMB = genEec = -999.0;
   }
+
+  // Kinematics of the two aggregated B hadrons: the reco SVs, or the chosen gen pair.
+  void setReco(const ROOT::Math::PtEtaPhiMVector &a, const ROOT::Math::PtEtaPhiMVector &b) {
+    recoPt1 = a.Pt(); recoEta1 = a.Eta(); recoPhi1 = a.Phi(); recoM1 = a.M();
+    recoPt2 = b.Pt(); recoEta2 = b.Eta(); recoPhi2 = b.Phi(); recoM2 = b.M();
+  }
+  void setGen(const ROOT::Math::PtEtaPhiMVector &a, const ROOT::Math::PtEtaPhiMVector &b) {
+    genPt1 = a.Pt(); genEta1 = a.Eta(); genPhi1 = a.Phi(); genM1 = a.M();
+    genPt2 = b.Pt(); genEta2 = b.Eta(); genPhi2 = b.Phi(); genM2 = b.M();
+  }
 };
 
 void makeAggBHadronBranches(TTree* tree, AggBHadronNtupleRow& row) {
-  tree->Branch("entry", &row.entry, "entry/L");
-  tree->Branch("run", &row.run, "run/i");   // /i = UInt_t, /l = ULong64_t
-  tree->Branch("lumi", &row.lumi, "lumi/i");
-  tree->Branch("evt", &row.evt, "evt/l");
-  tree->Branch("jetIndex", &row.jetIndex, "jetIndex/I");
-  tree->Branch("weight", &row.weight, "weight/F");
-  tree->Branch("jtpt", &row.jtpt, "jtpt/F");
-  tree->Branch("jteta", &row.jteta, "jteta/F");
-  tree->Branch("refpt", &row.refpt, "refpt/F");
-  tree->Branch("refeta", &row.refeta, "refeta/F");
-  tree->Branch("jtNbHad", &row.jtNbHad, "jtNbHad/I");
-  tree->Branch("btagScore", &row.btagScore, "btagScore/F");
-  tree->Branch("passRecoKin", &row.passRecoKin, "passRecoKin/I");
-  tree->Branch("passGenKin", &row.passGenKin, "passGenKin/I");
-  tree->Branch("passBtag", &row.passBtag, "passBtag/I");
-  tree->Branch("nRecoAgg", &row.nRecoAgg, "nRecoAgg/I");
-  tree->Branch("nGenAgg", &row.nGenAgg, "nGenAgg/I");
-  tree->Branch("genStatus1", &row.genStatus1, "genStatus1/I");
-  tree->Branch("genStatus2", &row.genStatus2, "genStatus2/I");
-  tree->Branch("recoPt1", &row.recoPt1, "recoPt1/F");
-  tree->Branch("recoEta1", &row.recoEta1, "recoEta1/F");
-  tree->Branch("recoPhi1", &row.recoPhi1, "recoPhi1/F");
-  tree->Branch("recoM1", &row.recoM1, "recoM1/F");
-  tree->Branch("recoPt2", &row.recoPt2, "recoPt2/F");
-  tree->Branch("recoEta2", &row.recoEta2, "recoEta2/F");
-  tree->Branch("recoPhi2", &row.recoPhi2, "recoPhi2/F");
-  tree->Branch("recoM2", &row.recoM2, "recoM2/F");
-  tree->Branch("recoDr", &row.recoDr, "recoDr/F");
-  tree->Branch("recoMB", &row.recoMB, "recoMB/F");
-  tree->Branch("recoEec", &row.recoEec, "recoEec/F");
-  tree->Branch("genPt1", &row.genPt1, "genPt1/F");
-  tree->Branch("genEta1", &row.genEta1, "genEta1/F");
-  tree->Branch("genPhi1", &row.genPhi1, "genPhi1/F");
-  tree->Branch("genM1", &row.genM1, "genM1/F");
-  tree->Branch("genPt2", &row.genPt2, "genPt2/F");
-  tree->Branch("genEta2", &row.genEta2, "genEta2/F");
-  tree->Branch("genPhi2", &row.genPhi2, "genPhi2/F");
-  tree->Branch("genM2", &row.genM2, "genM2/F");
-  tree->Branch("genDr", &row.genDr, "genDr/F");
-  tree->Branch("genMB", &row.genMB, "genMB/F");
-  tree->Branch("genEec", &row.genEec, "genEec/F");
+  // Leaf types: /L Long64_t, /i UInt_t, /l ULong64_t, /I Int_t, /F Float_t. Branch order = file order.
+  auto br = [tree](const char *name, void *addr, const char *type) { tree->Branch(name, addr, Form("%s/%s", name, type)); };
+  br("entry", &row.entry, "L"); br("run", &row.run, "i"); br("lumi", &row.lumi, "i"); br("evt", &row.evt, "l");
+  br("jetIndex", &row.jetIndex, "I");
+  br("weight", &row.weight, "F"); br("jtpt", &row.jtpt, "F"); br("jteta", &row.jteta, "F");
+  br("refpt", &row.refpt, "F"); br("refeta", &row.refeta, "F");
+  br("jtNbHad", &row.jtNbHad, "I"); br("btagScore", &row.btagScore, "F");
+  br("passRecoKin", &row.passRecoKin, "I"); br("passGenKin", &row.passGenKin, "I"); br("passBtag", &row.passBtag, "I");
+  br("nRecoAgg", &row.nRecoAgg, "I"); br("nGenAgg", &row.nGenAgg, "I");
+  br("genStatus1", &row.genStatus1, "I"); br("genStatus2", &row.genStatus2, "I");
+  br("recoPt1", &row.recoPt1, "F"); br("recoEta1", &row.recoEta1, "F"); br("recoPhi1", &row.recoPhi1, "F"); br("recoM1", &row.recoM1, "F");
+  br("recoPt2", &row.recoPt2, "F"); br("recoEta2", &row.recoEta2, "F"); br("recoPhi2", &row.recoPhi2, "F"); br("recoM2", &row.recoM2, "F");
+  br("recoDr", &row.recoDr, "F"); br("recoMB", &row.recoMB, "F"); br("recoEec", &row.recoEec, "F");
+  br("genPt1", &row.genPt1, "F"); br("genEta1", &row.genEta1, "F"); br("genPhi1", &row.genPhi1, "F"); br("genM1", &row.genM1, "F");
+  br("genPt2", &row.genPt2, "F"); br("genEta2", &row.genEta2, "F"); br("genPhi2", &row.genPhi2, "F"); br("genM2", &row.genM2, "F");
+  br("genDr", &row.genDr, "F"); br("genMB", &row.genMB, "F"); br("genEec", &row.genEec, "F");
 }
-
-void fill_jk_resampling_response_1D(std::vector<RooUnfoldResponse *> responses, double num, 
-                                 double x_reco,  
-                                 double x_gen, 
-                                 double w) {
-    /*
-    histos: vector of size 10
-    num:  double between 0 and 1
-    */
-    
-    int numRescaled = (int) (num*10); // from 0 to 9
-    for (int i=0; i<10; i++) {
-        if (i==numRescaled) continue; // fill all but 1 responses
-        responses[i]->Fill(x_reco,x_gen,w);
-    }
-}
-
-//For 2D unfolding
-void fill_jk_resampling_2D(std::vector<TH2D *> histos, double num, double x, double y, double w) {
-    /*
-    histos: vector of size 10
-    num:  double between 0 and 1
-    */
-    
-    int numRescaled = (int) (num*10); // from 0 to 9
-    for (int i=0; i<10; i++) {
-        if (i==numRescaled) continue; // fill all but 1 histograms
-        histos[i]->Fill(x,y,w);
-    }
-}
-
-void fill_jk_resampling_response_2D(std::vector<RooUnfoldResponse *> responses, double num, 
-                                 double x_reco, double y_reco,
-                                 double x_gen, double y_gen,
-                                 double w) {
-    /*
-    histos: vector of size 10
-    num:  double between 0 and 1
-    */
-    
-    int numRescaled = (int) (num*10); // from 0 to 9
-    for (int i=0; i<10; i++) {
-        if (i==numRescaled) continue; // fill all but 1 responses
-        responses[i]->Fill(x_reco,y_reco,x_gen,y_gen,w);
-    }
-}
-
-//For 3D unfolding
-void fill_jk_resampling_3D(std::vector<TH3D *> histos, double num, double x, double y, double z, double w) {
-    /*
-    histos: vector of size 10
-    num:  double between 0 and 1
-    */
-    
-    int numRescaled = (int) (num*10); // from 0 to 9
-    for (int i=0; i<10; i++) {
-        if (i==numRescaled) continue; // fill all but 1 histograms
-        histos[i]->Fill(x,y,z,w);
-    }
-}
-
-void fill_jk_resampling_response_3D(std::vector<RooUnfoldResponse *> responses, double num, 
-                                 double x_reco, double y_reco, double z_reco,
-                                 double x_gen, double y_gen, double z_gen,
-                                 double w) {
-    /*
-    histos: vector of size 10
-    num:  double between 0 and 1
-    */
-    
-    int numRescaled = (int) (num*10); // from 0 to 9
-    for (int i=0; i<10; i++) {
-        if (i==numRescaled) continue; // fill all but 1 responses
-        responses[i]->Fill(x_reco,y_reco,z_reco,x_gen,y_gen,z_gen,w);
-    }
-}
-
-
-
-
 
 // ---- disabled (kept for reference): make_templates, superseded by Build_templates ----
 #if 0
@@ -903,9 +737,8 @@ void make_templates(const AnalysisConfig& cfg, Long64_t ev_first = 0, Long64_t e
 
   double prescale = cfg.dataset.data_prescale;
 
-  //-- Variables 
+  //-- Variables
   double agg_fail = 0, nb_sv = 0, sv_fail = 0, merge_fail = 0;
-
 
   // MC: separate 0b, b and bb templates
   TH3D *h3D_0b = new TH3D("h3D_0b", ";m_{2B} [GeV];#DeltaR;p_{T} [GeV]", bins_mb, mb_binsVector, bins_dr, dr_binsVector, jtpt_bins, jtpt_binsVector);
@@ -938,27 +771,26 @@ void make_templates(const AnalysisConfig& cfg, Long64_t ev_first = 0, Long64_t e
     if (ient % 50000 == 0)
       std::cout << "\rProcessing: " << 100.0 * ient / n_events << " %" << std::flush;
       //std::cout << "\rProcessing: " << ient  <<std::endl;
-      
+
       t.GetEntry(ient);
-      // -- test tree branches are read: 
+      // -- test tree branches are read:
       //cout << "jtpt = " << t.jtpt[0] << endl;
-      
+
       double weight_tree = cfg.dataset.isMC ? t.weight : 1.0;
 
-    // -- Trigger selections 
+    // -- Trigger selections
     if (! passEventSelection(t, cfg)) continue;
     // cout << "event pass ok" << endl;
-    
+
     for (Int_t ijet = 0; ijet < t.nref; ijet++) {
 
       // -- jet knematiocs + skip event of large weight based on jet pt
       if(! passRecoJetKinematics(t, ijet, cfg)) continue;
           // cout << "Jet kin pass ok" << endl;
 
-	  	// batgging 
+	  	// batgging
       if (! passBtag(t, ijet, cfg)) continue;
           // cout << "Jet btag pass ok" << endl;
-
 
       // reco SV reconstruction — same for data and MC
       vector<ROOT::Math::PtEtaPhiMVector> reco_sv = makeSvtxs_withBDT(t, ijet, ient, agg_fail, nb_sv, sv_fail, merge_fail, nullptr, nullptr);
@@ -979,11 +811,11 @@ void make_templates(const AnalysisConfig& cfg, Long64_t ev_first = 0, Long64_t e
       //std::cout << "weight: " << weight_tree << std::endl;
       //std::cout << "eec: " << eec << std::endl;
 
-      if (cfg.dataset.RunN == 2 && !cfg.dataset.isMC && t.HLT_HIAK4PFJet40_v1 && !(t.HLT_HIAK4PFJet60_v1 || t.HLT_HIAK4PFJet80_v1 || t.HLT_HIAK4PFJet100_v1)) 
-      {eec *= prescale;} 
+      if (cfg.dataset.RunN == 2 && !cfg.dataset.isMC && t.HLT_HIAK4PFJet40_v1 && !(t.HLT_HIAK4PFJet60_v1 || t.HLT_HIAK4PFJet80_v1 || t.HLT_HIAK4PFJet100_v1))
+      {eec *= prescale;}
 
-      if (cfg.dataset.RunN == 3 && !cfg.dataset.isMC && t.HLT_AK4PFJet60_v8 && !(t.HLT_AK4PFJet80_v8 || t.HLT_AK4PFJet100_v8 || t.HLT_AK4PFJet120_v8) ) 
-      {eec *= prescale;} 
+      if (cfg.dataset.RunN == 3 && !cfg.dataset.isMC && t.HLT_AK4PFJet60_v8 && !(t.HLT_AK4PFJet80_v8 || t.HLT_AK4PFJet100_v8 || t.HLT_AK4PFJet120_v8) )
+      {eec *= prescale;}
 
       if (cfg.dataset.isMC && dr > 0.005) {
         // use truth to classify: fill separate 0b, b and bb templates
@@ -1015,7 +847,6 @@ void make_templates(const AnalysisConfig& cfg, Long64_t ev_first = 0, Long64_t e
   outFile.Close();
 }
 #endif // ---- end disabled: make_templates ----
-
 
 // ---- disabled (kept for reference): create_response_templatefit, now in Build_templates ----
 #if 0
@@ -1050,7 +881,7 @@ void create_response_templatefit(
     TString fout_name = cfg.dataset.output_folder + output_hist_response + (cfg.physics.useBtag ? "_btag" : "_nobtag") + kinLabel(cfg) + ".root"; // -- can be changed to be in the same file as templates?(but with Response keyword if they are produced seperately)
 
     // -------------------------------------------------------------------
-    // -- Change this to be used from the default header ? 
+    // -- Change this to be used from the default header ?
     // Re-derive bin counts from const sizes (Cling init-order workaround for non-const globals)
     Int_t n_mb = mb_binsVectorSize - 1;   // same as mb_bins in binning_histos_small.h
     Int_t n_dr = dr_binsVectorSize - 1;   // same as dr_bins
@@ -1065,7 +896,6 @@ void create_response_templatefit(
     std::cout << "dr range: [" << dr_min << ", " << dr_max << "]" << std::endl;
     // -------------------------------------------------------------------
 
-
     tTree t;
     t.Init(cfg.dataset.filename, cfg.dataset.isMC, cfg.dataset.RunN);
       t.SetBranchStatus("*", 0);
@@ -1076,13 +906,12 @@ void create_response_templatefit(
     std::mt19937 generator(rand_dev());
     std::uniform_real_distribution<double> distr(0., 1.);
 
-    // -- needed parameters for reco SV func() 
+    // -- needed parameters for reco SV func()
     double agg_fail = 0, nb_sv = 0, sv_fail = 0, merge_fail = 0;
 
-    //-- debugging variables 
+    //-- debugging variables
     long n_bb_jets = 0, n_reco_pass = 0, n_gen_pass = 0, n_both_pass = 0;
     long n_gen_bh_ok = 0;  // jets passing gen_bh.size() >= 2
-
 
     // per-condition failure counters for reco_pass
     long n_fail_reco_sv   = 0, n_fail_reco_pt  = 0, n_fail_reco_eta = 0;
@@ -1108,7 +937,6 @@ void create_response_templatefit(
     TH2D *h_half1_btag_eff_num = new TH2D("h_half1_btag_efficiency_numerator_tf",   "x=dr_SV, y=jtpt", n_dr, dr_binsVector, n_pt, jtpt_binsVector);
     TH2D *h_half1_btag_eff_den = new TH2D("h_half1_btag_efficiency_denominator_tf", "x=dr_SV, y=jtpt", n_dr, dr_binsVector, n_pt, jtpt_binsVector);
 
-
     RooUnfoldResponse *response_half0 = new RooUnfoldResponse(h_half0_purity_den, h_half0_eff_den, "response_tf_half0", "tf response half0");
     RooUnfoldResponse *response_half1 = new RooUnfoldResponse(h_half1_purity_den, h_half1_eff_den, "response_tf_half1", "tf response half1");
     RooUnfoldResponse *response_full  = new RooUnfoldResponse(h_half0_purity_den, h_half0_eff_den, "response_tf_full",  "tf response full");
@@ -1125,7 +953,6 @@ void create_response_templatefit(
 
         // MC trigger selection (run-dependent)
         if (! passEventSelection(t, cfg)) continue;
-
 
         for (Int_t ijet = 0; ijet < t.nref; ijet++) {
 
@@ -1153,7 +980,6 @@ void create_response_templatefit(
             double dr_gen  = t.calc_dr(gen_bh[best_i].Eta(), gen_bh[best_i].Phi(),
                                        gen_bh[best_j].Eta(), gen_bh[best_j].Phi());
 
-
             // -- common variables repeatdly used in fill histograms
             // jtpt_fill() folds jets above the last bin edge into that bin, so they are
             // not lost to the overflow bin (see binning_histos_small.h).
@@ -1163,12 +989,11 @@ void create_response_templatefit(
             double jeta_gen = gen_jet_eta(t, ijet);
               // -- for cout only
             double btagVar =  (cfg.dataset.RunN == 2) ? (t.discr_particleNet_BvsAll[ijet]) :
-                              ( (cfg.dataset.RunN == 3) ? 
+                              ( (cfg.dataset.RunN == 3) ?
                                   (t.discr_unifiedParticleTransformer_probb[ijet] +
                                   t.discr_unifiedParticleTransformer_problepb[ijet] +
                                   t.discr_unifiedParticleTransformer_probbb[ijet]) :
                                   -1);
-
 
             // step2: for Response matrix ---- Reco SVs ----
             vector<ROOT::Math::PtEtaPhiMVector> reco_sv =
@@ -1201,8 +1026,8 @@ void create_response_templatefit(
                              //passBtag(t, ijet, cfg);
                              //  && (mB_reco_fill >= mb_min && mB_reco_fill < mb_max) && (dr_reco_fill < dr_max); // Not needed since reco_sv_ok is already required.
 
-            bool reco_pass = reco_sv_ok && passRecoJetKinematics(t, ijet, cfg) && dr_reco_fill > 0.005; 
-            
+            bool reco_pass = reco_sv_ok && passRecoJetKinematics(t, ijet, cfg) && dr_reco_fill > 0.005;
+
             bool reco_pass_btag = reco_sv_ok && passBtag(t, ijet, cfg); //check
 
             /*
@@ -1212,8 +1037,8 @@ void create_response_templatefit(
             //if (reco_sv_ok && (jpt_reco >= pT_low && jpt_reco < pT_high)) {
                          //std::cout << "jteta_reco: " << t.jteta[ijet] << std::endl; }
             //if (reco_sv_ok && (jpt_reco >= pT_low && jpt_reco < pT_high) && (std::abs(t.jteta[ijet]) < 1.6)) {
-             //std::cout << "btag: " << (t.discr_particleNet_BvsAll[ijet] ) << std::endl;}  
-            
+             //std::cout << "btag: " << (t.discr_particleNet_BvsAll[ijet] ) << std::endl;}
+
             //if (reco_sv_ok && (jpt_reco >= pT_low && jpt_reco < pT_high) && (std::abs(t.jteta[ijet]) < 1.6) && (!btag || t.discr_particleNet_BvsAll[ijet] > 0.898)){
              //std::cout << "mB_reco: " << mb_min << " " << mB_reco_fill << " " << mb_max << std::endl;
             //}
@@ -1221,11 +1046,10 @@ void create_response_templatefit(
                 //std::cout << "dr_reco: " << dr_reco << "MAX" <<dr_max << std::endl;}
             */
 
-
             // gen_pass: particle-level jet kinematics + gen observable range
-            bool gen_pass  = passGenJetKinematics(t, ijet, cfg); //  && (mB_gen_fill >= mb_min && mB_gen_fill < mb_max) &&(dr_gen_fill < dr_max); //dr_gen_fill >= dr_min && 
+            bool gen_pass  = passGenJetKinematics(t, ijet, cfg); //  && (mB_gen_fill >= mb_min && mB_gen_fill < mb_max) &&(dr_gen_fill < dr_max); //dr_gen_fill >= dr_min &&
 
-            bool gen_pass_btag = passBtag(t, ijet, cfg); //check 
+            bool gen_pass_btag = passBtag(t, ijet, cfg); //check
             // --- debugging paragraph ----
             //std::cout << "gen_pass: " << gen_pass << std::endl;
             //std::cout << "jpt_gen: " << jpt_gen << std::endl;
@@ -1257,7 +1081,7 @@ void create_response_templatefit(
             if (n_debug_printed < 10) {
                 std::cout << "[DBG jet " << n_debug_printed << "]"
                     << " jpt_reco=" << jpt_reco
-                    << " jpt_gen="  <<  t.refpt[ijet]  // jpt_gen 
+                    << " jpt_gen="  <<  t.refpt[ijet]  // jpt_gen
                     << " reco jteta="    << jeta_reco
                     << " gen jteta="   << t.refeta[ijet] //  jeta_gen
                     << " discr="    << btagVar
@@ -1274,7 +1098,6 @@ void create_response_templatefit(
             }
             //---------------------------
 
-
             // -------------------------------------------
             // ---- Fill Response matrix -----------------
             // -------------------------------------------
@@ -1287,14 +1110,14 @@ void create_response_templatefit(
               else           h_half1_purity_den->Fill(dr_reco_fill, jpt_reco, w_reco);
 
             }
-            
+
             if (gen_pass) {
                 // Intentional: the efficiency is binned at gen level but weighted with
                 // the reco-side EEC weight, matching the response matrix convention.
                 if (num < 0.5) h_half0_eff_den->Fill(dr_gen_fill, jpt_gen, w_reco);
                 else           h_half1_eff_den->Fill(dr_gen_fill, jpt_gen, w_reco);
             }
-            
+
             if (reco_pass && gen_pass) {
                 if (num < 0.5) {
                     h_half0_purity_num->Fill(dr_reco_fill, jpt_reco, w_reco);
@@ -1339,7 +1162,7 @@ void create_response_templatefit(
     std::cout << "  fail gen dr:       " << n_fail_gen_dr    << std::endl;
     //----------------------------
 
-    // --- Compte Purity, Eff.  
+    // --- Compte Purity, Eff.
     auto divide = [](TH2D* num, TH2D* den, const char* name) -> TH2D* {
         TH2D *h = (TH2D*) num->Clone(name);
         h->Divide(num, den, 1., 1., "b"); // Bionmial error propogation
@@ -1351,7 +1174,7 @@ void create_response_templatefit(
     TH2D *h_half0_eff    = divide(h_half0_eff_num,    h_half0_eff_den,    "h_half0_efficiency_tf");
     TH2D *h_half1_eff    = divide(h_half1_eff_num,    h_half1_eff_den,    "h_half1_efficiency_tf");
 
-      // For full 
+      // For full
     TH2D *h_full_purity_num = (TH2D*) h_half0_purity_num->Clone("h_full_purity_numerator_tf");
     h_full_purity_num->Add(h_half1_purity_num);
     TH2D *h_full_purity_den = (TH2D*) h_half0_purity_den->Clone("h_full_purity_denominator_tf");
@@ -1378,10 +1201,6 @@ void create_response_templatefit(
     delete fout;
 }
 #endif // ---- end disabled: create_response_templatefit ----
-
-
-
-
 
 // ---- The observable list, and the one place that fixes its order -----------------------
 // obsList() and obsValues() are a matched pair: the Nth entry of obsValues() must be the
@@ -1678,20 +1497,14 @@ struct ResponseHistos {
         std::cout << "[EEC-weight debug " << o.name << "] global eec_gen/eec_reco = "
                   << (I_reco_eec > 0 ? I_gen_eec / I_reco_eec : 0) << std::endl;
 
-        hgenjet_2b->Write();
-        hgenjet_2b_passbtag->Write();
-        btagEff->Write();
-        hgenjet_2b_all->Write();
-        hgenjet_2b_reco_btag->Write();
-        svbtagEff->Write();
-        eecwEff->Write();
+        hgenjet_2b->Write(); hgenjet_2b_passbtag->Write(); btagEff->Write();
+        hgenjet_2b_all->Write(); hgenjet_2b_reco_btag->Write(); svbtagEff->Write(); eecwEff->Write();
     }
 };
 
-
 void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, bool isCreateRmatrix = true,
                      Long64_t ev_first = 0, Long64_t ev_last = -1, Int_t job_idx = -1, bool makeAggNtuple = true) {
-  // -- make templates of Data/MC, and Response matrix for MC 
+  // -- make templates of Data/MC, and Response matrix for MC
 
 #if !HAS_ROOUNFOLD
   if (isCreateRmatrix) {
@@ -1712,12 +1525,13 @@ void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, boo
   // then append their own OUT_TAG after it).
   // EecWeight::tag() is "_noeecw" for the yield run: not a systematic, a different
   // observable, so it must never land in the same file as the EEC histograms.
-  TString syst_suffix = TrkEffSyst::tag() + EecWeight::tag();
+  // SvSF::tag() is "_svsf" / "_svsfup" / "_svsfdn" when the SV b scale factor is applied
+  // (MC only), "" when off -- see sv_sf.h.
+  TString syst_suffix = TrkEffSyst::tag() + SvSF::tag() + EecWeight::tag();
   TString fout_name = cfg.dataset.output_folder + cfg.dataset.output_hist + job_suffix + "MCGEN" + syst_suffix + ".root"; // for reposnse matrix: has Prefix: Response
   TString ResponseMatrix_fout_name =  cfg.dataset.output_folder + "RMatrix_" + cfg.dataset.output_hist + job_suffix + syst_suffix + ".root";
   TString AggBHadronNtuple_fout_name = cfg.dataset.output_folder + "AggBHadronNtuple_" + cfg.dataset.output_hist + job_suffix + syst_suffix + ".root";
   gSystem->mkdir(cfg.dataset.output_folder, true);
-
 
   // ---- Histograms ----
   // One set per measured observable. dr's ObsDef has an empty suffix, so its histograms are
@@ -1751,21 +1565,15 @@ void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, boo
   TH1D *hpt_selectedJets   = new TH1D("hpt_selectedJets", "For templates: Selected jets (btagged, NSvx >=2, within kienmatics(jet pt and eta + skipped events of large weights) of anlalysis);p_{T} [GeV]; weighted counts(event weight)",jtpt_bins, jtpt_binsVector);
   TH1D *hpt_selectedJets_noweight   = new TH1D("hpt_selectedJets_noweight", "For templates: Selected jets (btagged, NSvx >=2, within kienmatics(jet pt and eta + skipped events of large weights) of anlalysis);p_{T} [GeV]; counts",jtpt_bins, jtpt_binsVector);
 
-  hpt_selectedJets->Sumw2();
-  hpt_selectedJets_noweight->Sumw2();
+  hpt_selectedJets->Sumw2(); hpt_selectedJets_noweight->Sumw2();
 
+  // -- For response matrix
 
-  // -- For response matrix 
-
-    // Re-derive bin counts from const sizes (Cling init-order workaround)
-    Int_t n_mb = mb_binsVectorSize - 1;   // same as mb_bins in binning_histos_small.h
-    Int_t n_dr = dr_binsVectorSize - 1;   // same as dr_bins
-    Int_t n_pt = jtpt_binsVectorSize - 1; // same as jtpt_bins
-    Double_t mb_min = mb_binsVector[0];
-    Double_t mb_max = mb_binsVector[n_mb];
-    Double_t mb_max_fill = 9.9;
-    Double_t dr_min = dr_binsVector[0];
-    Double_t dr_max = dr_binsVector[n_dr];
+    // Re-derive bin counts from const sizes (Cling init-order workaround);
+    // same as mb_bins, dr_bins, jtpt_bins in binning_histos_small.h
+    Int_t n_mb = mb_binsVectorSize - 1, n_dr = dr_binsVectorSize - 1, n_pt = jtpt_binsVectorSize - 1;
+    Double_t mb_min = mb_binsVector[0], mb_max = mb_binsVector[n_mb], mb_max_fill = 9.9;
+    Double_t dr_min = dr_binsVector[0], dr_max = dr_binsVector[n_dr];
     std::cout << "Histogram binning: mB=" << n_mb << " dr=" << n_dr << " jtpt=" << n_pt << std::endl;
     std::cout << "mb range: [" << mb_min << ", " << mb_max << "], fill cap=" << mb_max_fill << std::endl;
     std::cout << "dr range: [" << dr_min << ", " << dr_max << "]" << std::endl;
@@ -1779,8 +1587,7 @@ void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, boo
 	// DEBUG: reco SV pt vs gen partial-B pt (EEC weight = pt_i * pt_j).
 	TH2D* h_svpt_vs_bpt = new TH2D("h_svpt_vs_bpt", "reco SV p_{T} vs gen B p_{T};gen partial-B p_{T} [GeV];reco SV p_{T} [GeV]", 60, 0, 120, 60, 0, 120);
 	TH1D* h_ptratio     = new TH1D("h_ptratio", "reco/gen SV p_{T};p_{T}^{reco}/p_{T}^{gen};entries", 60, 0., 2.);
-	h_svpt_vs_bpt->Sumw2();
-	h_ptratio->Sumw2();
+	h_svpt_vs_bpt->Sumw2(); h_ptratio->Sumw2();
 	const bool doAggNtuple = makeAggNtuple && cfg.dataset.isMC;
 	TFile* fout_agg = nullptr;
 	TTree* aggBHadronTree = nullptr;
@@ -1800,11 +1607,11 @@ void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, boo
 	    makeAggBHadronBranches(aggBHadronTree, aggRow);
 	  }
 	}
-	
+
     // Data / reco MC variables
-    // -- needed parameters for reco SV func() 
+    // -- needed parameters for reco SV func()
       double agg_fail = 0, nb_sv = 0, sv_fail = 0, merge_fail = 0; // for templates conditions
-      double agg_fail_rm = 0, nb_sv_rm = 0, sv_fail_rm = 0, merge_fail_rm = 0; // for Response matrix conditions 
+      double agg_fail_rm = 0, nb_sv_rm = 0, sv_fail_rm = 0, merge_fail_rm = 0; // for Response matrix conditions
 
   // Response-matrix variables
     // -- To split any sample into two parts randomly.
@@ -1815,26 +1622,17 @@ void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, boo
     // identical between the nominal and a systematic variation, which is what keeps the
     // split noise out of the systematic. See tracking_efficiency_syst.h.
 
-    //-- debugging variables 
+    //-- debugging variables
     long n_bb_jets = 0, n_reco_pass = 0, n_gen_pass = 0, n_both_pass = 0;
     long n_gen_bh_ok = 0;  // jets passing gen_bh.size() >= 2
-    // per-condition failure counters for reco_pass
-    long n_fail_reco_sv   = 0, n_fail_reco_pt  = 0, n_fail_reco_eta = 0;
-    long n_fail_reco_btag = 0, n_fail_reco_mb  = 0, n_fail_reco_dr  = 0;
-    // per-condition failure counters for gen_pass
-    long n_fail_gen_pt  = 0, n_fail_gen_eta = 0;
-    long n_fail_gen_mb  = 0, n_fail_gen_dr  = 0;
-    int  n_debug_printed = 10;
-    int  n_weight_debug_printed = 10;
-    long n_weight_checked = 0;
-    long n_zero_weight_tree = 0;
-    long n_zero_eec_gen = 0;
-    long n_zero_eec_reco = 0;
+    // per-condition failure counters for reco_pass, then gen_pass
+    long n_fail_reco_sv = 0, n_fail_reco_pt = 0, n_fail_reco_eta = 0, n_fail_reco_btag = 0, n_fail_reco_mb = 0, n_fail_reco_dr = 0;
+    long n_fail_gen_pt = 0, n_fail_gen_eta = 0, n_fail_gen_mb = 0, n_fail_gen_dr = 0;
+    int  n_debug_printed = 10, n_weight_debug_printed = 10;
+    long n_weight_checked = 0, n_zero_weight_tree = 0, n_zero_eec_gen = 0, n_zero_eec_reco = 0, n_zero_w_reco = 0;
     //long n_zero_w_gen = 0;
-    long n_zero_w_reco = 0;
-    double sum_weight_tree_checked = 0.0;
+    double sum_weight_tree_checked = 0.0, sum_w_reco_checked = 0.0;
     //double sum_w_gen_checked = 0.0;
-    double sum_w_reco_checked = 0.0;
 
   // ---- Event loop ----
   tTree t;
@@ -1843,25 +1641,36 @@ void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, boo
   auto active_branches = getActiveBranches(cfg);
   t.SetBranchStatus(active_branches, 1);
 
+  // JEC (see the Jec namespace at the top): MC-truth levels on everything, residual on data.
+  JetCorrector jec;
+  if (Jec::enabled()) {
+    const std::vector<std::string> jec_files = Jec::files(cfg.dataset.isMC);
+    for (const std::string &f : jec_files)
+      if (gSystem->AccessPathName(f.c_str()))
+        throw std::runtime_error("Missing JEC file: " + f);
+    jec.Initialize(jec_files);
+  }
+  TLeaf* hiEvtRhoLeaf = nullptr;
+
   TFile* eventInfoFile = nullptr;
-  TTree* hiEvtTree = nullptr;
-  TTree* hltTree = nullptr;
-  TTree* skimTree = nullptr;
-  TTree* weightTree = nullptr;
-  Float_t hiEvtVz = 999.0;
-  Float_t hiEvtWeight = 1.0;
+  TTree *hiEvtTree = nullptr, *hltTree = nullptr, *skimTree = nullptr, *weightTree = nullptr;
+  Float_t hiEvtVz = 999.0, hiEvtWeight = 1.0;
   Int_t skimPprimaryVertexFilter = 1;
-  Int_t hltAK4PFJet40 = 0;
-  Int_t hltAK4PFJet60 = 0;
-  Int_t hltAK4PFJet80 = 0;
-  Int_t hltAK4PFJet100 = 0;
-  Int_t hltAK4PFJet120 = 0;
+  Int_t hltAK4PFJet40 = 0, hltAK4PFJet60 = 0, hltAK4PFJet80 = 0, hltAK4PFJet100 = 0, hltAK4PFJet120 = 0;
 
   eventInfoFile = TFile::Open(cfg.dataset.filename);
   if (eventInfoFile && !eventInfoFile->IsZombie()) {
     hiEvtTree = (TTree*)eventInfoFile->Get("hiEvtAnalyzer/HiTree");
     if (hiEvtTree) {
       hiEvtTree->SetBranchStatus("*", 0);
+      if (Jec::enabled()) {
+        if (!hiEvtTree->GetBranch("rho"))
+          throw std::runtime_error("JEC requires hiEvtAnalyzer/HiTree::rho in the input forest");
+        hiEvtTree->SetBranchStatus("rho", 1);
+        hiEvtRhoLeaf = hiEvtTree->GetLeaf("rho");
+        if (!hiEvtRhoLeaf)
+          throw std::runtime_error("Could not read hiEvtAnalyzer/HiTree::rho leaf");
+      }
       if (hiEvtTree->GetBranch("vz")) {
         hiEvtTree->SetBranchStatus("vz", 1);
         hiEvtTree->SetBranchAddress("vz", &hiEvtVz);
@@ -1882,26 +1691,11 @@ void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, boo
     hltTree = (TTree*)eventInfoFile->Get("hltanalysis/HltTree");
     if (hltTree && cfg.dataset.RunN == 3) {
       hltTree->SetBranchStatus("*", 0);
-      if (hltTree->GetBranch("HLT_AK4PFJet40_v8")) {
-        hltTree->SetBranchStatus("HLT_AK4PFJet40_v8", 1);
-        hltTree->SetBranchAddress("HLT_AK4PFJet40_v8", &hltAK4PFJet40);
-      }
-      if (hltTree->GetBranch("HLT_AK4PFJet60_v8")) {
-        hltTree->SetBranchStatus("HLT_AK4PFJet60_v8", 1);
-        hltTree->SetBranchAddress("HLT_AK4PFJet60_v8", &hltAK4PFJet60);
-      }
-      if (hltTree->GetBranch("HLT_AK4PFJet80_v8")) {
-        hltTree->SetBranchStatus("HLT_AK4PFJet80_v8", 1);
-        hltTree->SetBranchAddress("HLT_AK4PFJet80_v8", &hltAK4PFJet80);
-      }
-      if (hltTree->GetBranch("HLT_AK4PFJet100_v8")) {
-        hltTree->SetBranchStatus("HLT_AK4PFJet100_v8", 1);
-        hltTree->SetBranchAddress("HLT_AK4PFJet100_v8", &hltAK4PFJet100);
-      }
-      if (hltTree->GetBranch("HLT_AK4PFJet120_v8")) {
-        hltTree->SetBranchStatus("HLT_AK4PFJet120_v8", 1);
-        hltTree->SetBranchAddress("HLT_AK4PFJet120_v8", &hltAK4PFJet120);
-      }
+      const std::vector<std::pair<const char *, Int_t *>> hltBits = {
+        {"HLT_AK4PFJet40_v8", &hltAK4PFJet40}, {"HLT_AK4PFJet60_v8", &hltAK4PFJet60}, {"HLT_AK4PFJet80_v8", &hltAK4PFJet80},
+        {"HLT_AK4PFJet100_v8", &hltAK4PFJet100}, {"HLT_AK4PFJet120_v8", &hltAK4PFJet120} };
+      for (const auto &b : hltBits)
+        if (hltTree->GetBranch(b.first)) { hltTree->SetBranchStatus(b.first, 1); hltTree->SetBranchAddress(b.first, b.second); }
       std::cout << "Reading Run3 HLT bits from hltanalysis/HltTree" << std::endl;
     }
     skimTree = (TTree*)eventInfoFile->Get("skimanalysis/HltTree");
@@ -1917,13 +1711,10 @@ void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, boo
     std::cout << "WARNING: could not reopen input file for event-level friend trees; falling back to tTree friends" << std::endl;
     eventInfoFile = nullptr;
   }
-  if (!cfg.dataset.isMC) {
-    weightTree = nullptr;
-  }
+  if (!cfg.dataset.isMC) weightTree = nullptr;
 
   // Tree variables
   double prescale = cfg.dataset.data_prescale;
-
 
   Long64_t n_events = t.GetEntries();
   if (ev_last < 0 || ev_last > n_events) ev_last = n_events;
@@ -1932,11 +1723,32 @@ void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, boo
 
   for (Long64_t ient = ev_first; ient < ev_last; ient++) {
     // Keep batch logs compact; final counters are printed after the loop.
-      
+
       t.GetEntry(ient);
       if (hiEvtTree) {
         hiEvtTree->GetEntry(ient);
         t.vz = hiEvtVz;
+      }
+      // JEC: replace jtpt by the corrected pT BEFORE any selection reads it. A jet whose
+      // inputs are unusable gets -999, which every pT cut downstream rejects.
+      if (Jec::enabled()) {
+        const double eventRho = hiEvtRhoLeaf->GetValue();
+        if (!std::isfinite(eventRho))
+          throw std::runtime_error("Non-finite event rho encountered while applying JEC");
+        for (Int_t ijet = 0; ijet < t.nref; ++ijet) {
+          if (!std::isfinite(t.rawpt[ijet]) || t.rawpt[ijet] <= 0 ||
+              !std::isfinite(t.jteta[ijet]) || !std::isfinite(t.jtarea[ijet])) {
+            t.jtpt[ijet] = -999.0f;
+            continue;
+          }
+          jec.SetJetPT(t.rawpt[ijet]);
+          jec.SetJetEta(t.jteta[ijet]);
+          jec.SetJetPhi(t.jtphi[ijet]);
+          jec.SetJetArea(t.jtarea[ijet]);
+          jec.SetRho(eventRho);
+          const double correctedPt = jec.GetCorrectedPT();
+          t.jtpt[ijet] = std::isfinite(correctedPt) && correctedPt > 0 ? correctedPt : -999.0f;
+        }
       }
       if (hltTree && cfg.dataset.RunN == 3) {
         hltTree->GetEntry(ient);
@@ -1951,23 +1763,22 @@ void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, boo
         t.pprimaryVertexFilter = skimPprimaryVertexFilter;
       }
 
-      // -- test tree branches are read: 
+      // -- test tree branches are read:
         // cout << "jtpt = " << t.jtpt[0] << endl;
-      
+
       double weight_tree = cfg.dataset.isMC ? (weightTree ? hiEvtWeight : t.weight) : 1.0;
 
-      // -- NEW: 
+      // -- NEW:
       if (! passPVQuality_EventSelection(t, cfg)) continue;
 
         // cout << "PV quality pass ok: t.vz = "<< t.vz  << endl;
           // if (cfg.dataset.RunN == 3 &&  !isMC ) cout << " and t.pprimaryVertexFilter = "<< t.pprimaryVertexFilter << endl;
 
-      // -- Trigger selections for all 
+      // -- Trigger selections for all
       if (! passEventSelection(t, cfg)) continue;
       // cout << "event pass ok" << endl;
 
     for (Int_t ijet = 0; ijet < t.nref; ijet++) { // Jet loop
-
 
       // Fill templates from DATA or RECO MC: jet kinematics + btagging
 
@@ -1983,13 +1794,16 @@ void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, boo
               // pt_nonb_reco: the jet's non-b track pT, filled by the same pass that builds
               // the SVs (it is the only place that knows which tracks were rejected).
               double pt_nonb_reco = 0.;
-              vector<ROOT::Math::PtEtaPhiMVector> reco_sv = makeSvtxs_withBDT(t, ijet, ient, agg_fail, nb_sv, sv_fail, merge_fail, nullptr, nullptr, &pt_nonb_reco);
+              std::vector<int> reco_sv_sta;
+              vector<ROOT::Math::PtEtaPhiMVector> reco_sv = makeSvtxs_withBDT(t, ijet, ient, agg_fail, nb_sv, sv_fail, merge_fail, nullptr, nullptr, &pt_nonb_reco, &reco_sv_sta);
 
               if (reco_sv.size() == 2){ // #sv must = 2 (default of makeSvtxs_withBDT())
 
                 double dr   = t.calc_dr(reco_sv[0].Eta(), reco_sv[0].Phi(), reco_sv[1].Eta(), reco_sv[1].Phi());
                 double pt1  = reco_sv[0].Pt();
                 double pt2  = reco_sv[1].Pt();
+                // SV b scale factor, one per b-matched SV (sv_sf.h). 1 for data and when off.
+                double w_svsf = SvSF::jetWeight(pt1, reco_sv_sta[0], pt2, reco_sv_sta[1]);
                 double eec  = EecWeight::value(pt1, pt2, cfg.n);
                 double jtpt = jtpt_fill(t.jtpt[ijet]);
                 double mB   = reco_sv[0].M() + reco_sv[1].M();
@@ -2037,17 +1851,16 @@ void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, boo
                 for (size_t io = 0; io < tmpl.size(); ++io) {
                   if (xreco[io] < 0.) continue;   // unusable pair for this observable
                   tmpl[io].fill(cfg.dataset.isMC, t.jtNbHad[ijet], ient,
-                                mB, xreco[io], jtpt, eec, weight_tree);
+                                mB, xreco[io], jtpt, eec, weight_tree * w_svsf);
                 }
 
                 } // end if (dr > 0.005)
                 }// Fill Templates
-              } // end if 2 SV 
-
+              } // end if 2 SV
 
     /////////---- To Prepare Response matrix (of true >=2B) ---- ONLY for MC (both RECO, GEN) ----
 	          if((isCreateRmatrix || doAggNtuple) && cfg.dataset.isMC && t.jtNbHad[ijet] >= 2)  // -- select jets of 2b (truth)
-          { 
+          {
 
             // -- common variables repeatdly used in fill histograms
             // jtpt_fill() folds jets above the last bin edge into that bin, so they are
@@ -2058,28 +1871,19 @@ void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, boo
             double jeta_gen = gen_jet_eta(t, ijet);
             // -- for cout only
             double btagVar =  (cfg.dataset.RunN == 2) ? (t.discr_particleNet_BvsAll[ijet]) :
-                              ( (cfg.dataset.RunN == 3) ? 
+                              ( (cfg.dataset.RunN == 3) ?
                                   (t.discr_unifiedParticleTransformer_probb[ijet] +
                                   t.discr_unifiedParticleTransformer_problepb[ijet] +
                                   t.discr_unifiedParticleTransformer_probbb[ijet]) :
 	                                  -1);
 
 	            // -- counts stats
-	            n_bb_jets++; // true >=2b jets 
+	            n_bb_jets++; // true >=2b jets
 
 	            aggRow.reset();
-	            aggRow.entry = ient;
-	            aggRow.run = t.run;
-	            aggRow.lumi = t.lumi;
-	            aggRow.evt = t.evt;
-	            aggRow.jetIndex = ijet;
-	            aggRow.weight = weight_tree;
-	            aggRow.jtpt = jpt_reco;
-	            aggRow.jteta = jeta_reco;
-	            aggRow.refpt = jpt_gen;
-	            aggRow.refeta = jeta_gen;
-	            aggRow.jtNbHad = t.jtNbHad[ijet];
-	            aggRow.btagScore = btagVar;
+	            aggRow.entry = ient; aggRow.run = t.run; aggRow.lumi = t.lumi; aggRow.evt = t.evt; aggRow.jetIndex = ijet;
+	            aggRow.weight = weight_tree; aggRow.jtNbHad = t.jtNbHad[ijet]; aggRow.btagScore = btagVar;
+	            aggRow.jtpt = jpt_reco; aggRow.jteta = jeta_reco; aggRow.refpt = jpt_gen; aggRow.refeta = jeta_gen;
 	            aggRow.passRecoKin = passRecoJetKinematics(t, ijet, cfg);
 	            aggRow.passGenKin = passGenJetKinematics(t, ijet, cfg);
 	            aggRow.passBtag = passBtag(t, ijet, cfg);
@@ -2129,31 +1933,22 @@ void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, boo
 	                //   fb_gen   = BFraction::value(pt_b_gen, pt_nonb_gen);
 	                //   lnfb_gen = LogBFraction::value(pt_b_gen, pt_nonb_gen);
 	                // }
-	                aggRow.genStatus1 = gen_bh_sta[best_i];
-	                aggRow.genStatus2 = gen_bh_sta[best_j];
-	                aggRow.genPt1 = gen_bh[best_i].Pt();
-	                aggRow.genEta1 = gen_bh[best_i].Eta();
-	                aggRow.genPhi1 = gen_bh[best_i].Phi();
-	                aggRow.genM1 = gen_bh[best_i].M();
-	                aggRow.genPt2 = gen_bh[best_j].Pt();
-	                aggRow.genEta2 = gen_bh[best_j].Eta();
-	                aggRow.genPhi2 = gen_bh[best_j].Phi();
-	                aggRow.genM2 = gen_bh[best_j].M();
-	                aggRow.genDr = dr_gen;
-	                aggRow.genMB = mB_gen;
-	                aggRow.genEec = eec_gen;
-					// overflow treatement at gen level	
+	                aggRow.genStatus1 = gen_bh_sta[best_i]; aggRow.genStatus2 = gen_bh_sta[best_j];
+	                aggRow.setGen(gen_bh[best_i], gen_bh[best_j]);
+	                aggRow.genDr = dr_gen; aggRow.genMB = mB_gen; aggRow.genEec = eec_gen;
+					// overflow treatement at gen level
 				    mB_gen_fill = mB_gen; dr_gen_fill = dr_gen;
                 if (mB_gen_fill >= mb_max) mB_gen_fill = mb_max_fill;
                 if (dr_gen_fill >= dr_max)  dr_gen_fill = dr_max_fill;
                 } // end if (gen_ok): gen-pair observables ready
-			  
-			  // -- Prepare combined b-tagger: 
+
+			  // -- Prepare combined b-tagger:
         // ---- Reco SVs ----
         // Same call as the template block above, and the non-b pT comes back the same way.
         double pt_nonb_reco_rm = 0.;
-        vector<ROOT::Math::PtEtaPhiMVector> reco_sv_rm = makeSvtxs_withBDT(t, ijet, ient, agg_fail_rm, nb_sv_rm, sv_fail_rm, merge_fail_rm, nullptr, nullptr, &pt_nonb_reco_rm);
-				  
+        std::vector<int> reco_sv_sta_rm;
+        vector<ROOT::Math::PtEtaPhiMVector> reco_sv_rm = makeSvtxs_withBDT(t, ijet, ient, agg_fail_rm, nb_sv_rm, sv_fail_rm, merge_fail_rm, nullptr, nullptr, &pt_nonb_reco_rm, &reco_sv_sta_rm);
+
 	      bool reco_sv_ok = (reco_sv_rm.size() == 2);
 	      aggRow.nRecoAgg = reco_sv_rm.size();
 	      if (reco_sv_ok) {
@@ -2162,17 +1957,8 @@ void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, boo
 	                                                        reco_sv_rm[1].Eta(), reco_sv_rm[1].Phi());
 	        const double eec_reco_diag =
 	            EecWeight::value(reco_sv_rm[0].Pt(), reco_sv_rm[1].Pt(), cfg.n);
-	        aggRow.recoPt1 = reco_sv_rm[0].Pt();
-	        aggRow.recoEta1 = reco_sv_rm[0].Eta();
-	        aggRow.recoPhi1 = reco_sv_rm[0].Phi();
-	        aggRow.recoM1 = reco_sv_rm[0].M();
-	        aggRow.recoPt2 = reco_sv_rm[1].Pt();
-	        aggRow.recoEta2 = reco_sv_rm[1].Eta();
-	        aggRow.recoPhi2 = reco_sv_rm[1].Phi();
-	        aggRow.recoM2 = reco_sv_rm[1].M();
-	        aggRow.recoDr = dr_reco_diag;
-	        aggRow.recoMB = mB_reco_diag;
-	        aggRow.recoEec = eec_reco_diag;
+	        aggRow.setReco(reco_sv_rm[0], reco_sv_rm[1]);
+	        aggRow.recoDr = dr_reco_diag; aggRow.recoMB = mB_reco_diag; aggRow.recoEec = eec_reco_diag;
 	      }
 	    if (aggBHadronTree) aggBHadronTree->Fill();
 	    if (!isCreateRmatrix) continue;
@@ -2192,10 +1978,9 @@ void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, boo
 
       // -- Prepare to Fill Rmatrix --
 		  // -- Reco pair info
-		  double mB_reco = -1, dr_reco = -1, eec_reco = -1;
-      mB_reco  = reco_sv_rm[0].M() + reco_sv_rm[1].M();
-      dr_reco  = t.calc_dr(reco_sv_rm[0].Eta(), reco_sv_rm[0].Phi(), reco_sv_rm[1].Eta(), reco_sv_rm[1].Phi());
-      eec_reco = EecWeight::value(reco_sv_rm[0].Pt(), reco_sv_rm[1].Pt(), cfg.n);
+      double mB_reco  = reco_sv_rm[0].M() + reco_sv_rm[1].M();
+      double dr_reco  = t.calc_dr(reco_sv_rm[0].Eta(), reco_sv_rm[0].Phi(), reco_sv_rm[1].Eta(), reco_sv_rm[1].Phi());
+      double eec_reco = EecWeight::value(reco_sv_rm[0].Pt(), reco_sv_rm[1].Pt(), cfg.n);
       double B_reco = MomBalance::value(reco_sv_rm[0].Pt(), reco_sv_rm[1].Pt());
       // DISABLED 2026-09-22 with the fraction observables:
       //   double fnb_reco  = NonBFraction::value(reco_sv_rm[0].Pt() + reco_sv_rm[1].Pt(),
@@ -2205,18 +1990,20 @@ void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, boo
       //   double lnfb_reco = LogBFraction::value(reco_sv_rm[0].Pt() + reco_sv_rm[1].Pt(),
       //                                          pt_nonb_reco_rm);
       (void)pt_nonb_reco_rm;
-		  double w_reco = weight_tree * eec_reco;
+      // SV b scale factor (sv_sf.h): every fill from here on is made from these two reco SVs,
+      // so it carries the SF -- including w_gen in the SV+b-tag efficiency NUMERATOR below.
+      // The all-true-2b denominator (fillGenAll, above) is before the SVs and stays unweighted.
+      double w_svsf = SvSF::jetWeight(reco_sv_rm[0].Pt(), reco_sv_sta_rm[0],
+                                      reco_sv_rm[1].Pt(), reco_sv_sta_rm[1]);
+		  double w_reco = weight_tree * eec_reco * w_svsf;
 
       // Fill total number of True 2b Jets (Deno of b-tagging eff. correction) before b-tagger: simialr axis to what we unfold to. - used after unfolding
 			if (gen_ok)
 			  for (size_t io = 0; io < resp.size(); ++io)
 			    if (xgen_raw[io] >= 0.) resp[io].fillGenPreBtag(xgen_raw[io], jpt_gen, w_reco);
-			   
-			// -- Use combined b-tagger: Upart tagger + 2SV of aggreagted Bs., for Rmatrix unfolding, purity, reconstruction eff. 
+
+			// -- Use combined b-tagger: Upart tagger + 2SV of aggreagted Bs., for Rmatrix unfolding, purity, reconstruction eff.
 			if (!passBtag(t, ijet, cfg)) continue; // select btagged jets only (reco_sv_ok already required above)
-			  
-
-
 
 			// Fill total number of True 2b Jets that survive after btagging condition (Num of b tagging eff. correction - used after unfolding)
 			// and the combined SV-reco + b-tag efficiency NUMERATOR = 2b jets reconstructed
@@ -2224,7 +2011,7 @@ void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, boo
 			// hgenjet_2b_all.
 			if (gen_ok)
 			  for (size_t io = 0; io < resp.size(); ++io)
-			    if (xgen_raw[io] >= 0.) resp[io].fillGenPostBtag(xgen_raw[io], jpt_gen, w_reco, w_gen);
+			    if (xgen_raw[io] >= 0.) resp[io].fillGenPostBtag(xgen_raw[io], jpt_gen, w_reco, w_gen * w_svsf);
 
 			// DEBUG: reco SV pt vs gen partial-B pt (pt-rank matched), to explain the EEC-weight factor.
 			if (gen_ok) {
@@ -2236,17 +2023,14 @@ void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, boo
 			  if (g_lo > 0) h_ptratio->Fill(r_lo / g_lo, weight_tree);
 			}
 
-		 
-
-
 	      // Overflow protection at reco level
 	              double mB_reco_fill = mB_reco, dr_reco_fill = dr_reco;
                   if (mB_reco_fill >= mb_max) mB_reco_fill = mb_max_fill;
                   if (dr_reco_fill >= dr_max) dr_reco_fill = dr_max_fill;
-			   
+
             // Define reco_pass: full detector-level selection
-            bool reco_pass = passRecoJetKinematics(t, ijet, cfg) && dr_reco_fill > 0.005; 
-                
+            bool reco_pass = passRecoJetKinematics(t, ijet, cfg) && dr_reco_fill > 0.005;
+
             // Define gen_pass: particle-level jet kinematics + gen observable range.
             // Requires gen_ok, so a jet with < 2 gen B-hadrons stays out of num/eff/response.
             bool gen_pass  = gen_ok && passGenJetKinematics(t, ijet, cfg);
@@ -2277,7 +2061,7 @@ void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, boo
                     << std::endl;
                 ++n_weight_debug_printed;
             }
-          
+
             // --- debugging paragraph ----
             //std::cout << "gen_pass: " << gen_pass << std::endl;
             //std::cout << "jpt_gen: " << jpt_gen << std::endl;
@@ -2304,7 +2088,7 @@ void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, boo
             if (n_debug_printed < 10) {
                 std::cout << "[DBG jet " << n_debug_printed << "]"
                     << " jpt_reco=" << jpt_reco
-                    << " jpt_gen="  <<  t.refpt[ijet]  // jpt_gen 
+                    << " jpt_gen="  <<  t.refpt[ijet]  // jpt_gen
                     << " reco jteta="    << jeta_reco
                     << " gen jteta="   << t.refeta[ijet] //  jeta_gen
                     << " discr="    << btagVar
@@ -2337,7 +2121,6 @@ void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, boo
                                     has_gen  ? o.fill(xgen_raw[io])  : 0., jpt_gen, w_reco);
             }
 
-
           } // END if MC()
 
       }// JET LOOP
@@ -2345,16 +2128,8 @@ void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, boo
 	  } // EVENT LOOP
 	  std::cout << std::endl;
 
-	  if (aggBHadronTree && fout_agg) {
-	    fout_agg->cd();
-	    aggBHadronTree->Write();
-	    fout_agg->Close();
-	    delete fout_agg;
-	  }
-	  if (eventInfoFile) {
-	    eventInfoFile->Close();
-	    delete eventInfoFile;
-	  }
+	  if (aggBHadronTree && fout_agg) { fout_agg->cd(); aggBHadronTree->Write(); fout_agg->Close(); delete fout_agg; }
+	  if (eventInfoFile) { eventInfoFile->Close(); delete eventInfoFile; }
 
 	  // Response-matrix efficiency and purity, then write the output file
   if(isCreateRmatrix && cfg.dataset.isMC)
@@ -2405,44 +2180,33 @@ void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, boo
 
     // Observable-independent debug histograms, written once.
     std::cout << "[EEC-weight debug] mean reco/gen SV pt = " << h_ptratio->GetMean() << std::endl;
-    h_svpt_vs_bpt->Write();
-    h_ptratio->Write();
-
-    fout_rm->Close();
-    delete fout_rm;
+    h_svpt_vs_bpt->Write(); h_ptratio->Write();
+    fout_rm->Close(); delete fout_rm;
   } // end if MC () after event loop  -- For Response matrix related hists.
-  
 
 // Write templates to the output root file
 if(isMakeTemplates)
 {
   std::cout << "Creating: " << fout_name << std::endl;
   TFile* outFile = new TFile(fout_name, "RECREATE");
-    hpt_selectedJets->Write();
-    hpt_selectedJets_noweight->Write();
+  hpt_selectedJets->Write(); hpt_selectedJets_noweight->Write();
 
   // One template set per observable; dr's names are unchanged, B's carry "_B".
   for (const TemplateHistos &h : tmpl) h.write(cfg.dataset.isMC);
 
-  outFile->Close();
-  delete outFile;
+  outFile->Close(); delete outFile;
 }
 
-} // end Function 
-
-
-
-
+} // end Function
 
 // ---- disabled (kept for reference): filter_b_bb_as_data_and_mc, split-sample variant ----
 #if 0
 void filter_b_bb_as_data_and_mc(const AnalysisConfig& cfg) {
   TString output_hist =  Form("SPLIT_TEST_templatefit_n%d_bjet_Run%d", 1, cfg.dataset.RunN);
-  
-  
+
   double prescale = cfg.dataset.data_prescale;
   TString fout_name = cfg.dataset.output_folder + cfg.dataset.output_hist + "MCGEN.root"; // for reposnse matrix: has Prefix: Response
-  
+
   // true level information aggregated to partial Bs
   tTree t;
   t.Init(cfg.dataset.filename, cfg.dataset.isMC, cfg.dataset.RunN);
@@ -2454,38 +2218,34 @@ void filter_b_bb_as_data_and_mc(const AnalysisConfig& cfg) {
   double nb_sv=0 ;
   double lt2sv = 0 ;
   double totjt = 0;
-  double beforeskip = 0 ;    
+  double beforeskip = 0 ;
   double vertskip = 0 ;
   double matchskip = 0;
   double merge_fail = 0 ;
   double sv_fail = 0 ;
-  double global_count = 0 ; 
+  double global_count = 0 ;
 
-
-  
-
-   
   // Plots or histograms
   TH3D *h3D_bb_bkg = new TH3D("h3D_bb_bkg", "#DeltaR;EEC",bins_mb, mb_binsVector, bins_dr, dr_binsVector,jtpt_bins, jtpt_binsVector);
-  TH3D *h3D_b_bkg = new TH3D("h3D_b_bkg", "#DeltaR;EEC", bins_mb, mb_binsVector, bins_dr, dr_binsVector,jtpt_bins, jtpt_binsVector);    
+  TH3D *h3D_b_bkg = new TH3D("h3D_b_bkg", "#DeltaR;EEC", bins_mb, mb_binsVector, bins_dr, dr_binsVector,jtpt_bins, jtpt_binsVector);
   TH3D *h3D_bb_signal = new TH3D("h3D_bb_signal", "#DeltaR;EEC",bins_mb, mb_binsVector, bins_dr, dr_binsVector,jtpt_bins, jtpt_binsVector);
-  TH3D *h3D_b_signal = new TH3D("h3D_b_signal", "#DeltaR;EEC", bins_mb, mb_binsVector, bins_dr, dr_binsVector,jtpt_bins, jtpt_binsVector);    
+  TH3D *h3D_b_signal = new TH3D("h3D_b_signal", "#DeltaR;EEC", bins_mb, mb_binsVector, bins_dr, dr_binsVector,jtpt_bins, jtpt_binsVector);
 
   TH2F* global_histo = new TH2F("global_histo", "distribution of wrong reco with pt; pT; reco proportion", 40, 0, 180, 40, 0, 1.2);
-  
+
   TH1D *h_0b_score = new TH1D("h_0b_score", "Distribution of Score", 50, -1.5, 1.5);
   TH1D *h_1b_score = new TH1D("h_1b_score", "Distribution of Score", 50, -1.5, 1.5);
- 
+
   h3D_bb_bkg->Sumw2();
   h3D_b_bkg->Sumw2();
   h3D_bb_signal->Sumw2();
   h3D_b_signal->Sumw2();
-    
+
   TRandom3 rnd(12345);
-  Long64_t n_events = t.GetEntries();                                                                                                
+  Long64_t n_events = t.GetEntries();
   for (Long64_t ient = 0; ient < n_events; ient++) {
     //Progress
-    if (ient % 50000 == 0) {                                                                                                         
+    if (ient % 50000 == 0) {
       float percent = 100.0 * ient / n_events;
       std::cout << "\rProcessing: "  << percent << " %" << std::flush;
     }
@@ -2533,21 +2293,18 @@ void filter_b_bb_as_data_and_mc(const AnalysisConfig& cfg) {
   } //close jet loop
   } //close event loop
 
-
   // -------- Save histograms -------
   TString label = "_btag";
-  if(!cfg.physics.useBtag) label = "_nobtag"; 
+  if(!cfg.physics.useBtag) label = "_nobtag";
 
-  TFile outFile( (cfg.dataset.output_folder + output_hist + label + cfg.dataset.domain).Data(), "RECREATE");                                                                                                                                             
+  TFile outFile( (cfg.dataset.output_folder + output_hist + label + cfg.dataset.domain).Data(), "RECREATE");
   h3D_b_signal->Write();
   h3D_b_bkg->Write();
   h3D_bb_signal->Write();
   h3D_bb_bkg->Write();
 
-
   h_0b_score->Write();
   h_1b_score->Write();
-
 
   outFile.Close();
 
@@ -2563,18 +2320,12 @@ void create_files_for_template_fit(Int_t RunN = 3, Float_t pT_low = 80, Float_t 
                                    bool makeAggNtuple = true, Long64_t ev_first = 0, Long64_t ev_last = -1, const char* inputFileOverride = "", const char* outputFolderOverride = "",
                                    const char* sampleTag = "",
                                    bool track_eff_unc = false, ULong64_t trkSeed = 20260908,
-                                   bool eec_weight_off = false){
+                                   bool eec_weight_off = false,
+                                   bool apply_jec = false,
+                                   const char* sv_sf = "off"){
  // load at prompt: gSystem->Load("libGenVector");
  // -- test use of central configuration
-  AnalysisConfig cfg =  buildConfig(
-    RunN,
-    pT_low,
-    etaCut,
-    n,
-	  btag,
-	  isMC,
-	  btagWP,
-	  sampleTag);
+  AnalysisConfig cfg = buildConfig(RunN, pT_low, etaCut, n, btag, isMC, btagWP, sampleTag);
 
 	  if (inputFileOverride && std::string(inputFileOverride).size() > 0) {
 	    cfg.dataset.filename = inputFileOverride;
@@ -2604,11 +2355,22 @@ void create_files_for_template_fit(Int_t RunN = 3, Float_t pT_low = 80, Float_t 
 	  EecWeight::enable(!eec_weight_off);
 	  EecWeight::print();
 
+	  // ---- Jet energy corrections on/off (see the Jec namespace at the top) ----
+	  Jec::enable(apply_jec);
+	  Jec::print(cfg.dataset.isMC);
+
+	  // ---- SV b scale factor (see sv_sf.h) ----
+	  // "off" (default) changes nothing. "nominal" weights every b-matched reco SV in MC by
+	  // SF(aggregate pT); "up"/"down" shift that SF by its stat (+) syst uncertainty. Data is
+	  // never weighted, hence the isMC guard inside.
+	  SvSF::enable(sv_sf, cfg.dataset.isMC);
+	  SvSF::print();
+
       // make_templates(cfg, 1, 1e+04);
       // TString output_hist_response =  Form("response_templatefit_n1_bjet_Run%d", cfg.dataset.RunN);
       // create_response_templatefit(cfg, output_hist_response, 0, 1e+04);
 
-    cout << "Build_templates " << endl; 
+    cout << "Build_templates " << endl;
     Build_templates(cfg, makeTemplates, createRmatrix, ev_first, ev_last, -1, makeAggNtuple); // switches exposed for diagnostic/template-only runs
 
    std::cout << "finished :) :D " << std::endl;

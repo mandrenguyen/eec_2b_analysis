@@ -33,7 +33,12 @@ esac
 
 # Pythia8 chunks carry the generator in the filename, the Herwig ones do not:
 #   merged_block_0000_Pythia8_UParTV2.root  vs  merged_block_0000_UParTV2.root
-FILE_TAG=$([ "${GENERATOR}" = pythia ] && echo "Pythia8_${INPUT_TAG}" || echo "${INPUT_TAG}")
+# INPUT_SUFFIX: Marc re-made every chunk on 2026-09-22..24 as ..._UParTV2_rho.root and the
+# un-suffixed ones are gone. Keep OUT_TAG distinct from any pre-_rho production (upartv2rho,
+# upartv2rho_B -- see eraTag() in result_paths.h): _rho has 8 Pythia blocks per sample where
+# the old had 10/9, and old blocks left under the same name would be summed in.
+INPUT_SUFFIX=${INPUT_SUFFIX-_rho}
+FILE_TAG=$([ "${GENERATOR}" = pythia ] && echo "Pythia8_${INPUT_TAG}" || echo "${INPUT_TAG}")${INPUT_SUFFIX}
 
 INPUT_DIR=/data_CMS/cms/mnguyen/bJetAggRun3/PPRef2024/${IN_SUBDIR}
 OUT_BASE=$mydata/bJetAggRun3/PPRef2024/${OUT_SUBDIR}/agg_ntuple_chunks
@@ -45,6 +50,25 @@ SAMPLE_TAG=${SAMPLE}
 # instead of overwriting the nominal one:  OUT_TAG=upartv2_B ./run_agg_ntuple_chunks.sh
 OUT_TAG=${OUT_TAG:-upartv2}
 OUT_SUFFIX="${OUT_TAG:+_${OUT_TAG}}"
+
+# ---------------------------------------------------------------------------
+# Jet energy corrections (2024 pp-reference JEC, as in Matt's JEC_Prompt24HIpp files)
+# ---------------------------------------------------------------------------
+# false (default) keeps jtpt as stored in the forest, so every existing production is
+# reproduced unchanged. true recomputes jtpt from rawpt with L1FastJet + L2Relative (+ the
+# L2Residual on data) before any selection -- see the Jec namespace in
+# create_files_for_template_fit.cpp. The OUT_TAG must then say "jec" (eraTag() in
+# result_paths.h: upartv2rhojec / upartv2rhojec_B), and must NOT say it otherwise, so
+# corrected and uncorrected files can never share a name.
+APPLY_JEC=${APPLY_JEC:-false}   # true | false
+if [ "${APPLY_JEC}" != true ] && [ "${APPLY_JEC}" != false ]; then
+  echo "APPLY_JEC must be exactly 'true' or 'false', got '${APPLY_JEC}'"; exit 1
+fi
+case "${OUT_TAG}" in
+  *jec*) [ "${APPLY_JEC}" = true ]  || { echo "OUT_TAG '${OUT_TAG}' says jec but APPLY_JEC=false -- refusing"; exit 1; } ;;
+  *)     [ "${APPLY_JEC}" = false ] || { echo "APPLY_JEC=true needs an OUT_TAG containing 'jec' (e.g. upartv2rhojec) -- refusing"; exit 1; } ;;
+esac
+[ "${APPLY_JEC}" = true ] && echo "JEC ON: jtpt recomputed from rawpt (L1FastJet + L2Relative, + L2Residual on data)"
 
 # ---- Tracking-efficiency systematic -----------------------------------------
 # false = nominal production (nothing is dropped, output names unchanged)
@@ -76,10 +100,32 @@ TRK_SEED=20260908
 # at the top of create_files_for_template_fit.cpp.
 EEC_WEIGHT_OFF=${EEC_WEIGHT_OFF:-false}   # true | false
 
+# ---------------------------------------------------------------------------
+# SV b scale factor (sv_sfb_singleb_aggpt_jp_wp712_mu5_systematics.root, see sv_sf.h)
+# ---------------------------------------------------------------------------
+# off     no SF, output names as before 2026-10-12 (was the default until then)
+# nominal every b-matched reco SV weighted by SF(aggregate pT)           tag _svsf
+# up/down SF shifted by +/- sqrt(stat^2 + syst_total^2), coherently    tag _svsfup / _svsfdn
+# MC only. The macro tags its own files, as for the tracking variation.
+# Default "nominal" since 2026-10-12, matching the readers (svsfNominal() in result_paths.h):
+# the SF is part of the nominal MC now. SV_SF=off reproduces the earlier no-SF productions.
+# SV_SF=${SV_SF:-off}   # off | nominal | up | down
+SV_SF=${SV_SF:-nominal}   # off | nominal | up | down
+case "${SV_SF}" in
+  off)     SVSF_TAG="" ;;
+  nominal) SVSF_TAG="_svsf" ;;
+  up)      SVSF_TAG="_svsfup" ;;
+  down)    SVSF_TAG="_svsfdn" ;;
+  # per-contribution variations (2026-10-13), see sv_sf.h
+  statup|statdn|nomuonup|nomuondn|bbup|bbdn|jpup|jpdn|qqup|qqdn) SVSF_TAG="_svsf${SV_SF}" ;;
+  *) echo "SV_SF must be off | nominal | up | down | stat|nomuon|bb|jp|qq + up|dn, got '${SV_SF}'"; exit 1 ;;
+esac
+[ "${SV_SF}" != off ] && echo "SV b SCALE FACTOR: ${SV_SF}, file tag ${SVSF_TAG}"
+
 # Same tags the macro builds, for the staging dir and the log filenames.
 TRK_TAG=$([ "${TRACK_EFF_UNC}" = true ] && echo "_trkdrop030" || echo "")
 EECW_TAG=$([ "${EEC_WEIGHT_OFF}" = true ] && echo "_noeecw" || echo "")
-TRK_TAG="${TRK_TAG}${EECW_TAG}"
+TRK_TAG="${TRK_TAG}${SVSF_TAG}${EECW_TAG}"
 
 case "${INPUT_TAG}" in
   UParTV2)   BTAG_WP=0.712 ;;
@@ -115,6 +161,17 @@ mkdir -p "${LOG_DIR}"
 cd "${WORK}" || exit 1
 
 COMPILE_LOG="${LOG_DIR}/compile.log"
+SO="${ACLIC_BUILD_DIR}/create_files_for_template_fit_cpp.so"
+
+# SKIP_COMPILE=true reuses the .so already in the build dir instead of deleting and
+# rebuilding it. That is what lets several productions (and the condor data jobs) run at
+# the same time: a normal run rm's the .so, and every other job that loads it meanwhile
+# fails. The staleness check below still runs, so a .so older than the sources is refused.
+SKIP_COMPILE=${SKIP_COMPILE:-false}
+if [ "${SKIP_COMPILE}" = true ]; then
+  echo "SKIP_COMPILE: reusing ${SO}"
+  [ -f "${SO}" ] || { echo "no ${SO} -- run once without SKIP_COMPILE first"; exit 1; }
+else
 echo "compiling create_files_for_template_fit.cpp once before launching parallel jobs"
 
 # Drop half-written ACLiC products from a previous parallel launch.
@@ -139,17 +196,17 @@ root -l -b > "${COMPILE_LOG}" 2>&1 <<EOF
 EOF
 compile_status=$?
 
-SO="${ACLIC_BUILD_DIR}/create_files_for_template_fit_cpp.so"
 if [ ${compile_status} -ne 0 ] || [ ! -f "${SO}" ] || grep -q "Error in <ACLiC>" "${COMPILE_LOG}"; then
   echo "compile FAILED -- not launching any jobs. Last 80 lines of ${COMPILE_LOG}:"
   tail -n 80 "${COMPILE_LOG}"
   exit 1
 fi
+fi   # SKIP_COMPILE
 
 # The .so must be NEWER than every source it is built from, or a failed rebuild left the
 # previous one in place and the jobs would run the wrong code.
 for src in create_files_for_template_fit.cpp observables.h binning_histos_small.h \
-           result_paths.h tTree.h tracking_efficiency_syst.h; do
+           result_paths.h tTree.h tracking_efficiency_syst.h central_selections.h sv_sf.h; do
   if [ -e "${WORK}/${src}" ] && [ "${WORK}/${src}" -nt "${SO}" ]; then
     echo "compile FAILED -- ${src} is newer than ${SO}; the build did not take. Not launching."
     tail -n 40 "${COMPILE_LOG}"
@@ -185,10 +242,10 @@ for input in "${inputs[@]}"; do
 
   (
   
-  # Remeber: create_files_for_template_fit(Int_t RunN = 3, Float_t pT_low = 80, Float_t etaCut = 2, Int_t n = 1,bool btag = true, bool isMC = true, Double_t btagWP = 0.712, bool makeTemplates = true, bool createRmatrix = true, bool makeAggNtuple = true, Long64_t ev_first = 0, Long64_t ev_last = -1, const char* inputFileOverride = "", const char* outputFolderOverride = "", const char* sampleTag = "", bool track_eff_unc = false, ULong64_t trkSeed = 20260908, bool eec_weight_off = false)
-  # MC vs data is the isMC argument; bjet vs qcd is SAMPLE_TAG (last argument).
+  # Remeber: create_files_for_template_fit(Int_t RunN = 3, Float_t pT_low = 80, Float_t etaCut = 2, Int_t n = 1,bool btag = true, bool isMC = true, Double_t btagWP = 0.712, bool makeTemplates = true, bool createRmatrix = true, bool makeAggNtuple = true, Long64_t ev_first = 0, Long64_t ev_last = -1, const char* inputFileOverride = "", const char* outputFolderOverride = "", const char* sampleTag = "", bool track_eff_unc = false, ULong64_t trkSeed = 20260908, bool eec_weight_off = false, bool apply_jec = false, const char* sv_sf = "off")
+  # MC vs data is the isMC argument; bjet vs qcd is SAMPLE_TAG.
 
-  nice -n 10 root -l -b -q -e "gSystem->Load(\"${ACLIC_BUILD_DIR}/create_files_for_template_fit_cpp.so\"); create_files_for_template_fit(3,80,2,1,true,true,${BTAG_WP},true,true,true,0,-1,\"${input}\",\"${stagedir}\",\"${SAMPLE_TAG}\",${TRACK_EFF_UNC},${TRK_SEED},${EEC_WEIGHT_OFF})"
+  nice -n 10 root -l -b -q -e "gSystem->Load(\"${ACLIC_BUILD_DIR}/create_files_for_template_fit_cpp.so\"); create_files_for_template_fit(3,80,2,1,true,true,${BTAG_WP},true,true,true,0,-1,\"${input}\",\"${stagedir}\",\"${SAMPLE_TAG}\",${TRACK_EFF_UNC},${TRK_SEED},${EEC_WEIGHT_OFF},${APPLY_JEC},\"${SV_SF}\")"
 
     for f in "${stagedir}"/*.root; do
       [ -e "${f}" ] || continue

@@ -316,6 +316,11 @@ std::vector<TString> getActiveBranches(const AnalysisConfig& cfg)
         "jtpt",
         "jteta",
         "nref",
+        // Inputs of the JEC (Jec namespace in create_files_for_template_fit.cpp): the
+        // correction is computed from rawpt, eta, phi and the jet area. Off -> unused.
+        "rawpt",
+        "jtphi",
+        "jtarea",
 
         "jtNtrk",
         "jtNsvtx",

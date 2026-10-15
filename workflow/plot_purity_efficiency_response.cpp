@@ -101,7 +101,7 @@ void drawCorrectionMap(TH2D *h, const char *ztitle, const char *level,
     t.SetTextAngle(0);       
   }
 
-void drawCMSHeader(TPad *pad, const char *sublabel = "Internal Simulation",
+void drawCMSHeader(TPad *pad, const char *sublabel = "Work In Progress",
                    const char *rightlabel = "2024 pp (5.36 TeV)")
 {
     if (!pad) return;

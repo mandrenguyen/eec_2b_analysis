@@ -13,6 +13,10 @@ CONDOR_LOG_DIR=/data_CMS/cms/zaidan/bJetAggRun3/PPRef2024/condor/logfiles
 # INPUT_TAG names the chunk subdir (<TAG>_chunks) and the per-block filenames.
 #INPUT_TAG=negTagFix
 INPUT_TAG=UParTV2
+# Marc re-made the data chunks on 2026-09-22..24 as merged_block_NNNN_UParTV2_rho.root and the
+# un-suffixed ones are gone (they were 543-byte stubs mid-rewrite -- which the missing-input
+# check below lets through, so never point this at a half-written area).
+INPUT_SUFFIX=${INPUT_SUFFIX-_rho}
 
 # SAMPLE_TAG replaces the old dataType argument: the macro puts it in the output histogram
 # names (..._template_for_fit_histos_3D_<SAMPLE_TAG>_f). These jobs run HardProbes data.
@@ -42,8 +46,31 @@ fi
 # write to its own files:  OUT_TAG=upartv2_B ./make_hardprobes_condor_scripts.sh
 OUT_TAG=${OUT_TAG:-upartv2}
 OUT_SUFFIX="${OUT_TAG:+_${OUT_TAG}}"
+
+# ---------------------------------------------------------------------------
+# Jet energy corrections (2024 pp-reference JEC, as in Matt's JEC_Prompt24HIpp files)
+# ---------------------------------------------------------------------------
+# false (default) keeps jtpt as stored in the forest, so every existing production is
+# reproduced unchanged. true recomputes jtpt from rawpt with L1FastJet + L2Relative (+ the
+# L2Residual on data) before any selection -- see the Jec namespace in
+# create_files_for_template_fit.cpp. The OUT_TAG must then say "jec" (eraTag() in
+# result_paths.h: upartv2rhojec / upartv2rhojec_B), and must NOT say it otherwise, so
+# corrected and uncorrected files can never share a name.
+APPLY_JEC=${APPLY_JEC:-false}   # true | false
+if [ "${APPLY_JEC}" != true ] && [ "${APPLY_JEC}" != false ]; then
+  echo "APPLY_JEC must be exactly 'true' or 'false', got '${APPLY_JEC}'"; exit 1
+fi
+case "${OUT_TAG}" in
+  *jec*) [ "${APPLY_JEC}" = true ]  || { echo "OUT_TAG '${OUT_TAG}' says jec but APPLY_JEC=false -- refusing"; exit 1; } ;;
+  *)     [ "${APPLY_JEC}" = false ] || { echo "APPLY_JEC=true needs an OUT_TAG containing 'jec' (e.g. upartv2rhojec) -- refusing"; exit 1; } ;;
+esac
+[ "${APPLY_JEC}" = true ] && echo "JEC ON: jtpt recomputed from rawpt (L1FastJet + L2Relative, + L2Residual on data)"
 # Staging dir only, so two productions can never share a staging area.
 STAGE_TAG="${EECW_TAG}${OUT_SUFFIX}"
+# The job scripts get their own directory per production too, so two productions (the EEC and
+# the yield one) can be generated and queued at the same time without the second rm'ing the
+# first one's scripts. Submit with the matching Executable (printed at the end).
+SCRIPT_DIR="${SCRIPT_DIR}${STAGE_TAG}"
 
 # Must match BTAG_WP in run_agg_ntuple_chunks.sh.
 case "${INPUT_TAG}" in
@@ -66,7 +93,7 @@ for primary_dataset in $(seq 0 4); do
   for i in $(seq 0 9); do
     block=$(printf "000%d" "${i}")
     script="${SCRIPT_DIR}/jobs_${job_index}.sh"
-    input="${input_dir}/merged_block_${block}_${INPUT_TAG}.root"
+    input="${input_dir}/merged_block_${block}_${INPUT_TAG}${INPUT_SUFFIX}.root"
     outdir="${OUT_BASE}/HardProbes${primary_dataset}/block_${block}"
     logdir="${OUT_BASE}/HardProbes${primary_dataset}/logs"
     # The macro picks its own filenames, so stage them and rename on the way out.
@@ -104,7 +131,7 @@ if [ ! -f "\${ACLIC_BUILD_DIR}/create_files_for_template_fit_cpp.so" ]; then
   exit 3
 fi
 
-root -l -b -q -e "gSystem->AddIncludePath(\"-I\${ROOUNFOLD_INC} -I\${ROOUNFOLD_BUILD}\"); if (gSystem->Load(\"\${ROOUNFOLD_BUILD}/libRooUnfold.so\") < 0) gSystem->Exit(3); if (gSystem->Load(\"\${ACLIC_BUILD_DIR}/create_files_for_template_fit_cpp.so\") < 0) gSystem->Exit(3); create_files_for_template_fit(3,80,2,1,true,false,${BTAG_WP},true,false,true,0,-1,\"\${INPUT}\",\"\${STAGEDIR}\",\"${SAMPLE_TAG}\",false,20260908,${EEC_WEIGHT_OFF})"
+root -l -b -q -e "gSystem->AddIncludePath(\"-I\${ROOUNFOLD_INC} -I\${ROOUNFOLD_BUILD}\"); if (gSystem->Load(\"\${ROOUNFOLD_BUILD}/libRooUnfold.so\") < 0) gSystem->Exit(3); if (gSystem->Load(\"\${ACLIC_BUILD_DIR}/create_files_for_template_fit_cpp.so\") < 0) gSystem->Exit(3); create_files_for_template_fit(3,80,2,1,true,false,${BTAG_WP},true,false,true,0,-1,\"\${INPUT}\",\"\${STAGEDIR}\",\"${SAMPLE_TAG}\",false,20260908,${EEC_WEIGHT_OFF},${APPLY_JEC})"
 
 for f in "\${STAGEDIR}"/*.root; do
   [ -e "\${f}" ] || continue
@@ -120,3 +147,5 @@ EOF
 done
 
 echo "created 50 scripts in ${SCRIPT_DIR}"
+echo "submit with:"
+echo "  condor_submit condor.submit -append 'Executable = ${SCRIPT_DIR}/jobs_\$(Process).sh'"

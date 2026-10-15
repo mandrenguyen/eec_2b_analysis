@@ -146,7 +146,7 @@ TString templateFitFile(const TString &sample, const TString &tfGenerator,
     // NAME and the wrong binning, the quietest possible way to be wrong.
     const TString obs_tag = (observable == "dr") ? "" : ("_" + observable);
     return "/data_CMS/cms/zaidan/bJetAggRun3/PPRef2024/results/TemplateFit_Run3/TemplateFits_"
-         + tf_sample + "_" + tfGenerator + trk_tag + eecw_tag + obs_tag + "_upartv2/"
+         + tf_sample + "_" + tfGenerator + trk_tag + svsfTag() + eecw_tag + obs_tag + eraTag() + "/"
          + tfVariation + "_Run3_TemplateFits_histos_3d_80_inf.root";
 
     /* ---- disabled (kept for reference): Afnan's fits, Pythia8 only ----
@@ -174,7 +174,9 @@ TString mcVarTag(bool track_eff_unc, bool eec_weight_off = false)
     // eecWeightTag() is "_noeecw": the yield production, written by the same macro with the
     // EEC weight switched off. Same delegation rule as above -- one literal, in
     // result_paths.h, shared by the MC-production names and the result folders.
-    return trkTag(track_eff_unc) + eecWeightTag(eec_weight_off);
+    // svsfTag(): the SV b scale-factor production when SV_SF is set (2026-10-12), in the
+    // position create_files_for_template_fit.cpp writes it (trk, svsf, noeecw).
+    return trkTag(track_eff_unc) + svsfTag() + eecWeightTag(eec_weight_off);
 }
 
 // One per-block file, or the top-level merged one when block < 0. prefix is "RMatrix_" or
@@ -223,8 +225,14 @@ struct RefoldGof {
     double chi2ndf() const { return ndf > 0 ? chi2 / ndf : -1.; }
 };
 
+// h_mc_meas (optional, added 2026-10-01): the response's own measured MC distribution. When
+// given, the refolded prediction carries the MC's relative statistical error in each bin, added
+// in quadrature to the data error -- as in CMS-AN-2024-133 (Sec. 5.6/6.6), where the response
+// MC statistics are propagated. Without it (the default) only the data error enters, which is
+// far stricter here: per bin the MC error is 1-2.6x the data's.
 RefoldGof refoldChi2(const TH2D *h_refolded, const TH2D *h_input,
-                     int ix_min, int ix_max, int iy_min, int iy_max)
+                     int ix_min, int ix_max, int iy_min, int iy_max,
+                     const TH2 *h_mc_meas = nullptr)
 {
     RefoldGof g;
     if (!h_refolded || !h_input) return g;
@@ -234,7 +242,12 @@ RefoldGof refoldChi2(const TH2D *h_refolded, const TH2D *h_input,
             const double ed = h_input->GetBinError(ix, iy);
             const double r  = h_refolded->GetBinContent(ix, iy);
             if (d == 0. || ed <= 0.) continue;
-            const double pull = (r - d) / ed;
+            double e2 = ed * ed;
+            if (h_mc_meas) {
+                const double m = h_mc_meas->GetBinContent(ix, iy);
+                if (m > 0.) e2 += std::pow(r * h_mc_meas->GetBinError(ix, iy) / m, 2);
+            }
+            const double pull = (r - d) / std::sqrt(e2);
             g.chi2 += pull * pull;
             ++g.ndf;
         }
@@ -831,7 +844,8 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
     TString png_dir  = folder + "bayesian_unfolding_iterations_" + label + "_png/"; // one PNG per iteration lands here
     if (scan_niter) gSystem->mkdir(png_dir, kTRUE);                     // create the PNG folder if it does not exist
     const int niter_min = 0;
-    const int niter_max = scan_niter ? 49 : 0;   // scan niter = 1..niter_max+1; one pass when not scanning
+    // 1..100 since 2026-10-01 (was 1..50): B does not reach a refolding p of 0.95 by 50.
+    const int niter_max = scan_niter ? 99 : 0;   // scan niter = 1..niter_max+1; one pass when not scanning
     const Int_t prev_ignore = gErrorIgnoreLevel;
     if (scan_niter) gErrorIgnoreLevel = kError;  // silence "Replacing existing histogram" spam from re-cloning each pass
 
@@ -841,16 +855,22 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
     // earlier iterations are still non-closing, later ones only overfit the input further.
     const double pvalue_threshold = 0.05;
     std::vector<double> v_niter, v_pvalue_all, v_pvalue_pt, v_chi2ndf_all, v_chi2ndf_pt;
+    // The same test with the response MC statistics included (see refoldChi2).
+    std::vector<double> v_pvalue_all_mc, v_chi2ndf_all_mc;
+    const TH2 *h_mc_meas_gof = dynamic_cast<const TH2 *>(response->Hmeasured());
+    // The unfolded result in the measured pT bin at every iteration (scan only), for the
+    // bias-vs-variance choice of niter after the loop (see "Bias vs statistical error" below).
+    std::vector<TH1D *> v_unf_pt;
 
     for (int iter = niter_min; iter <= niter_max; ++iter) {
 
     // Single non-scan pass keeps the nominal 7 iterations; the scan walks 1..100.
-    // scan_niter walks 1..50; otherwise use niter_fixed. The old hardcoded 7 is the default,
+    // scan_niter walks 1..100; otherwise use niter_fixed. The old hardcoded 7 is the default,
     // so an unchanged call is unchanged -- but for a new observable the right value has to be
     // found with scan_niter=true first. For the balance the scan says 21-26; 7 refolds at
     // chi2/ndf = 16 (p = 2e-29), i.e. badly under-iterated and still close to the prior.
     //
-    // ⚠️ A scan_niter run WRITES THE LAST PASS (niter = 50), not the optimum it reports. Use
+    // ⚠️ A scan_niter run WRITES THE LAST PASS (niter = 100), not the optimum it reports. Use
     // the scan to find the number, then re-run with scan_niter=false and niter_fixed set.
     const Int_t niter_now = scan_niter ? iter + 1 : niter_fixed;
 
@@ -915,6 +935,21 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
     v_pvalue_pt.push_back(gof_pt.pvalue);
     v_chi2ndf_all.push_back(gof_all.chi2ndf());
     v_chi2ndf_pt.push_back(gof_pt.chi2ndf());
+    {
+        const RefoldGof gof_mc = refoldChi2(h_data_refolded, h_data_purity_corrected,
+                                            ibin_dr_min, ibin_dr_max, 1, bins_pt, h_mc_meas_gof);
+        v_pvalue_all_mc.push_back(gof_mc.pvalue);
+        v_chi2ndf_all_mc.push_back(gof_mc.chi2ndf());
+        std::cout << Form("\t---->Refolding GoF, data (+) MC stat | 2D: chi2/ndf = %8.2f/%3d = %6.3f, p = %8.3e",
+                          gof_mc.chi2, gof_mc.ndf, gof_mc.chi2ndf(), gof_mc.pvalue) << std::endl;
+    }
+    if (scan_niter) {
+        // x is dr, y is pt: the measured pT bin, with the covariance-based errors of Hreco.
+        TH1D *u = h_data_unfolded->ProjectionX(Form("h_unf_pt_it%d", (int) niter_now),
+                                               ibin_pt, ibin_pt, "e");
+        u->SetDirectory(nullptr);
+        v_unf_pt.push_back(u);
+    }
 
     // ---- Apply efficiency correction
     TH2D *h_data_efficiency_corrected = (TH2D *) h_data_unfolded->Clone("h_data_efficiency_corrected");
@@ -1120,7 +1155,7 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
         // CMS Internal above the top axis (outside the frame)
         TLatex cms; cms.SetNDC();
         cms.SetTextFont(62); cms.SetTextSize(0.042); cms.DrawLatex(0.13, 0.945, "CMS");
-        cms.SetTextFont(52); cms.SetTextSize(0.034); cms.DrawLatex(0.235, 0.945, "Internal");
+        cms.SetTextFont(52); cms.SetTextSize(0.034); cms.DrawLatex(0.235, 0.945, "Work In Progress");
         cms.SetTextFont(42); cms.SetTextSize(0.034); cms.DrawLatex(0.66, 0.945, "pp #sqrt{s} = 5.36 TeV");
         pad_main->RedrawAxis();
 
@@ -1202,7 +1237,7 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
             // CMS Internal above the top axis
             TLatex cmsd; cmsd.SetNDC();
             cmsd.SetTextFont(62); cmsd.SetTextSize(0.042); cmsd.DrawLatex(0.13, 0.945, "CMS");
-            cmsd.SetTextFont(52); cmsd.SetTextSize(0.034); cmsd.DrawLatex(0.235, 0.945, "Internal");
+            cmsd.SetTextFont(52); cmsd.SetTextSize(0.034); cmsd.DrawLatex(0.235, 0.945, "Work In Progress");
             c_dbg->Print(folder + "debug_svpt_vs_bpt_" + label + ".pdf");
             c_dbg->Print(folder + "debug_svpt_vs_bpt_" + label + ".png");
         }
@@ -1423,7 +1458,7 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
         // CMS Internal above the top axis (outside the frame)
         TLatex cms_bl; cms_bl.SetNDC();
         cms_bl.SetTextFont(62); cms_bl.SetTextSize(0.045); cms_bl.DrawLatex(0.10, 0.945, "CMS"); // cms_bl.SetTextSize(0.042); 
-        cms_bl.SetTextFont(52); cms_bl.SetTextSize(0.037); cms_bl.DrawLatex(0.205, 0.945, "Internal"); // cms_bl.SetTextSize(0.034); 
+        cms_bl.SetTextFont(52); cms_bl.SetTextSize(0.037); cms_bl.DrawLatex(0.205, 0.945, "Work In Progress"); // cms_bl.SetTextSize(0.034); 
         cms_bl.SetTextFont(42); cms_bl.SetTextSize(0.037); cms_bl.DrawLatex(0.66, 0.945, "pp #sqrt{s} = 5.36 TeV"); // cms_bl.SetTextSize(0.034);
 
         pad_main->RedrawAxis();
@@ -1704,28 +1739,139 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
                   << "  input   : h_data_purity_corrected (reconstructed level)\n"
                   << "  refolded: response->ApplyToTruth(unfolded)\n"
                   << Form("  criterion: smallest niter with p >= %.3f\n", pvalue_threshold);
-        std::cout << Form("  %6s  %12s %10s   %12s %10s\n",
-                          "niter", "chi2/ndf 2D", "p 2D", "chi2/ndf pT", "p pT");
+        std::cout << Form("  %6s  %12s %10s   %12s %10s   %14s %10s\n",
+                          "niter", "chi2/ndf 2D", "p 2D", "chi2/ndf pT", "p pT",
+                          "chi2/ndf 2D+MC", "p 2D+MC");
         for (size_t i = 0; i < v_niter.size(); ++i)
-            std::cout << Form("  %6.0f  %12.3f %10.3e   %12.3f %10.3e\n",
+            std::cout << Form("  %6.0f  %12.3f %10.3e   %12.3f %10.3e   %14.3f %10.3e\n",
                               v_niter[i], v_chi2ndf_all[i], v_pvalue_all[i],
-                              v_chi2ndf_pt[i], v_pvalue_pt[i]);
+                              v_chi2ndf_pt[i], v_pvalue_pt[i],
+                              v_chi2ndf_all_mc[i], v_pvalue_all_mc[i]);
+        // CMS-AN-2024-133 rule: first iteration with p >= 0.95, with the MC statistics included.
+        auto firstAboveT = [&](const std::vector<double> &p, double t) -> int {
+            for (size_t i = 0; i < p.size(); ++i) if (p[i] >= t) return (int) v_niter[i];
+            return -1;
+        };
+        // THE CHOICE (Zoe, 2026-10-02), as in CMS-AN-2024-133 Sec. 5.6/6: the first iteration whose
+        // refolded distribution reaches p >= 0.95 against the input, with the data and the response
+        // MC statistical errors combined. The analysis driver reads the OPTIMAL line below.
+        const double an_threshold = 0.95;
+        const int best_an = firstAboveT(v_pvalue_all_mc, an_threshold);
+        std::cout << Form("  ----> first p >= 0.95, data stat only       = %d\n", firstAboveT(v_pvalue_all, 0.95))
+                  << Form("  ----> first p >= 0.05, data (+) MC stat     = %d\n", firstAboveT(v_pvalue_all_mc, 0.05))
+                  << Form("  ----> OPTIMAL niter (AN-2024-133: first p >= %.2f, data (+) MC stat) = %d\n",
+                          an_threshold, best_an);
         std::cout << Form("  ----> optimal niter (full 2D reco space) = %d\n", best_all)
                   << Form("  ----> optimal niter (pT bin %d only)      = %d\n", ibin_pt, best_pt)
                   << Form("  ----> cross-check, chi2/ndf closest to 1 = %d\n", c2one_all)
                   << "================================================================\n"
                   << std::endl;
 
+        // ---- Bias vs statistical error (added 2026-10-01) ------------------------------
+        // The refolding test above compares against the data's own statistical errors, which
+        // are tiny here (~1e6 jets): it keeps rejecting until the unfolding has nearly stopped
+        // regularising, i.e. it pushes niter towards matrix inversion. This instead balances
+        // the two things an extra iteration trades:
+        //   bias(n)  = u_n - u_MI   the pull of the prior that is still left -- matrix
+        //                           inversion is the unregularised (unbiased) limit
+        //   stat(n)  = sigma_n      the statistical error, which grows with n
+        // in the measured pT bin, each distribution unit-area normalised (the result is a
+        // shape), all relative to u_MI. The optimum minimises the rms over bins of
+        // sqrt(bias^2 + stat^2). Cross-check: dchange = rms of (u_n - u_{n-1}) / sigma_n, how
+        // much one more iteration moves the result in units of its own stat error.
+        // Kept outside the block below so the convergence plot further down can draw them.
+        std::vector<double> v_cv_n, v_cv_bias, v_cv_stat, v_cv_dn, v_cv_dch;
+        const double dchange_threshold = 0.5;
+        int best_conv = -1, best_tot = -1;
+        double mi_stat_pct = 0.;
+        if (v_unf_pt.size() == v_niter.size()) {
+            RooUnfoldInvert inv(response, h_data_purity_corrected);
+            TH2D *h_mi = (TH2D *) inv.Hreco(RooUnfold::kCovariance)->Clone("h_unf_mi_scan");
+            TH1D *u_mi = h_mi->ProjectionX("h_unf_pt_mi", ibin_pt, ibin_pt, "e");
+            u_mi->SetDirectory(nullptr);
+            auto unitArea = [&](TH1D *h) {
+                const double s = h->Integral(ibin_dr_min, ibin_dr_max);
+                if (s > 0.) h->Scale(1. / s);
+            };
+            unitArea(u_mi);
+            for (TH1D *u : v_unf_pt) unitArea(u);
+
+            // THE CHOICE (Zoe, 2026-10-01): the first niter at which one more iteration moves
+            // the result by less than half its statistical error (dchange < 0.5) -- converged
+            // at the level of the measurement's precision. Gives 8 for dr, 11 for B on the
+            // _rho inputs; 7 for dr, 11 for B with the JEC (_rhojec). The analysis driver reads
+            // this line from the scan log and unfolds every Bayesian variation with it. The bias-vs-stat minimum is printed alongside: it sits much higher
+            // (41 dr, >50 B) because Bayesian approaches the MI result very slowly, so the
+            // distance to MI at the chosen niter is the prior dependence still left in the
+            // result -- read it from the "rms bias" column.
+            double min_tot = 1e30;
+            std::cout << "\n================ Bias vs statistical error (pT bin " << ibin_pt
+                      << ", unit area, % of MI) ================\n";
+            std::cout << Form("  %6s  %9s %9s %9s   %9s\n", "niter", "rms bias", "rms stat",
+                              "rms tot", "dchange");
+            for (size_t k = 0; k < v_unf_pt.size(); ++k) {
+                double sb = 0., ss = 0., st = 0., sc = 0.; int n = 0;
+                for (int i = ibin_dr_min; i <= ibin_dr_max; ++i) {
+                    const double m = u_mi->GetBinContent(i);
+                    if (m <= 0.) continue;
+                    const double b = (v_unf_pt[k]->GetBinContent(i) - m) / m;
+                    const double s = v_unf_pt[k]->GetBinError(i) / m;
+                    sb += b * b; ss += s * s; st += b * b + s * s;
+                    if (k > 0 && v_unf_pt[k]->GetBinError(i) > 0.) {
+                        const double c = (v_unf_pt[k]->GetBinContent(i) - v_unf_pt[k - 1]->GetBinContent(i))
+                                       / v_unf_pt[k]->GetBinError(i);
+                        sc += c * c;
+                    }
+                    ++n;
+                }
+                if (n == 0) continue;
+                const double tot = std::sqrt(st / n);
+                if (tot < min_tot) { min_tot = tot; best_tot = (int) v_niter[k]; }
+                if (best_conv < 0 && k > 0 && std::sqrt(sc / n) < dchange_threshold)
+                    best_conv = (int) v_niter[k];
+                v_cv_n.push_back(v_niter[k]);
+                v_cv_bias.push_back(100. * std::sqrt(sb / n));
+                v_cv_stat.push_back(100. * std::sqrt(ss / n));
+                if (k > 0) { v_cv_dn.push_back(v_niter[k]); v_cv_dch.push_back(std::sqrt(sc / n)); }
+                std::cout << Form("  %6.0f  %8.2f%% %8.2f%% %8.2f%%   %9.3f\n", v_niter[k],
+                                  100. * std::sqrt(sb / n), 100. * std::sqrt(ss / n),
+                                  100. * tot, k > 0 ? std::sqrt(sc / n) : 0.);
+            }
+            double ss_mi = 0.; int n_mi = 0;
+            for (int i = ibin_dr_min; i <= ibin_dr_max; ++i) {
+                const double m = u_mi->GetBinContent(i);
+                if (m > 0.) { ss_mi += std::pow(u_mi->GetBinError(i) / m, 2); ++n_mi; }
+            }
+            mi_stat_pct = n_mi ? 100. * std::sqrt(ss_mi / n_mi) : 0.;
+            std::cout << Form("  matrix inversion: rms stat = %.2f%%\n", mi_stat_pct)
+                      << Form("  ----> cross-check, converged: dchange < %.1f          = %d\n",
+                              dchange_threshold, best_conv)
+                      << Form("  ----> cross-check, min rms sqrt(bias^2 + stat^2)        = %d\n", best_tot)
+                      << "================================================================\n"
+                      << std::endl;
+        }
+
         const int np = (int) v_niter.size();
         TGraph *g_p_all    = new TGraph(np, v_niter.data(), v_pvalue_all.data());
         TGraph *g_p_pt     = new TGraph(np, v_niter.data(), v_pvalue_pt.data());
         TGraph *g_c2_all   = new TGraph(np, v_niter.data(), v_chi2ndf_all.data());
         TGraph *g_c2_pt    = new TGraph(np, v_niter.data(), v_chi2ndf_pt.data());
+        // The test that picks the iteration (data (+) MC stat); the data-only one is drawn too,
+        // in grey, for reference.
+        TGraph *g_p_mc     = new TGraph(np, v_niter.data(), v_pvalue_all_mc.data());
+        TGraph *g_c2_mc    = new TGraph(np, v_niter.data(), v_chi2ndf_all_mc.data());
         g_p_all ->SetLineColor(blue);   g_p_all ->SetMarkerColor(blue);   g_p_all ->SetMarkerStyle(kFullCircle);
         g_p_pt  ->SetLineColor(orange); g_p_pt  ->SetMarkerColor(orange); g_p_pt  ->SetMarkerStyle(kOpenSquare);
         g_c2_all->SetLineColor(blue);   g_c2_all->SetMarkerColor(blue);   g_c2_all->SetMarkerStyle(kFullCircle);
         g_c2_pt ->SetLineColor(orange); g_c2_pt ->SetMarkerColor(orange); g_c2_pt ->SetMarkerStyle(kOpenSquare);
         for (TGraph *g : {g_p_all, g_p_pt, g_c2_all, g_c2_pt}) { g->SetLineWidth(2); g->SetMarkerSize(0.9); }
+        for (TGraph *g : {g_p_mc, g_c2_mc}) {
+            g->SetLineColor(blue); g->SetMarkerColor(blue); g->SetMarkerStyle(kFullCircle);
+            g->SetLineWidth(2); g->SetMarkerSize(0.9);
+        }
+        for (TGraph *g : {g_p_all, g_c2_all}) {
+            g->SetLineColor(kGray + 1); g->SetMarkerColor(kGray + 1); g->SetMarkerStyle(kOpenCircle);
+        }
 
         const double x_lo_it = v_niter.front() - 0.5;
         const double x_hi_it = v_niter.back()  + 0.5;
@@ -1749,7 +1895,9 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
         // frame -- with 20 iterations the first p can be ~1e-17 -- and (b) the lowest labelled
         // decade sits one step above the frame edge instead of being clipped by it.
         const double y_lo_p = std::max(std::pow(10., std::floor(std::log10(p_min)) - 1.), 1e-30);
-        const double y_hi_p = 1.05;  // p is bounded by 1; just enough headroom to clear the curve
+        // p is bounded by 1; the band above it (to 1.45) holds the labels and the legend, which
+        // otherwise sit on one of the two rising curves wherever they are put.
+        const double y_hi_p = 1.45;
         TH1F *fr_p = pad_p->DrawFrame(x_lo_it, y_lo_p, x_hi_it, y_hi_p);
         fr_p->GetYaxis()->SetTitle("p-value");
         fr_p->GetYaxis()->CenterTitle(true);
@@ -1764,13 +1912,14 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
         fr_p->GetYaxis()->ChangeLabel(1, -1, 0.);
         fr_p->GetXaxis()->SetLabelSize(0); fr_p->GetXaxis()->SetTitleSize(0);  // x belongs to the bottom pad
         g_p_all->Draw("PL SAME");
+        g_p_mc ->Draw("PL SAME");
 
-        TLine *l_thr = new TLine(x_lo_it, pvalue_threshold, x_hi_it, pvalue_threshold);
+        TLine *l_thr = new TLine(x_lo_it, an_threshold, x_hi_it, an_threshold);
         l_thr->SetLineColor(kGray + 2); l_thr->SetLineStyle(2); l_thr->Draw("same");
         // Vertical marker at the chosen iteration. TLine takes user coordinates, which on a
         // log pad are the values themselves (not their logs), so the frame range is what to use.
-        if (best_all > 0) {
-            TLine *l_best = new TLine(best_all, y_lo_p, best_all, y_hi_p);
+        if (best_an > 0) {
+            TLine *l_best = new TLine(best_an, y_lo_p, best_an, y_hi_p);
             l_best->SetLineColor(red); l_best->SetLineStyle(7); l_best->SetLineWidth(2);
             l_best->Draw("same");
         }
@@ -1778,24 +1927,31 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
         // so the label tracks the line; it goes above the line on linear y, below on log y.
         TLatex tx_thr;
         tx_thr.SetTextFont(font_code); tx_thr.SetTextSize(label_size); tx_thr.SetTextColor(kGray + 2);
-        tx_thr.DrawLatex(x_hi_it - 0.25 * (x_hi_it - x_lo_it),
-                         pad_p->GetLogy() ? pvalue_threshold / 8.
-                                          : pvalue_threshold + 0.04 * (y_hi_p - y_lo_p),
-                         Form("p = %.2f", pvalue_threshold));
+        // Mid-axis, just under the line: clear of both rises in the dr and the B scans.
+        tx_thr.DrawLatex(x_lo_it + 0.50 * (x_hi_it - x_lo_it),
+                         an_threshold - 0.08 * (y_hi_p - y_lo_p),
+                         Form("p = %.2f", an_threshold));
 
         TLatex tx_reg; tx_reg.SetNDC();
         tx_reg.SetTextFont(font_code); tx_reg.SetTextSize(label_size);
         // Right of the rise, in the empty band under the saturated curve: on the left the text
         // sits on top of the part of the curve the plot is about.
-        tx_reg.DrawLatex(0.45, 0.30,
+        // In the headroom band above p = 1 (see y_hi_p), clear of both curves.
+        tx_reg.DrawLatex(0.17, 0.86,
             test_mode == 0 ? "MC full-sample closure" :
             test_mode == 1 ? "MC split closure test"  : "Data Run 3");
-        tx_reg.DrawLatex(0.45, 0.24, "D'Agostini, early stopping");
-        tx_reg.DrawLatex(0.45, 0.18, best_all > 0 ? Form("optimal N iter = %d", best_all)
-                                                  : "no iteration reaches the threshold");
+        tx_reg.DrawLatex(0.17, 0.80, "D'Agostini, early stopping");
+        tx_reg.DrawLatex(0.17, 0.74, best_an > 0 ? Form("chosen N iter = %d (first p #geq %.2f)", best_an, an_threshold)
+                                                 : "no iteration reaches the threshold");
+        TLegend *lg_reg = new TLegend(0.54, 0.73, 0.90, 0.89);
+        lg_reg->SetBorderSize(0); lg_reg->SetFillStyle(0);
+        lg_reg->SetTextFont(font_code); lg_reg->SetTextSize(label_size);
+        lg_reg->AddEntry(g_p_mc,  "data #oplus MC stat. (used)", "pl");
+        lg_reg->AddEntry(g_p_all, "data stat. only", "pl");
+        lg_reg->Draw();
         TLatex cms_reg; cms_reg.SetNDC();
         cms_reg.SetTextFont(62); cms_reg.SetTextSize(0.042); cms_reg.DrawLatex(0.13, 0.945, "CMS");
-        cms_reg.SetTextFont(52); cms_reg.SetTextSize(0.034); cms_reg.DrawLatex(0.205, 0.945, "Internal");
+        cms_reg.SetTextFont(52); cms_reg.SetTextSize(0.034); cms_reg.DrawLatex(0.205, 0.945, "Work In Progress");
         cms_reg.SetTextFont(42); cms_reg.SetTextSize(0.034); cms_reg.DrawLatex(0.66, 0.945, "pp #sqrt{s} = 5.36 TeV");
         pad_p->RedrawAxis();
 
@@ -1804,6 +1960,7 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
         pad_c2->SetLogy();
         double c2_max = 1., c2_min = 1.;
         for (double c : v_chi2ndf_all) if (c > 0.) { c2_max = std::max(c2_max, c); c2_min = std::min(c2_min, c); }
+        for (double c : v_chi2ndf_all_mc) if (c > 0.) { c2_max = std::max(c2_max, c); c2_min = std::min(c2_min, c); }
         TH1F *fr_c2 = pad_c2->DrawFrame(x_lo_it, c2_min * 0.5, x_hi_it, c2_max * 2.);
         fr_c2->GetYaxis()->SetTitle("#chi^{2}/ndf");
         fr_c2->GetYaxis()->CenterTitle(true);
@@ -1818,6 +1975,7 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
         fr_c2->GetXaxis()->SetTitleFont(font_code); fr_c2->GetXaxis()->SetTitleSize(title_size); fr_c2->GetXaxis()->SetTitleOffset(1.3);
         fr_c2->GetXaxis()->SetLabelFont(font_code); fr_c2->GetXaxis()->SetLabelSize(label_size);
         g_c2_all->Draw("PL SAME");
+        g_c2_mc ->Draw("PL SAME");
         TLine *l_one = new TLine(x_lo_it, 1., x_hi_it, 1.);
         l_one->SetLineColor(kGray + 2); l_one->SetLineStyle(2); l_one->Draw("same");
         pad_c2->RedrawAxis();
@@ -1833,9 +1991,103 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
         g_p_pt  ->Write(Form("g_pvalue_vs_niter_pt%d", ibin_pt));
         g_c2_all->Write("g_chi2ndf_vs_niter_2D");
         g_c2_pt ->Write(Form("g_chi2ndf_vs_niter_pt%d", ibin_pt));
+        g_p_mc  ->Write("g_pvalue_vs_niter_2D_datamcstat");
+        g_c2_mc ->Write("g_chi2ndf_vs_niter_2D_datamcstat");
         f_reg->Close();
         delete f_reg;
         std::cout << "Wrote regularisation scan to " << reg_stem << ".{pdf,png,root}" << std::endl;
+
+        // ---- The convergence criterion -- the iteration count that IS used (2026-10-01) -----
+        // Top: how much one more iteration moves the result, rms over bins in units of its own
+        // stat error, with the 0.5 threshold and the chosen count. Bottom: what the choice
+        // trades -- the rms stat error grows with niter while the distance to the unregularised
+        // matrix-inversion result (the prior dependence still left) shrinks.
+        if (!v_cv_dch.empty()) {
+            TGraph *g_dch  = new TGraph((int) v_cv_dn.size(), v_cv_dn.data(), v_cv_dch.data());
+            TGraph *g_bias = new TGraph((int) v_cv_n.size(),  v_cv_n.data(),  v_cv_bias.data());
+            TGraph *g_stat = new TGraph((int) v_cv_n.size(),  v_cv_n.data(),  v_cv_stat.data());
+            g_dch ->SetLineColor(blue);   g_dch ->SetMarkerColor(blue);   g_dch ->SetMarkerStyle(kFullCircle);
+            g_stat->SetLineColor(blue);   g_stat->SetMarkerColor(blue);   g_stat->SetMarkerStyle(kFullCircle);
+            g_bias->SetLineColor(orange); g_bias->SetMarkerColor(orange); g_bias->SetMarkerStyle(kOpenSquare);
+            for (TGraph *g : {g_dch, g_bias, g_stat}) { g->SetLineWidth(2); g->SetMarkerSize(0.9); }
+
+            TCanvas *c_cv = new TCanvas("c_convergence", "", 800, 800);
+            TPad *pc_t = new TPad("pad_cv_t", "", 0., 0.42, 1., 1.);
+            TPad *pc_b = new TPad("pad_cv_b", "", 0., 0.,   1., 0.42);
+            for (TPad *p : {pc_t, pc_b}) { p->SetTicks(1, 1); p->SetFillColor(0); }
+            pc_t->SetMargin(0.13, 0.05, 0.00, 0.08);
+            pc_b->SetMargin(0.13, 0.05, 0.22, 0.00);
+            c_cv->cd(); pc_t->Draw(); pc_b->Draw();
+
+            pc_t->cd(); pc_t->SetLogy();
+            double d_min = 1e30, d_max = 0.;
+            for (double d : v_cv_dch) if (d > 0.) { d_min = std::min(d_min, d); d_max = std::max(d_max, d); }
+            const double y_lo = d_min * 0.5, y_hi = d_max * 3.;
+            TH1F *fr = pc_t->DrawFrame(x_lo_it, y_lo, x_hi_it, y_hi);
+            fr->GetYaxis()->SetTitle("change per iteration [#sigma_{stat}]");
+            fr->GetYaxis()->CenterTitle(true);
+            fr->GetYaxis()->SetTitleFont(font_code); fr->GetYaxis()->SetTitleSize(title_size); fr->GetYaxis()->SetTitleOffset(1.5);
+            fr->GetYaxis()->SetLabelFont(font_code); fr->GetYaxis()->SetLabelSize(label_size);
+            fr->GetYaxis()->ChangeLabel(1, -1, 0.);
+            fr->GetXaxis()->SetLabelSize(0); fr->GetXaxis()->SetTitleSize(0);
+            g_dch->Draw("PL SAME");
+            TLine *l_t = new TLine(x_lo_it, dchange_threshold, x_hi_it, dchange_threshold);
+            l_t->SetLineColor(kGray + 2); l_t->SetLineStyle(2); l_t->Draw("same");
+            if (best_conv > 0) {
+                TLine *l_b = new TLine(best_conv, y_lo, best_conv, y_hi);
+                l_b->SetLineColor(kGray + 2); l_b->SetLineStyle(3); l_b->SetLineWidth(2); l_b->Draw("same");
+            }
+            if (best_an > 0) {
+                TLine *l_c = new TLine(best_an, y_lo, best_an, y_hi);
+                l_c->SetLineColor(red); l_c->SetLineStyle(7); l_c->SetLineWidth(2); l_c->Draw("same");
+            }
+            TLatex tx; tx.SetNDC(); tx.SetTextFont(font_code); tx.SetTextSize(label_size);
+            tx.DrawLatex(0.45, 0.80, test_mode == 0 ? "MC full-sample closure" :
+                                     test_mode == 1 ? "MC split closure test"  : "Data Run 3");
+            tx.DrawLatex(0.45, 0.74, Form("D'Agostini, converged at %.1f #sigma_{stat}", dchange_threshold));
+            tx.DrawLatex(0.45, 0.68, best_conv > 0 ? Form("converged at N iter = %d (grey)", best_conv)
+                                                   : "not converged in the scanned range");
+            if (best_an > 0) tx.DrawLatex(0.45, 0.62, Form("chosen N iter = %d (red, refolding p #geq 0.95)", best_an));
+            TLatex cms; cms.SetNDC();
+            cms.SetTextFont(62); cms.SetTextSize(0.042); cms.DrawLatex(0.13, 0.945, "CMS");
+            cms.SetTextFont(52); cms.SetTextSize(0.034); cms.DrawLatex(0.205, 0.945, "Work In Progress");
+            cms.SetTextFont(42); cms.SetTextSize(0.034); cms.DrawLatex(0.66, 0.945, "pp #sqrt{s} = 5.36 TeV");
+            pc_t->RedrawAxis();
+
+            pc_b->cd();
+            double b_max = mi_stat_pct;
+            for (size_t i = 0; i < v_cv_n.size(); ++i) b_max = std::max({b_max, v_cv_bias[i], v_cv_stat[i]});
+            TH1F *fb = pc_b->DrawFrame(x_lo_it, 0., x_hi_it, 1.15 * b_max);
+            fb->GetYaxis()->SetTitle("rms over bins [%]");
+            fb->GetYaxis()->CenterTitle(true);
+            fb->GetYaxis()->SetTitleFont(font_code); fb->GetYaxis()->SetTitleSize(title_size); fb->GetYaxis()->SetTitleOffset(1.5);
+            fb->GetYaxis()->SetLabelFont(font_code); fb->GetYaxis()->SetLabelSize(label_size);
+            fb->GetYaxis()->ChangeLabel(-1, -1, 0.);
+            fb->GetXaxis()->SetTitle("number of iterations");
+            fb->GetXaxis()->CenterTitle(true);
+            fb->GetXaxis()->SetTitleFont(font_code); fb->GetXaxis()->SetTitleSize(title_size); fb->GetXaxis()->SetTitleOffset(1.3);
+            fb->GetXaxis()->SetLabelFont(font_code); fb->GetXaxis()->SetLabelSize(label_size);
+            g_stat->Draw("PL SAME");
+            g_bias->Draw("PL SAME");
+            TLine *l_mi = new TLine(x_lo_it, mi_stat_pct, x_hi_it, mi_stat_pct);
+            l_mi->SetLineColor(kGray + 2); l_mi->SetLineStyle(2); l_mi->Draw("same");
+            if (best_conv > 0) {
+                TLine *l_b2 = new TLine(best_an > 0 ? best_an : best_conv, 0., best_an > 0 ? best_an : best_conv, 1.15 * b_max);
+                l_b2->SetLineColor(red); l_b2->SetLineStyle(7); l_b2->SetLineWidth(2); l_b2->Draw("same");
+            }
+            TLegend *lg = new TLegend(0.50, 0.60, 0.93, 0.95);
+            lg->SetBorderSize(0); lg->SetFillStyle(0); lg->SetTextFont(font_code); lg->SetTextSize(label_size);
+            lg->AddEntry(g_stat, "stat. error (Bayesian)", "pl");
+            lg->AddEntry(g_bias, "distance to matrix inversion", "pl");
+            lg->AddEntry(l_mi,   "stat. error (matrix inversion)", "l");
+            lg->Draw();
+            pc_b->RedrawAxis();
+
+            const TString cv_stem = folder + "convergence_vs_iteration_" + label;
+            c_cv->Print(cv_stem + ".pdf");
+            c_cv->Print(cv_stem + ".png");
+            std::cout << "Wrote convergence scan to " << cv_stem << ".{pdf,png}" << std::endl;
+        }
     }
 
     // gApplication -> Terminate(0);

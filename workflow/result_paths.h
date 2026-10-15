@@ -10,6 +10,7 @@
 // If you add a variation, add it in ONE place here and both macros follow.
 
 #include "TString.h"
+#include <cstdlib>
 #include <iostream>
 
 // A tag no path will ever contain, returned for a variation name that is not recognised.
@@ -98,6 +99,34 @@ inline TString trkTag(bool trackEffUnc)
 inline TString eecWeightTag(bool eecWeightOff)
 {
     return eecWeightOff ? TString("_noeecw") : TString("");
+}
+
+// SV_SF (added 2026-10-12): the SV b scale-factor MC production (SV_SF=nominal in
+// run_agg_ntuple_chunks.sh, see sv_sf.h). Read from the SAME environment variable the run
+// script uses, so a chain run as `SV_SF=<variation> <driver>` reads that variation's MC and
+// writes its own fits and results. Must stay in step with SvSF::tag(), which is what the
+// WRITER uses. Data is never weighted, so dataTemplateFile() ignores it.
+//
+// svsfNominal(): what an UNSET SV_SF means. ON since 2026-10-12 (Zoe: the result WITH the SV
+// b SF is the nominal, its uncertainty a source in the band) -- the default chain reads the
+// "_svsf" MC and results. SV_SF=off reads the no-SF chain, whose results are untouched; set
+// this false to make that the default again. Same pattern as jecInputs() below.
+inline bool svsfNominal() { return true; }
+
+inline TString svsfTag()
+{
+    const char *env = std::getenv("SV_SF");
+    const TString v = (env && *env) ? TString(env) : TString(svsfNominal() ? "nominal" : "off");
+    if (v == "off")             return "";
+    if (v == "nominal")         return "_svsf";
+    if (v == "up")              return "_svsfup";
+    if (v == "down")            return "_svsfdn";
+    // The per-contribution variations (2026-10-13), tag "_svsf<name>" -- SvSF::modeNames().
+    for (const char *c : {"statup", "statdn", "nomuonup", "nomuondn", "bbup", "bbdn",
+                          "jpup", "jpdn", "qqup", "qqdn"})
+        if (v == c) return "_svsf" + v;
+    warnUnknown("SV_SF", v, "off | nominal | up | down | stat|nomuon|bb|jp|qq + up|dn");
+    return kUnknownTag();
 }
 
 // TF_VARIATION: the template-fit variation supplying the signal fraction.
@@ -259,10 +288,41 @@ inline TString observableTag(const TString &observable)
 //   fnb  "_upartv2_3obs"     ) DISABLED 2026-09-22 with the observables themselves. All three
 //   lnfb "_upartv2_lnfblin"  ) predate the rename, so re-enabling any of them means a fresh
 //   fb   "_upartv2_fb"       ) production too, not just an uncomment.
+// ---- Which INPUT ERA the whole chain runs on (added 2026-09-28) ----------------------
+// Marc re-made every MC and data input chunk on 2026-09-22..24 as merged_block_*_rho.root;
+// the inputs the "_upartv2" productions were made from are gone. Zoe chose (2026-09-28) to
+// re-produce BOTH observables on the _rho inputs, so dR and B come from the same MC.
+//
+// The rho era gets its own tag at EVERY level -- MC/data production names, template-fit
+// directories and result folders -- because the old productions cannot be overwritten in
+// place: _rho has 8 Pythia blocks per sample where the old had 10 (QCD) / 9 (bJet), so
+// writing the new blocks over the old names would leave old blocks 8-9 behind, and the
+// block-summing in apply_unfolding_2d.C would silently add them in.
+//
+// Flip rhoInputs() to false to point the chain back at the pre-_rho results on disk.
+inline bool rhoInputs() { return true; }
+
+// ---- Jet energy corrections (added 2026-10-01) -----------------------------------------
+// true = read the productions made with APPLY_JEC=true (2024 pp-reference JEC on jtpt, see
+// the Jec namespace in create_files_for_template_fit.cpp). They are tagged "jec" at every
+// level, so the JEC and no-JEC chains sit side by side. Only meaningful with rhoInputs():
+// the JEC needs the event rho the _rho forests carry.
+// ON since 2026-10-01 (the upartv2rhojec productions exist). Set false to read the
+// uncorrected _upartv2rho results, which are untouched.
+inline bool jecInputs() { return true; }
+
+// "_upartv2rho" in the rho era, "_upartv2" before it, "_upartv2rhojec" with the JEC. Ends
+// every production name, every template-fit directory and every result folder.
+inline TString eraTag()
+{
+    if (!rhoInputs()) return TString("_upartv2");
+    return jecInputs() ? TString("_upartv2rhojec") : TString("_upartv2rho");
+}
+
 inline TString obsProdTag(const TString &observable)
 {
-    if (observable == "dr")  return "_upartv2";
-    if (observable == "B")   return "_upartv2_B";
+    if (observable == "dr")  return eraTag();
+    if (observable == "B")   return eraTag() + "_B";
     // DISABLED 2026-09-22:
     //   if (observable == "fnb")  return "_upartv2_3obs";
     //   if (observable == "lnfb") return "_upartv2_lnfblin";
@@ -287,6 +347,12 @@ inline TString dataTemplateFile(bool eecWeightOff, const TString &observable = "
 {
     const TString hp = "/data_CMS/cms/zaidan/bJetAggRun3/PPRef2024/HardProbes/"
                        "agg_template_chunks/";
+    // The rho era: every observable, EEC-weighted or not, from Zoe's own data production on
+    // the _rho inputs, hadd'ed to the top of agg_template_chunks. No fallback onto Afnan's.
+    if (rhoInputs())
+        return hp + "Run3_btagWP0712_template_for_fit_histos_3D_data_fMCGEN"
+                  + (eecWeightOff ? TString("_noeecw") : TString(""))
+                  + obsProdTag(observable) + ".root";
     if (observable != "dr")
         return hp + "Run3_btagWP0712_template_for_fit_histos_3D_data_fMCGEN"
                   + (eecWeightOff ? TString("_noeecw") : TString(""))
@@ -337,7 +403,7 @@ inline TString variationTag(const TString &tfGenerator, bool trackEffUnc,
                             bool eecWeightOff = false,
                             const TString &observable = "dr")
 {
-    return observableTag(observable) + tfTag(tfGenerator) + trkTag(trackEffUnc)
+    return observableTag(observable) + tfTag(tfGenerator) + trkTag(trackEffUnc) + svsfTag()
          + tfVarTag(tfVariation) + sfupartVarTag(sfupartVariation)
          + eecWeightTag(eecWeightOff);
 }
@@ -377,7 +443,7 @@ inline TString resultFolder(const TString &sample, const TString &generator, boo
          + sample + "_" + generator
          + variationTag(tfGenerator, trackEffUnc, tfVariation, sfupartVariation,
                         eecWeightOff, observable)
-         + "_upartv2/";
+         + eraTag() + "/";
 }
 
 // <sample>_<generator><variation tags>_<bayesian|MI>_<mode>.

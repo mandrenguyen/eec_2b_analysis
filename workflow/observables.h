@@ -318,7 +318,11 @@ inline void setFitObservable(const ObsDef &o) { gFitObs() = o; }
 inline TString obsSymbol(const TString &name)
 {
     if (name == "dr")  return "#Delta r";
-    if (name == "B")   return "B";
+    // 2026-10-12: Zoe renamed the balance "A" -- in the PLOTS only. The internal name, the
+    // "_B" file/histogram/folder tags and every OBSERVABLE="B" argument stay as they are, so
+    // the existing productions and results are still found.
+    // if (name == "B")   return "B";
+    if (name == "B")   return "A";
     // DISABLED 2026-09-22, with the fraction observables themselves:
     //   if (name == "fnb")  return "f_{nb}";   // the axis says 1/(1 + pT_b/pT_nonb)
     //   if (name == "fb")   return "p_{T}^{b}/p_{T}^{b+nb}";

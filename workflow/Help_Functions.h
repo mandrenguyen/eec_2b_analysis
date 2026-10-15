@@ -125,8 +125,8 @@ void styleCurve(TH1 *h, Color_t c, bool is_data)
 
 // CMS header above the frame: bold "CMS", italic sublabel to its right, beam and energy
 // right-aligned. NDC coordinates keyed off the pad margins, so it tracks the frame.
-// sublabel: "Internal" for anything with data, "Simulation Internal" for MC-only.
-void drawCMSHeader(TPad *pad, const char *sublabel = "Internal",
+// sublabel: "Work In Progress" on every plot, MC-only included (Zoe, 2026-09-28).
+void drawCMSHeader(TPad *pad, const char *sublabel = "Work In Progress",
                    const char *rightlabel = "pp #sqrt{s} = 5.36 TeV")
 {
     if (!pad) return;
@@ -359,8 +359,10 @@ void draw_variation_uncertainity(TFile *foutputPlots, TFile *fsys, int ibin_pt){
                 {"LP", "LP", "LP"},
                 { varNames[0].Data() ,varNames[1].Data(), varNames[2].Data()} 
                 );
-                leg_all->SetHeader(pt_label(pt_first, pt_last), "L"); //centered 
+                leg_all->SetHeader(pt_label(pt_first, pt_last), "L"); //centered
                 leg_all->Draw("same");
+                // Fit result on real data -> "Work In Progress", as every other plot.
+                drawCMSHeader(pad1);
 
             // Lower panel: Draw envelop 
              pad2->cd();  
@@ -388,7 +390,7 @@ void draw_variation_uncertainity(TFile *foutputPlots, TFile *fsys, int ibin_pt){
                 h_envDraw->SetFillStyle(3001);
                 h_envDraw->SetTitle("");
                 h_envDraw->GetYaxis()->SetTitle("Relative uncert.");
-                h_envDraw->GetXaxis()->SetTitle("#DeltaR");
+                h_envDraw->GetXaxis()->SetTitle(gFitObs().axis);   // the fitted observable, not always dR
                 h_envDraw->GetXaxis()->SetTitleSize(0.08);
                 h_envDraw->GetYaxis()->SetTitleSize(0.05);
                 h_envDraw->GetXaxis()->SetLabelSize(0.08);

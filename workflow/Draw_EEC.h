@@ -183,7 +183,7 @@ void draw_eec_simple(TString fout_name, TFile* foutputPlots, TString &folder, bo
                         mc_objs, mc_opts, mc_labels);
                         leg_mc->SetHeader(pt_label(pt_first, pt_last), "L"); //centered
                         leg_mc->Draw("same");
-                        drawCMSHeader(c_MC, "Simulation Internal");
+                        drawCMSHeader(c_MC, "Work In Progress");
                 if (save_eec_plots) c_MC->SaveAs( sresultDir_eec + "/" + "MC_ EEC_" + ibin_pt + ".pdf");
                 if (save_eec_plots) c_MC->SaveAs( sresultDir_eec + "/" + "MC_ EEC_" + ibin_pt + ".png");
 

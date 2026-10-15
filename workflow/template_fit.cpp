@@ -1359,7 +1359,7 @@ void Draw_template_Run3(TString &templates, TString pT_selection, TString folder
                             fout->cd();
                             DrawCommonTextTopRight(canva_beforefit, ibin_dr, ibin_pt, yBins, N_bins_dr);
                             // MC templates only on this canvas -> "Simulation Internal".
-                            drawCMSHeader(canva_beforefit, "Simulation Internal");
+                            drawCMSHeader(canva_beforefit, "Work In Progress");
                             canva_beforefit->Write();
                             canva_beforefit->Print(Form("%s/%s_allcontributions_beforefit.png", sDir_canvas.Data(), sname_canvas.Data()));
 
@@ -1382,7 +1382,7 @@ void Draw_template_Run3(TString &templates, TString pT_selection, TString folder
                             fout->cd();
                             DrawCommonTextTopRight(canva_sum_beforefit, ibin_dr, ibin_pt, yBins, N_bins_dr);
                             // MC templates only on this canvas -> "Simulation Internal".
-                            drawCMSHeader(canva_sum_beforefit, "Simulation Internal");
+                            drawCMSHeader(canva_sum_beforefit, "Work In Progress");
                             canva_sum_beforefit->Write();
                             canva_sum_beforefit->Print(Form("%s/%s_templates_beforefit.png", sDir_canvas.Data(), sname_canvas.Data()));
 
@@ -1515,7 +1515,7 @@ void Draw_template_Run3(TString &templates, TString pT_selection, TString folder
                             fout->cd();
                             DrawCommonTextTopRight(canva_pdf_norm_beforefit, ibin_dr, ibin_pt, yBins, N_bins_dr);
                             // MC templates only on this canvas -> "Simulation Internal".
-                            drawCMSHeader(canva_pdf_norm_beforefit, "Simulation Internal");
+                            drawCMSHeader(canva_pdf_norm_beforefit, "Work In Progress");
                             canva_pdf_norm_beforefit->Write();
                             canva_pdf_norm_beforefit->Print(Form("%s/%s_PDF_norm_beforefit.png", sDir_canvas.Data(), sname_canvas.Data()));
             
@@ -1541,7 +1541,7 @@ void Draw_template_Run3(TString &templates, TString pT_selection, TString folder
                                 fout->cd();
                                 DrawCommonTextTopRight(canva_pdfs_scaledtoqcd, ibin_dr, ibin_pt, yBins, N_bins_dr);
                                 // MC templates only on this canvas -> "Simulation Internal".
-                                drawCMSHeader(canva_pdfs_scaledtoqcd, "Simulation Internal");
+                                drawCMSHeader(canva_pdfs_scaledtoqcd, "Work In Progress");
                                 canva_pdfs_scaledtoqcd->Write();
                                 canva_pdfs_scaledtoqcd->Print(Form("%s/%s_pdfs_scaledtoqcdfractions_beforefit.png", sDir_canvas.Data(), sname_canvas.Data()));
             
@@ -1570,7 +1570,7 @@ void Draw_template_Run3(TString &templates, TString pT_selection, TString folder
                                 fout->cd();
                                 DrawCommonTextTopRight(canva_pdfs_scaledtoqcd_int, ibin_dr, ibin_pt, yBins, N_bins_dr);
                                 // MC templates only on this canvas -> "Simulation Internal".
-                                drawCMSHeader(canva_pdfs_scaledtoqcd_int, "Simulation Internal");
+                                drawCMSHeader(canva_pdfs_scaledtoqcd_int, "Work In Progress");
                                 canva_pdfs_scaledtoqcd_int->Write();
                                 canva_pdfs_scaledtoqcd_int->Print(Form("%s/%s_pdfs_scaledtoqcd_int_beforefit.png", sDir_canvas.Data(), sname_canvas.Data()));
             
@@ -1605,7 +1605,7 @@ void Draw_template_Run3(TString &templates, TString pT_selection, TString folder
                                 fout->cd();
                                 DrawCommonTextTopRight(canva_pdfs_seperated_scaledtoqcd_int, ibin_dr, ibin_pt, yBins, N_bins_dr);
                                 // MC templates only on this canvas -> "Simulation Internal".
-                                drawCMSHeader(canva_pdfs_seperated_scaledtoqcd_int, "Simulation Internal");
+                                drawCMSHeader(canva_pdfs_seperated_scaledtoqcd_int, "Work In Progress");
                                 canva_pdfs_seperated_scaledtoqcd_int->Write();
                                 canva_pdfs_seperated_scaledtoqcd_int->Print(Form("%s/%s_pdfs_seperated_scaledtoqcd_int_beforefit.png", sDir_canvas.Data(), sname_canvas.Data()));
             /*                     
@@ -1961,7 +1961,10 @@ TString mcgenTemplates(const TString &sample, const TString &generator,
     // ("Tracking efficiency") and Herwig nominal ("MC template modeling") -- each from its
     // per-block files hadd'ed to the agg_ntuple_chunks top level. A combination nobody
     // produced resolves to a file that does not exist, and the driver stops on it.
-    if (observable != "dr") {
+    // The rho era (result_paths.h, 2026-09-28) sends dr through this generic branch too: every
+    // template comes from Zoe's own _rho production, and the Afnan / pre-_rho fallbacks below
+    // point at inputs that no longer exist upstream.
+    if (observable != "dr" || rhoInputs()) {
         const TString base = "/data_CMS/cms/zaidan/bJetAggRun3/PPRef2024/";
         const bool herwig  = (generator == "herwig");
         TString subdir;
@@ -1970,7 +1973,8 @@ TString mcgenTemplates(const TString &sample, const TString &generator,
         if (subdir.Length() == 0) return "";
         // trkTag / eecWeightTag / obsProdTag are result_paths.h's, so the literals are shared
         // with apply_unfolding_2d.C and cannot drift from what it reads.
-        const TString tag = trkTag(track_eff_unc) + eecWeightTag(eec_weight_off)
+        // svsfTag(): the SV b scale-factor production when SV_SF is set (2026-10-12).
+        const TString tag = trkTag(track_eff_unc) + svsfTag() + eecWeightTag(eec_weight_off)
                           + obsProdTag(observable);
         return base + subdir + "/agg_ntuple_chunks/"
                "Run3_btagWP0712_template_for_fit_histos_3D_" + sample + "_fMCGEN" + tag + ".root";
@@ -2102,7 +2106,7 @@ void template_fit(TString SAMPLE = "both", TString GENERATOR = "pythia",
     // h_sig_fraction_fit by name, and a B-binned one there would be silently wrong.
     const TString obs_tag  = (OBSERVABLE == "dr") ? "" : ("_" + OBSERVABLE);
     sDirname     = "/data_CMS/cms/zaidan/bJetAggRun3/PPRef2024/results/TemplateFit_Run3/"
-                   "TemplateFits_" + SAMPLE + "_" + GENERATOR + trk_tag + eecw_tag + obs_tag + "_upartv2";
+                   "TemplateFits_" + SAMPLE + "_" + GENERATOR + trk_tag + svsfTag() + eecw_tag + obs_tag + eraTag();
     sDirname_www = sDirname;
 
     // -- Output folder to save the result of the tests
@@ -2111,7 +2115,8 @@ void template_fit(TString SAMPLE = "both", TString GENERATOR = "pythia",
     // TString folder = Form("/home/llr/cms/zaidan/analysis_lise/eec_2b_analysis/TemplateFit_Run3/%s/", sDirname.Data()); // this is sDirname
     TString folder = Form("%s", sDirname.Data()); // this is sDirname
         cout << "Sample: " << SAMPLE << ", generator: " << GENERATOR
-             << ", tracking-eff variation: " << (TRACK_EFF_UNC ? "ON (3% tracks dropped)" : "off") << endl;
+             << ", tracking-eff variation: " << (TRACK_EFF_UNC ? "ON (3% tracks dropped)" : "off")
+             << ", SV b SF: " << (svsfTag().Length() ? svsfTag() : TString("off")) << endl;
         cout << "Output folder path: "<< folder << endl;
 
     Int_t RunN = 3; // 3;
@@ -2398,9 +2403,12 @@ std::vector<TString> mcFiles(const TString &sample, const TString &generator,
         int found = 0;
         for (int b = 0; b < 50; ++b) {
             TString f = TString::Format(
-                "%s/%s/agg_ntuple_chunks/block_%04d/%sRun3_%s_template_for_fit_histos_3D_%s_f%s_%s.root",
+                "%s/%s/agg_ntuple_chunks/block_%04d/%sRun3_%s_template_for_fit_histos_3D_%s_f%s%s_%s.root",
                 kBase, subdir.Data(), b, rmatrix ? "RMatrix_" : "", kBtagTag, s.Data(),
-                rmatrix ? "" : "MCGEN", tag.Data());
+                rmatrix ? "" : "MCGEN",
+                // The SV b SF production (svsfTag(), 2026-10-12): MC only -- the same tag
+                // also names the data files (dataFiles below), which carry no SF.
+                svsfTag().Data(), tag.Data());
             if (gSystem->AccessPathName(f) == kFALSE) { files.push_back(f); ++found; }
         }
         if (found == 0)
@@ -2570,9 +2578,9 @@ static void z_first_look_one(const TString &sample, const TString &generator,
     // "<obs>_first_look_...": the folder is named from the observable, so the balance now
     // writes into "B_first_look_..." where it used to write "z_first_look_...". The old
     // folders are left where they are rather than moved.
-    TString outdir = TString::Format("%s/results/%s_first_look_%s_%s_%s",
+    TString outdir = TString::Format("%s/results/%s_first_look_%s_%s%s_%s",
                                      kBase, observable.Data(), sample.Data(),
-                                     generator.Data(), tag.Data());
+                                     generator.Data(), svsfTag().Data(), tag.Data());
     gSystem->mkdir(outdir, true);
 
     // ---- 1. Do the flavour templates separate in B? ----
@@ -2600,7 +2608,7 @@ static void z_first_look_one(const TString &sample, const TString &generator,
         double mx = n2b->GetMaximum();
         if (n1b) mx = std::max(mx, n1b->GetMaximum());
         if (n0b) mx = std::max(mx, n0b->GetMaximum());
-        n2b->SetMaximum(1.45 * mx);
+        n2b->SetMaximum(1.8 * mx);   // 1.8, not 1.45: the info lines now sit inside the frame
         n2b->SetMinimum(0.);
         n2b->Draw("hist");
         if (n1b) n1b->Draw("hist same");
@@ -2611,9 +2619,11 @@ static void z_first_look_one(const TString &sample, const TString &generator,
         if (n1b) leg.AddEntry(n1b, "1b", "l");
         if (n0b) leg.AddEntry(n0b, "0b (mistag)", "l");
         leg.Draw();
-        TLatex lat; lat.SetNDC(); lat.SetTextSize(0.032);
-        lat.DrawLatex(0.16, 0.93, Form("%s %s, %s, reco level, %s",
-                                       sample.Data(), generator.Data(), ptLabel(ptbin).Data(), wLab.Data()));
+        // Inside the frame, under the legend: the space above the frame is the CMS header's.
+        TLatex lat; lat.SetNDC(); lat.SetTextSize(0.030);
+        lat.DrawLatex(0.16, 0.68, Form("%s %s, reco level", sample.Data(), generator.Data()));
+        lat.DrawLatex(0.16, 0.63, Form("%s, %s", ptLabel(ptbin).Data(), wLab.Data()));
+        drawCMSHeader(&c);
         c.SaveAs(outdir + "/1_" + observable + "_templates_by_flavour" + ptSuffix(ptbin) + ".pdf");
         c.SaveAs(outdir + "/1_" + observable + "_templates_by_flavour" + ptSuffix(ptbin) + ".png");
     }
@@ -2651,7 +2661,7 @@ static void z_first_look_one(const TString &sample, const TString &generator,
             if (m0b) mx = std::max(mx, m0b->GetMaximum());
             if (m2b) {
                 m2b->SetTitle(";m_{2B} [GeV];normalised");
-                m2b->SetMaximum(1.5 * mx); m2b->SetMinimum(0.);
+                m2b->SetMaximum(1.9 * mx); m2b->SetMinimum(0.);
                 m2b->GetXaxis()->SetTitleSize(0.055); m2b->GetYaxis()->SetTitleSize(0.055);
                 m2b->Draw("hist");
             }
@@ -2660,18 +2670,21 @@ static void z_first_look_one(const TString &sample, const TString &generator,
             TLatex *lt = new TLatex(); lt->SetNDC(); lt->SetTextSize(0.055);
             // Name the observable, not "B": these panels are the fit's input and end up in
             // talks on their own, where "0.30 < B < 0.50" on a dr plot would be simply wrong.
-            lt->DrawLatex(0.20, 0.90, Form("%.2f < %s < %.2f",
+            // 0.84, inside the frame: the margin above it carries the CMS header in panel 1.
+            lt->DrawLatex(0.20, 0.84, Form("%.2f < %s < %.2f",
                                            h3_2b->GetYaxis()->GetBinLowEdge(iz),
                                            obsSymbol(observable).Data(),
                                            h3_2b->GetYaxis()->GetBinUpEdge(iz)));
             if (iz == 1) {
-                TLegend *lg = new TLegend(0.45, 0.62, 0.92, 0.86);
+                TLegend *lg = new TLegend(0.45, 0.52, 0.92, 0.78);
                 lg->SetBorderSize(0); lg->SetFillStyle(0); lg->SetTextSize(0.05);
                 lg->AddEntry(m2b, "2b", "l");
                 if (m1b) lg->AddEntry(m1b, "1b", "l");
                 if (m0b) lg->AddEntry(m0b, "0b", "l");
                 lg->Draw();
             }
+            // Panels are too narrow for the beam label, so the CMS mark alone, in panel 1.
+            if (iz == 1) drawCMSHeader((TPad *) gPad, "Work In Progress", "");
             keep.push_back(m2b); keep.push_back(m1b); keep.push_back(m0b);
         }
         c.SaveAs(outdir + "/2_mB_in_" + observable + "_bins" + ptSuffix(ptbin) + ".pdf");
@@ -2737,6 +2750,7 @@ static void z_first_look_one(const TString &sample, const TString &generator,
             leg.Draw();
             TLine l(obsd.bins[0], 1., obsd.bins[obsd.nbins], 1.);
             l.SetLineStyle(2); l.SetLineColor(kGray + 2); l.Draw();
+            drawCMSHeader(&c);
             c.SaveAs(outdir + "/3_" + observable + "_purity_efficiency" + ptSuffix(ptbin) + ".pdf");
             c.SaveAs(outdir + "/3_" + observable + "_purity_efficiency" + ptSuffix(ptbin) + ".png");
         }
@@ -2767,7 +2781,7 @@ static void z_first_look_one(const TString &sample, const TString &generator,
         TCanvas c("c4", "", 900, 700);
         pmc->SetTitle(Form(";%s;normalised", obsd.axis.Data()));
         pmc->SetMinimum(0.);
-        pmc->SetMaximum(1.45 * std::max(pmc->GetMaximum(), pdata->GetMaximum()));
+        pmc->SetMaximum(1.8 * std::max(pmc->GetMaximum(), pdata->GetMaximum()));
         pmc->Draw("hist");
         pdata->Draw("e same");
         TLegend leg(0.16, 0.74, 0.65, 0.89);
@@ -2776,7 +2790,9 @@ static void z_first_look_one(const TString &sample, const TString &generator,
         leg.AddEntry(pmc, Form("%s MC, all flavours", sample.Data()), "l");
         leg.Draw();
         TLatex lat; lat.SetNDC(); lat.SetTextSize(0.030);
-        lat.DrawLatex(0.16, 0.93, Form("%s -- reco level, %s, no fit/unfolding/UParT SF", ptLabel(ptbin).Data(), wLab.Data()));
+        lat.DrawLatex(0.16, 0.69, Form("%s, reco level, %s", ptLabel(ptbin).Data(), wLab.Data()));
+        lat.DrawLatex(0.16, 0.64, "no fit / unfolding / UParT SF");
+        drawCMSHeader(&c);
         c.SaveAs(outdir + "/4_" + observable + "_data_vs_mc" + ptSuffix(ptbin) + ".pdf");
         c.SaveAs(outdir + "/4_" + observable + "_data_vs_mc" + ptSuffix(ptbin) + ".png");
     }
@@ -2938,7 +2954,7 @@ static void z_first_look_one(const TString &sample, const TString &generator,
 
             TLatex cms; cms.SetNDC();
             cms.SetTextFont(62); cms.SetTextSize(0.045); cms.DrawLatex(0.15, 0.945, "CMS");
-            cms.SetTextFont(52); cms.SetTextSize(0.036); cms.DrawLatex(0.255, 0.945, "Internal");
+            cms.SetTextFont(52); cms.SetTextSize(0.036); cms.DrawLatex(0.255, 0.945, "Work In Progress");
             cms.SetTextFont(42); cms.SetTextSize(0.036); cms.DrawLatex(0.66, 0.945, "pp #sqrt{s} = 5.36 TeV");
 
             // Two lines only, by request: which pT bin, and what the plot is. The jet count,
@@ -2995,4 +3011,439 @@ void plot_z_first_look(const TString &sample    = "qcd",
 {
     for (int ptbin = 1; ptbin <= jtpt_bins; ++ptbin)
         z_first_look_one(sample, generator, tag, ptbin, observable);
+}
+
+
+// ============================================================================
+// RAW YIELDS: Pythia vs Herwig (added 2026-09-29)
+// ============================================================================
+// Plot 5 of the first look (the flavour-stacked raw yields) for BOTH generators on one
+// canvas. Same yields as plot 5 -- the h_count_* histograms, tree weight only, no EEC
+// weight, summed over all m_2B -- and the same normalisation: each generator's 2B+1B+0B
+// total is scaled to the data integral, flavour proportions kept. So what differs between
+// the two curves is the SHAPE of the reco-level yield, and (dashed) how much of it each
+// generator calls signal.
+//
+// Top pad : data, the Pythia and Herwig totals (solid), their 2B components (dashed).
+// Lower   : each total over the data, with the data's relative stat error as a grey band.
+//
+// Colours: orange (Pythia) vs purple (Herwig) -- TFColor::cmpA/cmpB, the pair
+// Help_Functions.h reserves for exactly two variants of one quantity. Data black.
+//
+//   root -l -b -q -e '.L template_fit.cpp+' \
+//        -e 'plot_raw_yields_generators("both","upartv2rho","dr")'
+//   root -l -b -q -e '.L template_fit.cpp+' \
+//        -e 'plot_raw_yields_generators("both","noeecw_upartv2rho_B","B")'
+static void raw_yields_generators_one(const TString &sample, const TString &tag, int ptbin,
+                                      const TString &observable)
+{
+    gStyle->SetOptStat(0);
+    gStyle->SetOptTitle(0);
+
+    const ObsDef obsd = obsByName(observable);
+    if (obsd.nbins == 0) {
+        std::cerr << "ERROR: unknown observable '" << observable << "' (use dr | B)" << std::endl;
+        return;
+    }
+    // Same guard as z_first_look_one(): never read one observable out of another's production.
+    {
+        TString stem = obsProdTag(observable);
+        if (stem.BeginsWith("_")) stem.Remove(0, 1);
+        if (!tag.Contains(stem)) {
+            std::cerr << "ERROR: tag '" << tag << "' is not a production of observable '"
+                      << observable << "' (expected it to contain '" << stem << "')." << std::endl;
+            return;
+        }
+    }
+
+    std::vector<TString> f_data = dataFiles(tag);
+    TH3D *c_data = f_data.empty() ? nullptr
+                                  : sumOverBlocks<TH3D>(f_data, obsd.n("h_count_data"), "cg_data");
+    TH1D *y_data = projX(c_data, "yg_data", ptbin);
+    if (!y_data) {
+        std::cerr << "ERROR: no data yields for tag '" << tag << "'" << std::endl;
+        return;
+    }
+    const double n_jets = y_data->Integral();
+
+    // One generator's yields: total (2B+1B+0B) and the 2B part, both scaled by the SAME
+    // factor, so the total matches the data and 2B keeps its share of it.
+    struct GenYields { TH1D *tot = nullptr; TH1D *sig = nullptr; double scale = 1.; };
+    auto load = [&](const TString &gen) -> GenYields {
+        GenYields g;
+        std::vector<TString> f = mcFiles(sample, gen, tag, false);
+        if (f.empty()) return g;
+        TH1D *y2 = projX(sumOverBlocks<TH3D>(f, obsd.n("h_count_bb"), "cg_2b_" + gen), "yg_2b_" + gen, ptbin);
+        TH1D *y1 = projX(sumOverBlocks<TH3D>(f, obsd.n("h_count_b"),  "cg_1b_" + gen), "yg_1b_" + gen, ptbin);
+        TH1D *y0 = projX(sumOverBlocks<TH3D>(f, obsd.n("h_count_0b"), "cg_0b_" + gen), "yg_0b_" + gen, ptbin);
+        if (!y2) return g;
+        g.sig = y2;
+        g.tot = (TH1D *) y2->Clone("yg_tot_" + gen);
+        g.tot->SetDirectory(nullptr);
+        if (y1) g.tot->Add(y1);
+        if (y0) g.tot->Add(y0);
+        g.scale = (g.tot->Integral() > 0.) ? n_jets / g.tot->Integral() : 1.;
+        g.tot->Scale(g.scale);
+        g.sig->Scale(g.scale);
+        return g;
+    };
+    GenYields py = load("pythia");
+    GenYields hw = load("herwig");
+    if (!py.tot || !hw.tot) {
+        std::cerr << "ERROR: missing " << (!py.tot ? "Pythia" : "Herwig") << " yields for tag '"
+                  << tag << "'" << std::endl;
+        return;
+    }
+
+    // ---- printout ----
+    std::cout << "\n================ raw yields, Pythia vs Herwig: " << observable << ", "
+              << sample << ", tag '" << tag << "', " << ptLabel(ptbin) << " ================"
+              << std::endl;
+    std::cout << "  MC totals scaled to the data (" << std::setprecision(0) << std::fixed
+              << n_jets << " jets): Pythia x" << std::setprecision(4) << py.scale
+              << ", Herwig x" << hw.scale << std::endl;
+    std::cout << "    " << observable << " bin      |    data  |  Pythia  |  Herwig  | Py/data | Hw/data | Hw/Py  | 2B frac Py | 2B frac Hw"
+              << std::endl;
+    std::cout << "    -------------+----------+----------+----------+---------+---------+--------+------------+-----------"
+              << std::endl;
+    for (int i = 1; i <= y_data->GetNbinsX(); ++i) {
+        const double d = y_data->GetBinContent(i);
+        const double p = py.tot->GetBinContent(i), h = hw.tot->GetBinContent(i);
+        std::cout << "    " << std::setprecision(3)
+                  << std::setw(5) << y_data->GetXaxis()->GetBinLowEdge(i)
+                  << " - " << std::setw(5) << y_data->GetXaxis()->GetBinUpEdge(i)
+                  << " | " << std::setw(8) << std::setprecision(0) << d
+                  << " | " << std::setw(8) << p
+                  << " | " << std::setw(8) << h
+                  << " | " << std::setw(7) << std::setprecision(3) << (d > 0 ? p / d : 0.)
+                  << " | " << std::setw(7) << (d > 0 ? h / d : 0.)
+                  << " | " << std::setw(6) << (p > 0 ? h / p : 0.)
+                  << " | " << std::setw(10) << (p > 0 ? py.sig->GetBinContent(i) / p : 0.)
+                  << " | " << std::setw(9) << (h > 0 ? hw.sig->GetBinContent(i) / h : 0.)
+                  << std::endl;
+    }
+
+    // ---- plot ----
+    const Float_t font_scale  = 1200. / 800.;
+    const Style_t font_code   = 43;
+    const Float_t label_size  = 15. * font_scale;
+    const Float_t title_size  = 15. * font_scale;
+    const Float_t legend_size = 13. * font_scale;
+    const Color_t col_py = TFColor::cmpA();
+    const Color_t col_hw = TFColor::cmpB();
+
+    TCanvas c("c_raw_gen", "", 800, 850);
+    TPad *top = new TPad("rg_top", "", 0., 0.32, 1., 1.);
+    TPad *bot = new TPad("rg_bot", "", 0., 0.,   1., 0.32);
+    for (TPad *q : {top, bot}) { q->SetTicks(1, 1); q->SetFillColor(0); }
+    top->SetMargin(0.15, 0.05, 0.0,  0.09);
+    bot->SetMargin(0.15, 0.05, 0.26, 0.0);   // as the data-vs-gen ratio pad, which fits its title
+    c.cd(); top->Draw(); bot->Draw();
+
+    auto styleLine = [](TH1D *h, Color_t col, Style_t ls) {
+        h->SetLineColor(col); h->SetLineWidth(2); h->SetLineStyle(ls);
+        h->SetMarkerSize(0); h->SetFillStyle(0);
+    };
+    styleLine(py.tot, col_py, kSolid);  styleLine(py.sig, col_py, kDashed);
+    styleLine(hw.tot, col_hw, kSolid);  styleLine(hw.sig, col_hw, kDashed);
+    styleData(y_data);
+
+    auto styleAxes = [&](TH1D *f) {
+        for (TAxis *ax : { f->GetXaxis(), f->GetYaxis() }) {
+            ax->CenterTitle(true);
+            ax->SetTitleFont(font_code); ax->SetTitleSize(title_size);
+            ax->SetLabelFont(font_code); ax->SetLabelSize(label_size);
+        }
+        if (observable != "dr") f->GetXaxis()->SetRange(1, f->GetNbinsX());
+    };
+
+    top->cd();
+    TH1D *frame = (TH1D *) y_data->Clone("rg_frame");
+    frame->SetDirectory(nullptr); frame->Reset(); frame->SetTitle("");
+    frame->SetMinimum(0.001);
+    frame->SetMaximum(1.5 * std::max({y_data->GetMaximum(), py.tot->GetMaximum(), hw.tot->GetMaximum()}));
+    frame->GetYaxis()->SetTitle("2b jets per bin");
+    styleAxes(frame);
+    frame->GetYaxis()->SetTitleOffset(1.9);
+    frame->GetYaxis()->SetNdivisions(505);
+    frame->Draw("AXIS");
+    py.sig->Draw("hist same");
+    hw.sig->Draw("hist same");
+    py.tot->Draw("hist same");
+    hw.tot->Draw("hist same");
+    y_data->Draw("PE X0 same");
+
+    TLatex note; note.SetNDC(); note.SetTextFont(42); note.SetTextSize(0.037); note.SetTextAlign(13);
+    note.DrawLatex(0.19, 0.86, ptLabel(ptbin));
+    note.DrawLatex(0.19, 0.80, "Raw yields, reco level");
+    note.DrawLatex(0.19, 0.74, "MC scaled to data");
+
+    TLegend leg(0.52, 0.56, 0.94, 0.88);
+    leg.SetBorderSize(0); leg.SetFillStyle(0); leg.SetMargin(0.22);
+    leg.SetTextFont(font_code); leg.SetTextSize(legend_size);
+    leg.AddEntry(y_data, "Data", "pe1");
+    leg.AddEntry(py.tot, "Pythia 8, all flavours", "l");
+    leg.AddEntry(py.sig, "Pythia 8, 2B only", "l");
+    leg.AddEntry(hw.tot, "Herwig, all flavours", "l");
+    leg.AddEntry(hw.sig, "Herwig, 2B only", "l");
+    leg.Draw();
+    drawCMSHeader(top);
+    top->RedrawAxis();
+
+    bot->cd();
+    TH1D *rframe = (TH1D *) y_data->Clone("rg_rframe");
+    rframe->SetDirectory(nullptr); rframe->Reset(); rframe->SetTitle("");
+    TH1D *r_py = (TH1D *) py.tot->Clone("rg_r_py"); r_py->SetDirectory(nullptr);
+    TH1D *r_hw = (TH1D *) hw.tot->Clone("rg_r_hw"); r_hw->SetDirectory(nullptr);
+    TH1D *r_st = (TH1D *) y_data->Clone("rg_r_stat"); r_st->SetDirectory(nullptr);
+    double rdev = 0.;
+    for (int i = 1; i <= y_data->GetNbinsX(); ++i) {
+        const double d = y_data->GetBinContent(i);
+        r_py->SetBinContent(i, d > 0 ? py.tot->GetBinContent(i) / d : 0.); r_py->SetBinError(i, 0.);
+        r_hw->SetBinContent(i, d > 0 ? hw.tot->GetBinContent(i) / d : 0.); r_hw->SetBinError(i, 0.);
+        r_st->SetBinContent(i, 1.);
+        r_st->SetBinError(i, d > 0 ? y_data->GetBinError(i) / d : 0.);
+        rdev = std::max({rdev, std::fabs(r_py->GetBinContent(i) - 1.), std::fabs(r_hw->GetBinContent(i) - 1.)});
+    }
+    const double rhalf = std::max(0.25, 1.2 * rdev);
+    rframe->SetMinimum(1. - rhalf); rframe->SetMaximum(1. + rhalf);
+    rframe->GetYaxis()->SetTitle("MC / Data");
+    rframe->GetXaxis()->SetTitle(obsd.axis);
+    styleAxes(rframe);
+    rframe->GetYaxis()->SetTitleOffset(1.9);
+    rframe->GetXaxis()->SetTitleOffset(1.1);
+    rframe->GetYaxis()->SetNdivisions(505);
+    rframe->Draw("AXIS");
+    r_st->SetFillColor(kGray); r_st->SetFillStyle(1001); r_st->SetLineWidth(0); r_st->SetMarkerSize(0);
+    r_st->Draw("E2 same");
+    TLine one(obsd.bins[0], 1., obsd.bins[obsd.nbins], 1.);
+    one.SetLineStyle(2); one.SetLineColor(kBlack); one.Draw();
+    r_py->Draw("hist same");
+    r_hw->Draw("hist same");
+    bot->RedrawAxis();
+
+    const TString outdir = TString::Format("%s/results/%s_raw_yields_generators_%s%s_%s",
+                                           kBase, observable.Data(), sample.Data(),
+                                           svsfTag().Data(), tag.Data());
+    gSystem->mkdir(outdir, true);
+    const TString stem = outdir + "/" + observable + "_raw_yields_pythia_vs_herwig" + ptSuffix(ptbin);
+    c.SaveAs(stem + ".pdf");
+    c.SaveAs(stem + ".png");
+}
+
+void plot_raw_yields_generators(const TString &sample     = "both",
+                                const TString &tag        = "upartv2rho",
+                                const TString &observable = "dr")
+{
+    for (int ptbin = 1; ptbin <= jtpt_bins; ++ptbin)
+        raw_yields_generators_one(sample, tag, ptbin, observable);
+}
+
+
+// ============================================================================
+// DATA AFTER THE TEMPLATE FIT: Pythia vs Herwig templates (added 2026-09-29)
+// ============================================================================
+// The data times the signal fraction each fit extracts, bin by bin -- exactly the step
+// apply_unfolding_2d.C does ("Multiplying by signal fraction"), before the UParT SF and
+// before any unfolding. Read straight from the two template-fit output files, so the ONLY
+// thing that differs between the two curves is which generator's templates were fitted:
+//   data   = h3D_data of the fit file, projected over m_2B, one pT bin
+//   f_sig  = h_sig_fraction_fit (observable x pT)
+// Both files hold the same data (checked below). For dr the fit, and so the data here, is
+// EEC-weighted; for B it is the yield fit (_noeecw) -- as in the measurement chain.
+//
+// Top pad : data before the fit (black), after the Pythia fit (orange), after the Herwig
+//           fit (purple). Lower: Herwig / Pythia, which is the ratio of the signal fractions.
+// Errors on the after-fit curves: data stat (+) the fit's signal-fraction error.
+//
+//   root -l -b -q -e '.L template_fit.cpp+' -e 'plot_data_after_fit_generators("dr")'
+//   root -l -b -q -e '.L template_fit.cpp+' -e 'plot_data_after_fit_generators("B")'
+static TString tfFitFile(const TString &generator, const TString &observable, bool eecOff)
+{
+    // Same naming as templateFitFile() in apply_unfolding_2d.C: sample "both", nominal fit.
+    const TString eecw_tag = eecOff ? "_noeecw" : "";
+    const TString obs_tag  = (observable == "dr") ? "" : ("_" + observable);
+    return TString(kBase) + "/results/TemplateFit_Run3/TemplateFits_both_" + generator
+         + svsfTag() + eecw_tag + obs_tag + eraTag() + "/nominal_Run3_TemplateFits_histos_3d_80_inf.root";
+}
+
+static void data_after_fit_generators_one(const TString &observable, int ptbin)
+{
+    gStyle->SetOptStat(0);
+    gStyle->SetOptTitle(0);
+
+    const ObsDef obsd = obsByName(observable);
+    if (obsd.nbins == 0) {
+        std::cerr << "ERROR: unknown observable '" << observable << "' (use dr | B)" << std::endl;
+        return;
+    }
+    const bool eecOff = nominalEecWeightOff(observable);   // B: yield fit; dr: EEC-weighted
+
+    struct FitOut { TH1D *data = nullptr; TH1D *after = nullptr; TH1D *fsig = nullptr; };
+    auto load = [&](const TString &gen) -> FitOut {
+        FitOut o;
+        const TString fn = tfFitFile(gen, observable, eecOff);
+        TFile *f = TFile::Open(fn);
+        if (!f || f->IsZombie()) {
+            std::cerr << "ERROR: cannot open " << fn << " -- run template_fit.cpp for " << gen
+                      << " first" << std::endl;
+            return o;
+        }
+        TH3D *d3 = dynamic_cast<TH3D *>(f->Get("h3D_data"));
+        TH2D *sf = dynamic_cast<TH2D *>(f->Get("h_sig_fraction_fit"));
+        if (!d3 || !sf) {
+            std::cerr << "ERROR: h3D_data / h_sig_fraction_fit missing in " << fn << std::endl;
+            f->Close(); return o;
+        }
+        o.data = projX(d3, "af_data_" + gen, ptbin);
+        o.fsig = sf->ProjectionX("af_fsig_" + gen, ptbin, ptbin);
+        o.fsig->SetDirectory(nullptr);
+        if (o.fsig->GetNbinsX() != o.data->GetNbinsX()) {
+            std::cerr << "ERROR: signal fraction has " << o.fsig->GetNbinsX() << " bins, data "
+                      << o.data->GetNbinsX() << " in " << fn << std::endl;
+            f->Close(); o = FitOut(); return o;
+        }
+        o.after = (TH1D *) o.data->Clone("af_after_" + gen);
+        o.after->SetDirectory(nullptr);
+        o.after->Multiply(o.fsig);   // errors: data stat (+) fit error, in quadrature (relative)
+        f->Close();
+        return o;
+    };
+    FitOut py = load("pythia");
+    FitOut hw = load("herwig");
+    if (!py.after || !hw.after) return;
+
+    // The two fits must have been run on the same data, or the comparison is meaningless.
+    for (int i = 1; i <= py.data->GetNbinsX(); ++i) {
+        const double a = py.data->GetBinContent(i), b = hw.data->GetBinContent(i);
+        if (std::fabs(a - b) > 1e-6 * std::max(std::fabs(a), 1.)) {
+            std::cerr << "ERROR: the Pythia and Herwig fits were run on DIFFERENT data (bin " << i
+                      << ": " << a << " vs " << b << ") -- not comparing them." << std::endl;
+            return;
+        }
+    }
+
+    // ---- printout ----
+    std::cout << "\n================ data after the template fit, Pythia vs Herwig: "
+              << observable << ", " << ptLabel(ptbin) << (eecOff ? ", yields" : ", EEC-weighted")
+              << " ================" << std::endl;
+    std::cout << "    " << observable << " bin      |  f_sig Py      |  f_sig Hw      |  Hw/Py" << std::endl;
+    std::cout << "    -------------+----------------+----------------+--------" << std::endl;
+    for (int i = 1; i <= py.fsig->GetNbinsX(); ++i) {
+        const double p = py.fsig->GetBinContent(i), h = hw.fsig->GetBinContent(i);
+        std::cout << "    " << std::fixed << std::setprecision(3)
+                  << std::setw(5) << py.data->GetXaxis()->GetBinLowEdge(i)
+                  << " - " << std::setw(5) << py.data->GetXaxis()->GetBinUpEdge(i)
+                  << " | " << std::setw(6) << p << " +- " << std::setw(5) << py.fsig->GetBinError(i)
+                  << " | " << std::setw(6) << h << " +- " << std::setw(5) << hw.fsig->GetBinError(i)
+                  << " | " << std::setw(6) << (p > 0 ? h / p : 0.) << std::endl;
+    }
+    std::cout << "    integral after fit: Pythia " << std::setprecision(4) << py.after->Integral()
+              << ", Herwig " << hw.after->Integral() << "  (Hw/Py = "
+              << (py.after->Integral() > 0 ? hw.after->Integral() / py.after->Integral() : 0.)
+              << ")" << std::endl;
+
+    // ---- plot ----
+    const Float_t font_scale  = 1200. / 800.;
+    const Style_t font_code   = 43;
+    const Float_t label_size  = 15. * font_scale;
+    const Float_t title_size  = 15. * font_scale;
+    const Float_t legend_size = 13. * font_scale;
+    const Color_t col_py = TFColor::cmpA();
+    const Color_t col_hw = TFColor::cmpB();
+
+    TCanvas c("c_af_gen", "", 800, 850);
+    TPad *top = new TPad("af_top", "", 0., 0.32, 1., 1.);
+    TPad *bot = new TPad("af_bot", "", 0., 0.,   1., 0.32);
+    for (TPad *q : {top, bot}) { q->SetTicks(1, 1); q->SetFillColor(0); }
+    top->SetMargin(0.15, 0.05, 0.0,  0.09);
+    bot->SetMargin(0.15, 0.05, 0.26, 0.0);
+    c.cd(); top->Draw(); bot->Draw();
+
+    auto styleAfter = [](TH1D *h, Color_t col) {
+        h->SetLineColor(col); h->SetLineWidth(2); h->SetMarkerColor(col);
+        h->SetMarkerSize(0); h->SetFillStyle(0);
+    };
+    styleAfter(py.after, col_py);
+    styleAfter(hw.after, col_hw);
+    styleData(py.data);
+    py.data->SetMarkerStyle(24);   // open: the data BEFORE the fit, not a result
+
+    auto styleAxes = [&](TH1D *f) {
+        for (TAxis *ax : { f->GetXaxis(), f->GetYaxis() }) {
+            ax->CenterTitle(true);
+            ax->SetTitleFont(font_code); ax->SetTitleSize(title_size);
+            ax->SetLabelFont(font_code); ax->SetLabelSize(label_size);
+        }
+        if (observable != "dr") f->GetXaxis()->SetRange(1, f->GetNbinsX());
+    };
+
+    top->cd();
+    TH1D *frame = (TH1D *) py.data->Clone("af_frame");
+    frame->SetDirectory(nullptr); frame->Reset(); frame->SetTitle("");
+    frame->SetMinimum(0.001);
+    frame->SetMaximum(1.5 * py.data->GetMaximum());
+    frame->GetYaxis()->SetTitle(eecOff ? "2b jets per bin" : "EEC-weighted data per bin");
+    styleAxes(frame);
+    frame->GetYaxis()->SetTitleOffset(1.9);
+    frame->GetYaxis()->SetNdivisions(505);
+    frame->Draw("AXIS");
+    py.after->Draw("hist same");  py.after->Draw("E1 X0 same");
+    hw.after->Draw("hist same");  hw.after->Draw("E1 X0 same");
+    py.data->Draw("PE X0 same");
+
+    TLatex note; note.SetNDC(); note.SetTextFont(42); note.SetTextSize(0.037); note.SetTextAlign(13);
+    note.DrawLatex(0.19, 0.86, ptLabel(ptbin));
+    note.DrawLatex(0.19, 0.80, "Reco level, no unfolding");
+    note.DrawLatex(0.19, 0.74, eecOff ? "Yields" : "EEC weighted");
+
+    TLegend leg(0.50, 0.66, 0.94, 0.88);
+    leg.SetBorderSize(0); leg.SetFillStyle(0); leg.SetMargin(0.22);
+    leg.SetTextFont(font_code); leg.SetTextSize(legend_size);
+    leg.AddEntry(py.data, "Data, before fit", "pe1");
+    leg.AddEntry(py.after, "Data #times f_{sig}, Pythia 8 fit", "l");
+    leg.AddEntry(hw.after, "Data #times f_{sig}, Herwig fit", "l");
+    leg.Draw();
+    drawCMSHeader(top);
+    top->RedrawAxis();
+
+    bot->cd();
+    TH1D *rframe = (TH1D *) py.data->Clone("af_rframe");
+    rframe->SetDirectory(nullptr); rframe->Reset(); rframe->SetTitle("");
+    // Herwig / Pythia of the after-fit data = f_sig(Hw) / f_sig(Py); the data cancels, so the
+    // error is the two fits' errors only.
+    TH1D *r = (TH1D *) hw.fsig->Clone("af_ratio"); r->SetDirectory(nullptr);
+    r->Divide(py.fsig);
+    double rdev = 0.;
+    for (int i = 1; i <= r->GetNbinsX(); ++i)
+        rdev = std::max(rdev, std::fabs(r->GetBinContent(i) - 1.) + r->GetBinError(i));
+    const double rhalf = std::max(0.15, 1.2 * rdev);
+    rframe->SetMinimum(1. - rhalf); rframe->SetMaximum(1. + rhalf);
+    rframe->GetYaxis()->SetTitle("Herwig / Pythia");
+    rframe->GetXaxis()->SetTitle(obsd.axis);
+    styleAxes(rframe);
+    rframe->GetYaxis()->SetTitleOffset(1.9);
+    rframe->GetXaxis()->SetTitleOffset(1.1);
+    rframe->GetYaxis()->SetNdivisions(505);
+    rframe->Draw("AXIS");
+    TLine one(obsd.bins[0], 1., obsd.bins[obsd.nbins], 1.);
+    one.SetLineStyle(2); one.SetLineColor(kBlack); one.Draw();
+    r->SetLineColor(col_hw); r->SetMarkerColor(col_hw); r->SetMarkerStyle(20); r->SetMarkerSize(1.0);
+    r->SetLineWidth(2);
+    r->Draw("PE1 X0 same");
+    bot->RedrawAxis();
+
+    const TString outdir = TString::Format("%s/results/%s_data_after_fit_generators_both%s%s",
+                                           kBase, observable.Data(), svsfTag().Data(),
+                                           eraTag().Data());
+    gSystem->mkdir(outdir, true);
+    const TString stem = outdir + "/" + observable + "_data_after_fit_pythia_vs_herwig" + ptSuffix(ptbin);
+    c.SaveAs(stem + ".pdf");
+    c.SaveAs(stem + ".png");
+}
+
+void plot_data_after_fit_generators(const TString &observable = "dr")
+{
+    for (int ptbin = 1; ptbin <= jtpt_bins; ++ptbin)
+        data_after_fit_generators_one(observable, ptbin);
 }

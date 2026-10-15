@@ -87,6 +87,9 @@ struct Variation {
     // nominal, i.e. whatever SV_SF this band is built with; "up" / "down" for the two sides of
     // the SV b scale-factor uncertainty, whose results live under _svsfup / _svsfdn.
     TString svsfVariation = "";
+    // TRACK_BDT_SF of that run. The nominal applies both SFb and SFl; "boff" and "loff"
+    // remove one source at a time while retaining the other.
+    TString trackBdtSfVariation = "";
 };
 
 // ---- Weights = scale factors ---------------------------------------------------------
@@ -542,6 +545,18 @@ void apply_weights_and_systematics(TString SAMPLE = "both", TString GENERATOR = 
         ---- end disabled ---- */
     }
 
+    // ---- Track-BDT SF on/off systematics ---------------------------------------------
+    // With no dedicated uncertainties, use the full correction as the uncertainty. SFb
+    // and SFl are independent, while the in-SV and out-of-SV values move together.
+    if (trackBdtSfTag() == "_trkbdtsf") {
+        variations.push_back({ "track_bdt_sfb_off", SAMPLE, GENERATOR, TF_GENERATOR,
+                               "Track-BDT SF_{b} off", false, "nominal", SFUPART_NOM,
+                               "", "Track-BDT SF_{b}", true, true, "", "boff" });
+        variations.push_back({ "track_bdt_sfl_off", SAMPLE, GENERATOR, TF_GENERATOR,
+                               "Track-BDT SF_{l} off", false, "nominal", SFUPART_NOM,
+                               "", "Track-BDT SF_{l}", true, true, "", "loff" });
+    }
+
     // ---- Correction-level variations (no second unfolding; see the loop below) --------
     // NOTE ON DOUBLE COUNTING: "unfolding_model" above already swaps the whole unfolding MC
     // to the other generator, which includes these very corrections. Keeping both in the
@@ -692,7 +707,12 @@ void apply_weights_and_systematics(TString SAMPLE = "both", TString GENERATOR = 
         const char *svsf_env  = std::getenv("SV_SF");
         const bool  svsf_had  = (svsf_env != nullptr);
         const TString svsf_prev = svsf_had ? TString(svsf_env) : TString("");
+        const char *trkbdt_env = std::getenv("TRACK_BDT_SF");
+        const bool trkbdt_had = (trkbdt_env != nullptr);
+        const TString trkbdt_prev = trkbdt_had ? TString(trkbdt_env) : TString("");
         if (v.svsfVariation.Length()) gSystem->Setenv("SV_SF", v.svsfVariation);
+        if (v.trackBdtSfVariation.Length())
+            gSystem->Setenv("TRACK_BDT_SF", v.trackBdtSfVariation);
         const TString varFile =
             resultFile(v.sample, v.generator, test_mode, unfoldBayes, v.tfGenerator,
                        v.trackEffUnc, v.tfVariation, v.sfupartVariation, EEC_WEIGHT_OFF,
@@ -700,6 +720,10 @@ void apply_weights_and_systematics(TString SAMPLE = "both", TString GENERATOR = 
         if (v.svsfVariation.Length()) {
             if (svsf_had) gSystem->Setenv("SV_SF", svsf_prev);
             else          gSystem->Unsetenv("SV_SF");
+        }
+        if (v.trackBdtSfVariation.Length()) {
+            if (trkbdt_had) gSystem->Setenv("TRACK_BDT_SF", trkbdt_prev);
+            else            gSystem->Unsetenv("TRACK_BDT_SF");
         }
         std::cout << "Variation '" << v.name << "' : " << varFile << std::endl;
 
@@ -710,6 +734,8 @@ void apply_weights_and_systematics(TString SAMPLE = "both", TString GENERATOR = 
             // that stopped at the SF variation would rebuild the dr result instead.
             std::cerr << "   -> skipped (run "
                       << (v.svsfVariation.Length() ? "SV_SF=" + v.svsfVariation + " " : TString(""))
+                      << (v.trackBdtSfVariation.Length()
+                              ? "TRACK_BDT_SF=" + v.trackBdtSfVariation + " " : TString(""))
                       << "apply_unfolding_2d.C(\"" << v.sample << "\",\""
                       << v.generator << "\"," << test_mode << "," << (unfoldBayes ? "true" : "false")
                       << ",false,\"" << v.tfGenerator << "\","
@@ -2654,7 +2680,7 @@ void plot_unfolding_method_comparison(TString OBSERVABLE = "dr", int NITER = -1,
   };
 
   const TString outdir = "/data_CMS/cms/zaidan/bJetAggRun3/PPRef2024/results/unfolding_method_comparison"
-                       + svsfTag() + eraTag() + "/";
+                       + svsfTag() + trackBdtSfTag() + eraTag() + "/";
   gSystem->mkdir(outdir, true);
   const TString stem = outdir + OBSERVABLE + "_unfolding_MI_vs_bayes";
 

@@ -1974,7 +1974,8 @@ TString mcgenTemplates(const TString &sample, const TString &generator,
         // trkTag / eecWeightTag / obsProdTag are result_paths.h's, so the literals are shared
         // with apply_unfolding_2d.C and cannot drift from what it reads.
         // svsfTag(): the SV b scale-factor production when SV_SF is set (2026-10-12).
-        const TString tag = trkTag(track_eff_unc) + svsfTag() + eecWeightTag(eec_weight_off)
+        const TString tag = trkTag(track_eff_unc) + svsfTag() + trackBdtSfTag()
+                          + eecWeightTag(eec_weight_off)
                           + obsProdTag(observable);
         return base + subdir + "/agg_ntuple_chunks/"
                "Run3_btagWP0712_template_for_fit_histos_3D_" + sample + "_fMCGEN" + tag + ".root";
@@ -2106,7 +2107,8 @@ void template_fit(TString SAMPLE = "both", TString GENERATOR = "pythia",
     // h_sig_fraction_fit by name, and a B-binned one there would be silently wrong.
     const TString obs_tag  = (OBSERVABLE == "dr") ? "" : ("_" + OBSERVABLE);
     sDirname     = "/data_CMS/cms/zaidan/bJetAggRun3/PPRef2024/results/TemplateFit_Run3/"
-                   "TemplateFits_" + SAMPLE + "_" + GENERATOR + trk_tag + svsfTag() + eecw_tag + obs_tag + eraTag();
+                   "TemplateFits_" + SAMPLE + "_" + GENERATOR + trk_tag + svsfTag()
+                   + trackBdtSfTag() + eecw_tag + obs_tag + eraTag();
     sDirname_www = sDirname;
 
     // -- Output folder to save the result of the tests
@@ -2116,7 +2118,8 @@ void template_fit(TString SAMPLE = "both", TString GENERATOR = "pythia",
     TString folder = Form("%s", sDirname.Data()); // this is sDirname
         cout << "Sample: " << SAMPLE << ", generator: " << GENERATOR
              << ", tracking-eff variation: " << (TRACK_EFF_UNC ? "ON (3% tracks dropped)" : "off")
-             << ", SV b SF: " << (svsfTag().Length() ? svsfTag() : TString("off")) << endl;
+             << ", SV b SF: " << (svsfTag().Length() ? svsfTag() : TString("off"))
+             << ", track-BDT SF: " << (trackBdtSfTag().Length() ? trackBdtSfTag() : TString("off")) << endl;
         cout << "Output folder path: "<< folder << endl;
 
     Int_t RunN = 3; // 3;
@@ -2408,7 +2411,7 @@ std::vector<TString> mcFiles(const TString &sample, const TString &generator,
                 rmatrix ? "" : "MCGEN",
                 // The SV b SF production (svsfTag(), 2026-10-12): MC only -- the same tag
                 // also names the data files (dataFiles below), which carry no SF.
-                svsfTag().Data(), tag.Data());
+                (svsfTag() + trackBdtSfTag()).Data(), tag.Data());
             if (gSystem->AccessPathName(f) == kFALSE) { files.push_back(f); ++found; }
         }
         if (found == 0)
@@ -2580,7 +2583,7 @@ static void z_first_look_one(const TString &sample, const TString &generator,
     // folders are left where they are rather than moved.
     TString outdir = TString::Format("%s/results/%s_first_look_%s_%s%s_%s",
                                      kBase, observable.Data(), sample.Data(),
-                                     generator.Data(), svsfTag().Data(), tag.Data());
+                                     generator.Data(), (svsfTag() + trackBdtSfTag()).Data(), tag.Data());
     gSystem->mkdir(outdir, true);
 
     // ---- 1. Do the flavour templates separate in B? ----
@@ -3224,7 +3227,7 @@ static void raw_yields_generators_one(const TString &sample, const TString &tag,
 
     const TString outdir = TString::Format("%s/results/%s_raw_yields_generators_%s%s_%s",
                                            kBase, observable.Data(), sample.Data(),
-                                           svsfTag().Data(), tag.Data());
+                                           (svsfTag() + trackBdtSfTag()).Data(), tag.Data());
     gSystem->mkdir(outdir, true);
     const TString stem = outdir + "/" + observable + "_raw_yields_pythia_vs_herwig" + ptSuffix(ptbin);
     c.SaveAs(stem + ".pdf");
@@ -3264,7 +3267,8 @@ static TString tfFitFile(const TString &generator, const TString &observable, bo
     const TString eecw_tag = eecOff ? "_noeecw" : "";
     const TString obs_tag  = (observable == "dr") ? "" : ("_" + observable);
     return TString(kBase) + "/results/TemplateFit_Run3/TemplateFits_both_" + generator
-         + svsfTag() + eecw_tag + obs_tag + eraTag() + "/nominal_Run3_TemplateFits_histos_3d_80_inf.root";
+         + svsfTag() + trackBdtSfTag() + eecw_tag + obs_tag + eraTag()
+         + "/nominal_Run3_TemplateFits_histos_3d_80_inf.root";
 }
 
 static void data_after_fit_generators_one(const TString &observable, int ptbin)
@@ -3434,7 +3438,8 @@ static void data_after_fit_generators_one(const TString &observable, int ptbin)
     bot->RedrawAxis();
 
     const TString outdir = TString::Format("%s/results/%s_data_after_fit_generators_both%s%s",
-                                           kBase, observable.Data(), svsfTag().Data(),
+                                           kBase, observable.Data(),
+                                           (svsfTag() + trackBdtSfTag()).Data(),
                                            eraTag().Data());
     gSystem->mkdir(outdir, true);
     const TString stem = outdir + "/" + observable + "_data_after_fit_pythia_vs_herwig" + ptSuffix(ptbin);

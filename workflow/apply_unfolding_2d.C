@@ -146,7 +146,8 @@ TString templateFitFile(const TString &sample, const TString &tfGenerator,
     // NAME and the wrong binning, the quietest possible way to be wrong.
     const TString obs_tag = (observable == "dr") ? "" : ("_" + observable);
     return "/data_CMS/cms/zaidan/bJetAggRun3/PPRef2024/results/TemplateFit_Run3/TemplateFits_"
-         + tf_sample + "_" + tfGenerator + trk_tag + svsfTag() + eecw_tag + obs_tag + eraTag() + "/"
+         + tf_sample + "_" + tfGenerator + trk_tag + svsfTag() + trackBdtSfTag()
+         + eecw_tag + obs_tag + eraTag() + "/"
          + tfVariation + "_Run3_TemplateFits_histos_3d_80_inf.root";
 
     /* ---- disabled (kept for reference): Afnan's fits, Pythia8 only ----
@@ -176,7 +177,8 @@ TString mcVarTag(bool track_eff_unc, bool eec_weight_off = false)
     // result_paths.h, shared by the MC-production names and the result folders.
     // svsfTag(): the SV b scale-factor production when SV_SF is set (2026-10-12), in the
     // position create_files_for_template_fit.cpp writes it (trk, svsf, noeecw).
-    return trkTag(track_eff_unc) + svsfTag() + eecWeightTag(eec_weight_off);
+    return trkTag(track_eff_unc) + svsfTag() + trackBdtSfTag()
+         + eecWeightTag(eec_weight_off);
 }
 
 // One per-block file, or the top-level merged one when block < 0. prefix is "RMatrix_" or

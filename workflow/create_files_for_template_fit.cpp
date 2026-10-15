@@ -36,6 +36,7 @@
 #include "central_selections.h"
 #include "tracking_efficiency_syst.h"
 #include "sv_sf.h"         // SV b scale factor vs aggregate pT, applied per SV (MC only)
+#include "track_bdt_sf.h"  // effective track-BDT WPs for signal/non-signal tracks (MC only)
 #include "observables.h"   // the measured observables (dr, B) and the axis abstraction
 
 // ============================================================================
@@ -578,7 +579,7 @@ vector<ROOT::Math::PtEtaPhiMVector> makeSvtxs_withBDT(
      // {h_score_sg->Fill(t.trkBdtScore[itrk], weight_tree);}
 
     // -- Add trkbdt score
-    if (t.trkBdtScore[itrk]<=0.365) {
+    if (!TrackBdtSF::passes(t.trkBdtScore[itrk], t.trkMatchSta[itrk], t.trkSvtxId[itrk])) {
       // Rejected as not b-like: this track is the NON-B part of the jet. Sum its pT for the
       // fnb observable before dropping it. The tracking-efficiency variation is applied here
       // too, so a 3% track drop thins the non-b side exactly as it thins the Bs -- the
@@ -1527,7 +1528,7 @@ void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, boo
   // observable, so it must never land in the same file as the EEC histograms.
   // SvSF::tag() is "_svsf" / "_svsfup" / "_svsfdn" when the SV b scale factor is applied
   // (MC only), "" when off -- see sv_sf.h.
-  TString syst_suffix = TrkEffSyst::tag() + SvSF::tag() + EecWeight::tag();
+  TString syst_suffix = TrkEffSyst::tag() + SvSF::tag() + TrackBdtSF::tag() + EecWeight::tag();
   TString fout_name = cfg.dataset.output_folder + cfg.dataset.output_hist + job_suffix + "MCGEN" + syst_suffix + ".root"; // for reposnse matrix: has Prefix: Response
   TString ResponseMatrix_fout_name =  cfg.dataset.output_folder + "RMatrix_" + cfg.dataset.output_hist + job_suffix + syst_suffix + ".root";
   TString AggBHadronNtuple_fout_name = cfg.dataset.output_folder + "AggBHadronNtuple_" + cfg.dataset.output_hist + job_suffix + syst_suffix + ".root";
@@ -2322,7 +2323,8 @@ void create_files_for_template_fit(Int_t RunN = 3, Float_t pT_low = 80, Float_t 
                                    bool track_eff_unc = false, ULong64_t trkSeed = 20260908,
                                    bool eec_weight_off = false,
                                    bool apply_jec = false,
-                                   const char* sv_sf = "off"){
+                                   const char* sv_sf = "off",
+                                   const char* track_bdt_sf = "nominal"){
  // load at prompt: gSystem->Load("libGenVector");
  // -- test use of central configuration
   AnalysisConfig cfg = buildConfig(RunN, pT_low, etaCut, n, btag, isMC, btagWP, sampleTag);
@@ -2365,6 +2367,13 @@ void create_files_for_template_fit(Int_t RunN = 3, Float_t pT_low = 80, Float_t 
 	  // never weighted, hence the isMC guard inside.
 	  SvSF::enable(sv_sf, cfg.dataset.isMC);
 	  SvSF::print();
+
+	  // ---- Track-BDT efficiency/mistag scale factors ----
+	  // MC uses category-dependent effective working points derived from the measured SFb
+	  // and SFl. "boff" and "loff" independently remove the corresponding correction;
+	  // "off" is the uncorrected cross-check. Data always keeps the nominal 0.365 cut.
+	  TrackBdtSF::enable(track_bdt_sf, cfg.dataset.isMC);
+	  TrackBdtSF::print();
 
       // make_templates(cfg, 1, 1e+04);
       // TString output_hist_response =  Form("response_templatefit_n1_bjet_Run%d", cfg.dataset.RunN);

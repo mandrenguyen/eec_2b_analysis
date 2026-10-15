@@ -129,6 +129,21 @@ inline TString svsfTag()
     return kUnknownTag();
 }
 
+// TRACK_BDT_SF: effective MC working points that reproduce the measured track-level SFb
+// and SFl. The two sources are independent, while their in/out-SV values move together.
+// Data never carries this tag. An unset variable means the corrected nominal production.
+inline TString trackBdtSfTag()
+{
+    const char *env = std::getenv("TRACK_BDT_SF");
+    const TString v = (env && *env) ? TString(env) : TString("nominal");
+    if (v == "off")     return "";
+    if (v == "nominal") return "_trkbdtsf";
+    if (v == "boff")    return "_trkbdtsf_boff";
+    if (v == "loff")    return "_trkbdtsf_loff";
+    warnUnknown("TRACK_BDT_SF", v, "off | nominal | boff | loff");
+    return kUnknownTag();
+}
+
 // TF_VARIATION: the template-fit variation supplying the signal fraction.
 inline TString tfVarTag(const TString &tfVariation)
 {
@@ -404,6 +419,7 @@ inline TString variationTag(const TString &tfGenerator, bool trackEffUnc,
                             const TString &observable = "dr")
 {
     return observableTag(observable) + tfTag(tfGenerator) + trkTag(trackEffUnc) + svsfTag()
+         + trackBdtSfTag()
          + tfVarTag(tfVariation) + sfupartVarTag(sfupartVariation)
          + eecWeightTag(eecWeightOff);
 }

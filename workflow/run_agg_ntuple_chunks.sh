@@ -122,10 +122,26 @@ case "${SV_SF}" in
 esac
 [ "${SV_SF}" != off ] && echo "SV b SCALE FACTOR: ${SV_SF}, file tag ${SVSF_TAG}"
 
+# ---------------------------------------------------------------------------
+# Track-BDT efficiency and mistag scale factors
+# ---------------------------------------------------------------------------
+# nominal applies SFb and SFl through the four category-dependent effective WPs.
+# boff/loff remove one coupled in/out correction at a time; off is the uncorrected
+# cross-check. This is MC-only; the data production keeps the 0.365 working point.
+TRACK_BDT_SF=${TRACK_BDT_SF:-nominal}   # off | nominal | boff | loff
+case "${TRACK_BDT_SF}" in
+  off)     TRACKBDT_TAG="" ;;
+  nominal) TRACKBDT_TAG="_trkbdtsf" ;;
+  boff)    TRACKBDT_TAG="_trkbdtsf_boff" ;;
+  loff)    TRACKBDT_TAG="_trkbdtsf_loff" ;;
+  *) echo "TRACK_BDT_SF must be off | nominal | boff | loff, got '${TRACK_BDT_SF}'"; exit 1 ;;
+esac
+echo "Track-BDT SF: ${TRACK_BDT_SF}${TRACKBDT_TAG:+, file tag ${TRACKBDT_TAG}}"
+
 # Same tags the macro builds, for the staging dir and the log filenames.
 TRK_TAG=$([ "${TRACK_EFF_UNC}" = true ] && echo "_trkdrop030" || echo "")
 EECW_TAG=$([ "${EEC_WEIGHT_OFF}" = true ] && echo "_noeecw" || echo "")
-TRK_TAG="${TRK_TAG}${SVSF_TAG}${EECW_TAG}"
+TRK_TAG="${TRK_TAG}${SVSF_TAG}${TRACKBDT_TAG}${EECW_TAG}"
 
 case "${INPUT_TAG}" in
   UParTV2)   BTAG_WP=0.712 ;;
@@ -206,7 +222,8 @@ fi   # SKIP_COMPILE
 # The .so must be NEWER than every source it is built from, or a failed rebuild left the
 # previous one in place and the jobs would run the wrong code.
 for src in create_files_for_template_fit.cpp observables.h binning_histos_small.h \
-           result_paths.h tTree.h tracking_efficiency_syst.h central_selections.h sv_sf.h; do
+           result_paths.h tTree.h tracking_efficiency_syst.h central_selections.h sv_sf.h \
+           track_bdt_sf.h; do
   if [ -e "${WORK}/${src}" ] && [ "${WORK}/${src}" -nt "${SO}" ]; then
     echo "compile FAILED -- ${src} is newer than ${SO}; the build did not take. Not launching."
     tail -n 40 "${COMPILE_LOG}"
@@ -242,10 +259,10 @@ for input in "${inputs[@]}"; do
 
   (
   
-  # Remeber: create_files_for_template_fit(Int_t RunN = 3, Float_t pT_low = 80, Float_t etaCut = 2, Int_t n = 1,bool btag = true, bool isMC = true, Double_t btagWP = 0.712, bool makeTemplates = true, bool createRmatrix = true, bool makeAggNtuple = true, Long64_t ev_first = 0, Long64_t ev_last = -1, const char* inputFileOverride = "", const char* outputFolderOverride = "", const char* sampleTag = "", bool track_eff_unc = false, ULong64_t trkSeed = 20260908, bool eec_weight_off = false, bool apply_jec = false, const char* sv_sf = "off")
+  # Remeber: create_files_for_template_fit(..., bool apply_jec = false, const char* sv_sf = "off", const char* track_bdt_sf = "nominal")
   # MC vs data is the isMC argument; bjet vs qcd is SAMPLE_TAG.
 
-  nice -n 10 root -l -b -q -e "gSystem->Load(\"${ACLIC_BUILD_DIR}/create_files_for_template_fit_cpp.so\"); create_files_for_template_fit(3,80,2,1,true,true,${BTAG_WP},true,true,true,0,-1,\"${input}\",\"${stagedir}\",\"${SAMPLE_TAG}\",${TRACK_EFF_UNC},${TRK_SEED},${EEC_WEIGHT_OFF},${APPLY_JEC},\"${SV_SF}\")"
+  nice -n 10 root -l -b -q -e "gSystem->Load(\"${ACLIC_BUILD_DIR}/create_files_for_template_fit_cpp.so\"); create_files_for_template_fit(3,80,2,1,true,true,${BTAG_WP},true,true,true,0,-1,\"${input}\",\"${stagedir}\",\"${SAMPLE_TAG}\",${TRACK_EFF_UNC},${TRK_SEED},${EEC_WEIGHT_OFF},${APPLY_JEC},\"${SV_SF}\",\"${TRACK_BDT_SF}\")"
 
     for f in "${stagedir}"/*.root; do
       [ -e "${f}" ] || continue

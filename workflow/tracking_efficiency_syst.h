@@ -32,7 +32,7 @@
 // So instead of drawing the n-th number of a stream, the random number for a
 // track is COMPUTED from the track's identity:
 //
-//     u = hash(seed, entry number, track index)  ->  uniform in [0,1)
+//     u = hash(seed, run/lumi/event, track index)  ->  uniform in [0,1)
 //     drop the track if u >= 1 - dropFraction    (3% -> drop if u >= 0.97)
 //
 // The number attached to a given track is then a property of that track, not of
@@ -76,6 +76,7 @@
 #include <cstdint>
 #include <cmath>
 #include <iostream>
+#include <stdexcept>
 #include "Rtypes.h"
 #include "TString.h"
 
@@ -96,6 +97,8 @@ struct Config {
                                                    // produce an independent throw
     bool               isMC         = false;       // data is never varied
     unsigned long long splitSeed    = 12345ULL;    // half0/half1 jet split
+    unsigned long long eventKey     = 0ULL;         // hash(run,lumi,event)
+    bool               hasEventKey  = false;
 };
 
 inline Config &config()
@@ -133,9 +136,27 @@ inline double uniformFrom(uint64_t a, uint64_t b, uint64_t c)
     return static_cast<double>(h >> 11) * (1.0 / 9007199254740992.0);
 }
 
+// Set once after reading each event.  Unlike a local TTree entry number, this
+// identity is unchanged by chunking, merging, or processing only a sub-range.
+inline void beginEvent(UInt_t run, UInt_t lumi, ULong64_t event)
+{
+    Config &c = config();
+    c.eventKey = mix64(static_cast<uint64_t>(run));
+    c.eventKey = mix64(c.eventKey ^ mix64(static_cast<uint64_t>(lumi)));
+    c.eventKey = mix64(c.eventKey ^ mix64(static_cast<uint64_t>(event)));
+    c.hasEventKey = true;
+}
+
+inline uint64_t eventKey()
+{
+    if (!config().hasEventKey)
+        throw std::logic_error("TrkEffSyst::beginEvent must be called before drawing random numbers");
+    return config().eventKey;
+}
+
 // ---- The decision ----------------------------------------------------------
 // true  = this reconstructed track is thrown away by the variation.
-// ient  = TTree entry number, itrk = index in the trk* arrays of that entry.
+// beginEvent() supplies the stable event identity; itrk indexes the trk* arrays.
 // Deliberately independent of the jet index: a track keeps its verdict no
 // matter which jet's loop happens to be looking at it.
 inline bool dropTrack(Long64_t ient, Int_t itrk)
@@ -143,20 +164,21 @@ inline bool dropTrack(Long64_t ient, Int_t itrk)
     const Config &c = config();
     if (c.dropFraction <= 0.) return false;   // nominal: no-op
     if (!c.isMC)              return false;   // data is never varied
-    const double u = uniformFrom(c.seed, static_cast<uint64_t>(ient),
+    const double u = uniformFrom(c.seed, eventKey(),
                                  static_cast<uint64_t>(static_cast<uint32_t>(itrk)));
     return u >= (1.0 - c.dropFraction);       // 3% -> dropped when u >= 0.97
 }
 
 // ---- Deterministic jet half-split ------------------------------------------
 // Replaces a std::random_device-seeded mt19937 that made two runs of the SAME
-// job disagree in the half0/half1 histograms. Hashing (ient, ijet) makes the
+// job disagree in the half0/half1 histograms. Hashing (event identity, ijet) makes the
 // half a jet lands in a property of the jet, so it is stable across reruns and
 // across re-chunking, and identical between the nominal and the varied
 // production -- otherwise the split noise would leak into the systematic.
 inline double jetSplitRandom(Long64_t ient, Int_t ijet)
 {
-    return uniformFrom(config().splitSeed, static_cast<uint64_t>(ient),
+    const Config &c = config();
+    return uniformFrom(c.splitSeed, eventKey(),
                        0x5FF1CEULL ^ static_cast<uint64_t>(static_cast<uint32_t>(ijet)));
 }
 

@@ -353,8 +353,7 @@ void create_response_1D(TString &filename,  TString &dataset, TString &label, TS
     // random number generator for jackknife resampling (Lida)
     const double range_from = 0;
     const double range_to = 1;
-    std::random_device rand_dev;
-    std::mt19937 generator(rand_dev());
+    std::mt19937 generator(12345u);
     std::uniform_real_distribution<double> distr(range_from, range_to);
 
     
@@ -833,8 +832,7 @@ void create_response_2D(TString &filename,  TString &dataset, TString &label, TS
     // random number generator for jackknife resampling (Lida)
     const double range_from = 0;
     const double range_to = 1;
-    std::random_device rand_dev;
-    std::mt19937 generator(rand_dev());
+    std::mt19937 generator(12345u);
     std::uniform_real_distribution<double> distr(range_from, range_to);
 
     
@@ -1356,8 +1354,7 @@ void create_response_3D(TString &filename,  TString &sample, TString &label, TSt
     // random number generator for jackknife resampling (Lida)
     const double range_from = 0;
     const double range_to = 1;
-    std::random_device rand_dev;
-    std::mt19937 generator(rand_dev());
+    std::mt19937 generator(12345u);
     std::uniform_real_distribution<double> distr(range_from, range_to);
 
     //Check percentage of non-matched tracks
@@ -1904,8 +1901,7 @@ void create_response_3D_inclusive(TString &sample, TString &label, TString &fold
     // random number generator for jackknife resampling
     const double range_from = 0;
     const double range_to = 1;
-    std::random_device rand_dev;
-    std::mt19937 generator(rand_dev());
+    std::mt19937 generator(12345u);
     std::uniform_real_distribution<double> distr(range_from, range_to);
 
     
@@ -2727,8 +2723,7 @@ void create_response_templatefit(
     };
     t.SetBranchStatus(active_branches, 1);
 
-    std::random_device rand_dev;
-    std::mt19937 generator(rand_dev());
+    std::mt19937 generator(12345u);
     std::uniform_real_distribution<double> distr(0., 1.);
 
     double agg_fail = 0, nb_sv = 0, sv_fail = 0, merge_fail = 0;

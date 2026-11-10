@@ -979,6 +979,7 @@ void make_templates(const AnalysisConfig& cfg, Long64_t ev_first = 0, Long64_t e
       //std::cout << "\rProcessing: " << ient  <<std::endl;
 
       t.GetEntry(ient);
+      TrkEffSyst::beginEvent(t.run, t.lumi, t.evt);
       // -- test tree branches are read:
       //cout << "jtpt = " << t.jtpt[0] << endl;
 
@@ -1106,8 +1107,7 @@ void create_response_templatefit(
       auto active_branches = getActiveBranches(cfg);
       t.SetBranchStatus(active_branches, 1);
 
-    std::random_device rand_dev;
-    std::mt19937 generator(rand_dev());
+    std::mt19937 generator(12345u);
     std::uniform_real_distribution<double> distr(0., 1.);
 
     // -- needed parameters for reco SV func()
@@ -2067,6 +2067,7 @@ void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, boo
     // Keep batch logs compact; final counters are printed after the loop.
 
       t.GetEntry(ient);
+      TrkEffSyst::beginEvent(t.run, t.lumi, t.evt);
       if (hiEvtTree) {
         hiEvtTree->GetEntry(ient);
         t.vz = hiEvtVz;
@@ -2123,10 +2124,10 @@ void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, boo
             // Correlate the stochastic JER draw across JES variations.  The
             // correctionlib-compatible default hashes reco pT into the random
             // seed, so shifting JES would otherwise give the same jet a new
-            // Gaussian draw.  Event number and reco-jet index are stable under
+            // Gaussian draw.  Run/lumi/event and reco-jet index are stable under
             // these variations and distinguish jets within an event.
             if (!smear.matched) {
-              const std::uint64_t eventKey = static_cast<std::uint64_t>(t.evt);
+              const std::uint64_t eventKey = TrkEffSyst::eventKey();
               const std::uint64_t jetKey =
                   (static_cast<std::uint64_t>(ijet) + 1ULL)
                   * 0x9e3779b97f4a7c15ULL;

@@ -72,13 +72,14 @@ class TrackBTagMLP(nn.Module):
 # ---------------------------------------------------------------------------
 # 4. Training / evaluation utilities
 # ---------------------------------------------------------------------------
-def make_weighted_sampler(y_train):
+def make_weighted_sampler(y_train, generator=None):
     """Handle class imbalance: far more non-b tracks than b tracks."""
     class_counts = np.bincount(y_train.astype(int))
     class_weights = 1.0 / class_counts
     sample_weights = class_weights[y_train.astype(int)]
     return WeightedRandomSampler(
-        weights=sample_weights, num_samples=len(sample_weights), replacement=True
+        weights=sample_weights, num_samples=len(sample_weights), replacement=True,
+        generator=generator,
     )
 
 
@@ -151,7 +152,13 @@ def train_model(model, train_loader, val_loader, epochs=30, lr=1e-3, device="cpu
 # ---------------------------------------------------------------------------
 # 5. Example end-to-end pipeline
 # ---------------------------------------------------------------------------
-def main(mc_csv_path, data_csv_path=None, epochs=30, batch_size=512):
+def main(mc_csv_path, data_csv_path=None, epochs=30, batch_size=512, seed=42):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
@@ -163,7 +170,7 @@ def main(mc_csv_path, data_csv_path=None, epochs=30, batch_size=512):
     y = df_mc[LABEL].values.astype(np.float32)
 
     X_train, X_val, y_train, y_val = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
+        X, y, test_size=0.2, random_state=seed, stratify=y
     )
 
     # Scale features (fit ONLY on training MC, reuse for val/test/data)
@@ -174,7 +181,8 @@ def main(mc_csv_path, data_csv_path=None, epochs=30, batch_size=512):
     train_ds = TrackDataset(X_train_s, y_train)
     val_ds = TrackDataset(X_val_s, y_val)
 
-    sampler = make_weighted_sampler(y_train)
+    sampler_generator = torch.Generator().manual_seed(seed)
+    sampler = make_weighted_sampler(y_train, sampler_generator)
     train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=sampler)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
 

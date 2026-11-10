@@ -22,7 +22,7 @@ void split_mc_sample(TString inputFile,
                       Int_t dataType   = 1,    // 1 = b-jet enriched MC, 2 = dijet/QCD MC
                       Int_t RunN       = 2,
                       Double_t frac    = 0.5,  // fraction of entries sent to outFile0
-                      UInt_t seed      = 0) {  // 0 -> TRandom3 picks a non-reproducible seed
+                      UInt_t seed      = 20261110) {  // fixed default: reproducible split
 
   TFile *fin = TFile::Open(inputFile);
   if (!fin || fin->IsZombie()) {

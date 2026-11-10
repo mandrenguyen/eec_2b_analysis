@@ -1361,8 +1361,7 @@ void create_response_templatefit(
       auto active_branches = getActiveBranches(cfg);
       t.SetBranchStatus(active_branches, 1);
 
-    std::random_device rand_dev;
-    std::mt19937 generator(rand_dev());
+    std::mt19937 generator(12345u);
     std::uniform_real_distribution<double> distr(0., 1.);
 
     // -- needed parameters for reco SV func() 
@@ -1839,8 +1838,7 @@ void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, boo
 
   ///// Variables related to Response matrix //////
     // -- To split any sample into two parts randomly
-    std::random_device rand_dev;
-    std::mt19937 generator(rand_dev());
+    std::mt19937 generator(12345u);
     std::uniform_real_distribution<double> distr(0., 1.);
 
     //-- debugging variables 

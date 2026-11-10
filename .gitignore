@@ -6,6 +6,7 @@
 
 # ROOT output files
 *.root
+!workflow/sv_sfb_singleb_aggpt_jp_wp712_mu5_systematics.root
 
 # PDFs and plots
 *.pdf

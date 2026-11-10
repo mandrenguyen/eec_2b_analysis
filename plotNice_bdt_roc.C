@@ -58,13 +58,13 @@ void plotNice_bdt_roc(){
   btagLbl->SetNDC();
   btagLbl->SetTextFont(42);
   btagLbl->SetTextSize(0.04);
-  btagLbl->DrawLatex(0.2, 0.78, "b-tag WP > 0.868 (UParT)");
+  btagLbl->DrawLatex(0.2, 0.78, "b-tag WP > 0.712 (UParTV2)");
 
 
   TLatex *latex2 = new TLatex();
   latex2->SetNDC();
   latex2->SetTextSize(0.04);
-  latex2->DrawLatex(0.2, 0.85,"100 < p_{T,jet} < 120 GeV, |#eta_{jet}| < 2");
+  latex2->DrawLatex(0.2, 0.85,"p_{T,jet} > 100 GeV, |#eta_{jet}| < 2");
 
   
   drawCMSLabel(c, "Internal Simulation", "2024 pp (5.36 TeV)");

@@ -70,13 +70,14 @@
 #include "TFile.h"
 #include "TH1D.h"
 #include "TString.h"
+#include "TSystem.h"
 
 namespace SvSF {
 
 inline TString file()
 {
-    return "/home/llr/cms/zaidan/analysis_lise/eec_2b_analysis/workflow/"
-           "sv_sfb_singleb_aggpt_jp_wp712_mu5_systematics.root";
+    return TString(gSystem->DirName(__FILE__))
+         + "/sv_sfb_singleb_aggpt_jp_wp712_mu5_systematics.root";
 }
 
 enum class Mode { Off, Nominal, Up, Down,

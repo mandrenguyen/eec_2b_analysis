@@ -92,6 +92,65 @@ esac
 [ "${APPLY_JEC}" = true ] && echo "JEC ON: jtpt recomputed from rawpt (L1FastJet + L2Relative, + L2Residual on data)"
 
 # ---------------------------------------------------------------------------
+# JES uncertainty variation (analysis-local 1% placeholder payload)
+# ---------------------------------------------------------------------------
+# Apply the variation to reconstructed MC only. Generator jets are unchanged.
+# Up/down require JEC because the uncertainty is applied to the recalculated corrected pT.
+# The OUT_TAG guard prevents nominal and shifted products from sharing output paths.
+JES_VARIATION=${JES_VARIATION:-nominal}   # nominal | up | down
+case "${JES_VARIATION}" in
+  nominal)
+    case "${OUT_TAG}" in
+      *jesup*|*jesdown*) echo "OUT_TAG '${OUT_TAG}' names a JES shift but JES_VARIATION=nominal -- refusing"; exit 1 ;;
+    esac
+    ;;
+  up)
+    [ "${APPLY_JEC}" = true ] || { echo "JES_VARIATION=up requires APPLY_JEC=true"; exit 1; }
+    [[ "${OUT_TAG}" == *jesup* ]] || { echo "JES_VARIATION=up needs an OUT_TAG containing 'jesup'"; exit 1; }
+    ;;
+  down)
+    [ "${APPLY_JEC}" = true ] || { echo "JES_VARIATION=down requires APPLY_JEC=true"; exit 1; }
+    [[ "${OUT_TAG}" == *jesdown* ]] || { echo "JES_VARIATION=down needs an OUT_TAG containing 'jesdown'"; exit 1; }
+    ;;
+  *) echo "JES_VARIATION must be nominal | up | down, got '${JES_VARIATION}'"; exit 1 ;;
+esac
+echo "JES variation: ${JES_VARIATION}"
+
+# ---------------------------------------------------------------------------
+# JER hybrid smearing (MC only)
+# ---------------------------------------------------------------------------
+# off reproduces the historical unsmeared MC. nominal/up/down use SF 1.10/1.15/1.05.
+# JES and JER uncertainty shifts are mutually exclusive; the nominal correction of the
+# other nuisance remains applied (e.g. JES up together with nominal JER smearing).
+JER_VARIATION=${JER_VARIATION:-off}   # off | nominal | up | down
+case "${JER_VARIATION}" in
+  off)
+    case "${OUT_TAG}" in
+      *jernominal*|*jerup*|*jerdown*) echo "OUT_TAG '${OUT_TAG}' names JER smearing but JER_VARIATION=off -- refusing"; exit 1 ;;
+    esac
+    ;;
+  nominal)
+    [ "${APPLY_JEC}" = true ] || { echo "JER_VARIATION=nominal requires APPLY_JEC=true"; exit 1; }
+    [[ "${OUT_TAG}" == *jernominal* ]] || { echo "JER_VARIATION=nominal needs an OUT_TAG containing 'jernominal'"; exit 1; }
+    ;;
+  up)
+    [ "${APPLY_JEC}" = true ] || { echo "JER_VARIATION=up requires APPLY_JEC=true"; exit 1; }
+    [ "${JES_VARIATION}" = nominal ] || { echo "JER up cannot be combined with JES ${JES_VARIATION}"; exit 1; }
+    [[ "${OUT_TAG}" == *jerup* ]] || { echo "JER_VARIATION=up needs an OUT_TAG containing 'jerup'"; exit 1; }
+    ;;
+  down)
+    [ "${APPLY_JEC}" = true ] || { echo "JER_VARIATION=down requires APPLY_JEC=true"; exit 1; }
+    [ "${JES_VARIATION}" = nominal ] || { echo "JER down cannot be combined with JES ${JES_VARIATION}"; exit 1; }
+    [[ "${OUT_TAG}" == *jerdown* ]] || { echo "JER_VARIATION=down needs an OUT_TAG containing 'jerdown'"; exit 1; }
+    ;;
+  *) echo "JER_VARIATION must be off | nominal | up | down, got '${JER_VARIATION}'"; exit 1 ;;
+esac
+if [ "${JES_VARIATION}" != nominal ] && { [ "${JER_VARIATION}" = up ] || [ "${JER_VARIATION}" = down ]; }; then
+  echo "JES and JER uncertainty shifts must not be varied simultaneously"; exit 1
+fi
+echo "JER variation: ${JER_VARIATION}"
+
+# ---------------------------------------------------------------------------
 # 2024 jet veto map (Matt's, Winter24Prompt24_2024BCDEFGHI.root; JetVeto namespace in
 # create_files_for_template_fit.cpp)
 # ---------------------------------------------------------------------------
@@ -262,7 +321,7 @@ LOG_DIR=${OUT_BASE}/logs
 
 ACLIC_BUILD_DIR=$mydata/bJetAggRun3/PPRef2024/build
 
-mkdir -p "${LOG_DIR}"
+mkdir -p "${LOG_DIR}" "${ACLIC_BUILD_DIR}"
 
 cd "${WORK}" || exit 1
 
@@ -297,6 +356,7 @@ rm -f "${ACLIC_BUILD_DIR}"/create_files_for_template_fit_cpp.d \
 #     this compile produced it), and
 #   - the compile output must not contain an ACLiC error.
 root -l -b > "${COMPILE_LOG}" 2>&1 <<EOF
+gSystem->SetBuildDir("${ACLIC_BUILD_DIR}", true);
 .L create_files_for_template_fit.cpp++
 .q
 EOF
@@ -313,7 +373,9 @@ fi   # SKIP_COMPILE
 # previous one in place and the jobs would run the wrong code.
 for src in create_files_for_template_fit.cpp observables.h binning_histos_small.h \
            result_paths.h tTree.h tracking_efficiency_syst.h central_selections.h sv_sf.h \
-           track_bdt_sf.h agg_nn.h; do
+           track_bdt_sf.h agg_nn.h \
+           ../Run3HeavyIonJetCalibrations/include/JetCorrector.h \
+           ../Run3HeavyIonJetCalibrations/include/JetSmearer.h; do
   if [ -e "${WORK}/${src}" ] && [ "${WORK}/${src}" -nt "${SO}" ]; then
     echo "compile FAILED -- ${src} is newer than ${SO}; the build did not take. Not launching."
     tail -n 40 "${COMPILE_LOG}"
@@ -349,10 +411,10 @@ for input in "${inputs[@]}"; do
 
   (
   
-  # Remeber: create_files_for_template_fit(..., bool apply_jec = false, const char* sv_sf = "off", bool apply_jetveto = false, const char* track_bdt_sf = "nominal")
+  # Remeber: create_files_for_template_fit(..., bool apply_jec = false, const char* sv_sf = "off", bool apply_jetveto = false, const char* track_bdt_sf = "nominal", const char* jes_variation = "nominal", const char* jer_variation = "off")
   # MC vs data is the isMC argument; bjet vs qcd is SAMPLE_TAG.
 
-  nice -n 10 root -l -b -q -e "gSystem->Load(\"${ACLIC_BUILD_DIR}/create_files_for_template_fit_cpp.so\"); create_files_for_template_fit(3,80,2,1,true,true,${BTAG_WP},true,true,true,0,-1,\"${input}\",\"${stagedir}\",\"${SAMPLE_TAG}\",${TRACK_EFF_UNC},${TRK_SEED},${EEC_WEIGHT_OFF},${APPLY_JEC},\"${SV_SF}\",${APPLY_JETVETO},\"${TRACK_BDT_SF}\")"
+  nice -n 10 root -l -b -q -e "gSystem->Load(\"${ACLIC_BUILD_DIR}/create_files_for_template_fit_cpp.so\"); create_files_for_template_fit(3,80,2,1,true,true,${BTAG_WP},true,true,true,0,-1,\"${input}\",\"${stagedir}\",\"${SAMPLE_TAG}\",${TRACK_EFF_UNC},${TRK_SEED},${EEC_WEIGHT_OFF},${APPLY_JEC},\"${SV_SF}\",${APPLY_JETVETO},\"${TRACK_BDT_SF}\",\"${JES_VARIATION}\",\"${JER_VARIATION}\")"
 
     for f in "${stagedir}"/*.root; do
       [ -e "${f}" ] || continue

@@ -17,7 +17,7 @@
 
 bool skipMC_roc(double pt, double pthat)
 {
-  if (pthat < 0.35 * pt)
+  if (pthat < 0.4 * pt)
     return true;
   return false;
 }
@@ -657,7 +657,7 @@ void calc_btag_roc(TString filename, TString output_folder, TString output_hist,
 }
 
 
-void btag_roc(Int_t dataType = 2, Float_t pT_low = 100, Float_t pT_high = 200, double target_mistag = 1e-3,
+void btag_roc(Int_t dataType = 2, Float_t pT_low = 100, Float_t pT_high = 9999, double target_mistag = 1e-3,
               bool overlay_run3_qcd = true, int run3_nfiles = 10) {
 
   TString output_folder = TString(gSystem->DirName(__FILE__)) + "/";

@@ -77,6 +77,7 @@ inline void print()
 
 } 
 #include "../Run3HeavyIonJetCalibrations/include/JetCorrector.h"
+#include "../Run3HeavyIonJetCalibrations/include/JetSmearer.h"
 #include "TLeaf.h"     // the event rho is read through its leaf
 #include <stdexcept>
 namespace Jec {
@@ -91,7 +92,7 @@ inline void enable(bool on) { enabled() = on; }
 
 inline TString dir()
 {
-    return "/home/llr/cms/zaidan/analysis_lise/eec_2b_analysis/Run3HeavyIonJetCalibrations/txt/2024ppRef/";
+    return TString(gSystem->DirName(__FILE__)) + "/../Run3HeavyIonJetCalibrations/txt/2024ppRef/";
 }
 
 // The correction levels for this sample, in the order they are applied.
@@ -115,6 +116,117 @@ inline void print(bool isMC)
 }
 
 } 
+namespace JesSyst {
+
+enum Mode { Nominal = 0, Up = 1, Down = -1 };
+
+inline Mode &mode() { static Mode value = Nominal; return value; }
+
+inline TString uncertaintyFile()
+{
+    return TString(gSystem->DirName(__FILE__))
+         + "/calibrations/Prompt24HIpp_Placeholder1Percent_JESUncertainty_AK4PF.txt";
+}
+
+inline void configure(const char *name, bool applyJec, bool isMC)
+{
+    const TString value = name ? TString(name) : TString("nominal");
+    if (value == "nominal") mode() = Nominal;
+    else if (value == "up") mode() = Up;
+    else if (value == "down") mode() = Down;
+    else throw std::runtime_error("JES variation must be nominal, up, or down; got: "
+                                  + std::string(value.Data()));
+    if (mode() != Nominal && !isMC)
+        throw std::runtime_error("JES up/down is allowed only for MC; data must use nominal");
+    if (mode() != Nominal && !applyJec)
+        throw std::runtime_error("JES up/down requires apply_jec=true");
+}
+
+inline bool varied() { return mode() != Nominal; }
+inline TString tag() { return mode() == Up ? "_jesUp" : mode() == Down ? "_jesDown" : ""; }
+
+inline double apply(double nominalPt, const std::pair<double, double> &uncertainty)
+{
+    if (mode() == Up) return nominalPt * (1.0 + uncertainty.second);
+    if (mode() == Down) return nominalPt * (1.0 - uncertainty.first);
+    return nominalPt;
+}
+
+inline void print()
+{
+    if (mode() == Nominal) {
+        std::cout << "JES variation: nominal" << std::endl;
+        return;
+    }
+    std::cout << "JES variation: " << (mode() == Up ? "UP" : "DOWN")
+              << " using " << uncertaintyFile() << std::endl;
+}
+
+}
+namespace JerSyst {
+
+enum Mode { Off = 0, Nominal, Up, Down };
+
+inline Mode &mode() { static Mode value = Off; return value; }
+
+inline TString resolutionFile()
+{
+    return TString(gSystem->DirName(__FILE__))
+         + "/calibrations/Prompt24HIpp_Derived_MC_PtResolution_AK4PF.txt";
+}
+
+inline TString scaleFactorFile()
+{
+    return TString(gSystem->DirName(__FILE__))
+         + "/calibrations/Prompt24HIpp_Estimated_MC_SF_AK4PF.txt";
+}
+
+inline void configure(const char *name, bool applyJec, bool isMC)
+{
+    const TString value = name ? TString(name) : TString("off");
+    if (value == "off") mode() = Off;
+    else if (value == "nominal") mode() = Nominal;
+    else if (value == "up") mode() = Up;
+    else if (value == "down") mode() = Down;
+    else throw std::runtime_error("JER variation must be off, nominal, up, or down; got: "
+                                  + std::string(value.Data()));
+    if (mode() != Off && !isMC)
+        throw std::runtime_error("JER smearing is allowed only for MC; data must use off");
+    if (mode() != Off && !applyJec)
+        throw std::runtime_error("JER smearing requires apply_jec=true");
+    if ((mode() == Up || mode() == Down) && JesSyst::varied())
+        throw std::runtime_error("JES and JER uncertainty shifts must not be varied simultaneously");
+}
+
+inline bool enabled() { return mode() != Off; }
+inline TString tag()
+{
+    if (mode() == Nominal) return "_jerNominal";
+    if (mode() == Up) return "_jerUp";
+    if (mode() == Down) return "_jerDown";
+    return "";
+}
+
+inline Variation variation()
+{
+    if (mode() == Up) return Variation::UP;
+    if (mode() == Down) return Variation::DOWN;
+    return Variation::NOMINAL;
+}
+
+inline void print()
+{
+    if (mode() == Off) {
+        std::cout << "JER smearing: OFF" << std::endl;
+        return;
+    }
+    const char *label = mode() == Up ? "UP" : mode() == Down ? "DOWN" : "nominal";
+    std::cout << "JER smearing: " << label << " (hybrid method)" << std::endl
+              << "   resolution: " << resolutionFile() << std::endl
+              << "   scale factor: " << scaleFactorFile() << std::endl;
+}
+
+}
 namespace JetVeto {
 
 inline bool &enabled() { static bool on = false; return on; }
@@ -122,7 +234,7 @@ inline TH2D *&map() { static TH2D *m = nullptr; return m; }
 
 inline TString file()
 {
-    return "/home/llr/cms/zaidan/analysis_lise/eec_2b_analysis/Winter24Prompt24_2024BCDEFGHI.root";
+    return TString(gSystem->DirName(__FILE__)) + "/../Winter24Prompt24_2024BCDEFGHI.root";
 }
 
 inline void enable(bool on)
@@ -1742,7 +1854,8 @@ void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, boo
   // -- Output files name
   TString job_suffix = (job_idx >= 0) ? Form("_job%d", job_idx) : "";
  
-  TString syst_suffix = TrkEffSyst::tag() + SvSF::tag() + TrackBdtSF::tag() + EecWeight::tag();
+  TString syst_suffix = TrkEffSyst::tag() + SvSF::tag() + TrackBdtSF::tag()
+                       + JesSyst::tag() + JerSyst::tag() + EecWeight::tag();
   TString fout_name = cfg.dataset.output_folder + cfg.dataset.output_hist + job_suffix + "MCGEN" + syst_suffix + ".root"; // for reposnse matrix: has Prefix: Response
   TString ResponseMatrix_fout_name =  cfg.dataset.output_folder + "RMatrix_" + cfg.dataset.output_hist + job_suffix + syst_suffix + ".root";
   TString AggBHadronNtuple_fout_name = cfg.dataset.output_folder + "AggBHadronNtuple_" + cfg.dataset.output_hist + job_suffix + syst_suffix + ".root";
@@ -1858,6 +1971,27 @@ void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, boo
         throw std::runtime_error("Missing JEC file: " + f);
     jec.Initialize(jec_files);
   }
+  JetUncertainty jesUncertainty;
+  if (JesSyst::varied()) {
+    const TString uncertaintyFile = JesSyst::uncertaintyFile();
+    if (gSystem->AccessPathName(uncertaintyFile))
+      throw std::runtime_error("Missing JES uncertainty file: "
+                               + std::string(uncertaintyFile.Data()));
+    jesUncertainty.Initialize(uncertaintyFile.Data());
+  }
+  std::unique_ptr<JetSmearer> jerSmearer;
+  if (JerSyst::enabled()) {
+    const TString resolutionFile = JerSyst::resolutionFile();
+    const TString scaleFactorFile = JerSyst::scaleFactorFile();
+    if (gSystem->AccessPathName(resolutionFile))
+      throw std::runtime_error("Missing JER resolution file: "
+                               + std::string(resolutionFile.Data()));
+    if (gSystem->AccessPathName(scaleFactorFile))
+      throw std::runtime_error("Missing JER scale-factor file: "
+                               + std::string(scaleFactorFile.Data()));
+    jerSmearer.reset(new JetSmearer(resolutionFile.Data(), scaleFactorFile.Data(),
+                                    JetSmearing::Method::Hybrid));
+  }
   TLeaf* hiEvtRhoLeaf = nullptr;
 
   TFile* eventInfoFile = nullptr;
@@ -1955,7 +2089,40 @@ void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, boo
           jec.SetJetArea(t.jtarea[ijet]);
           jec.SetRho(eventRho);
           const double correctedPt = jec.GetCorrectedPT();
-          t.jtpt[ijet] = std::isfinite(correctedPt) && correctedPt > 0 ? correctedPt : -999.0f;
+          if (!std::isfinite(correctedPt) || correctedPt <= 0) {
+            t.jtpt[ijet] = -999.0f;
+            continue;
+          }
+          double variedPt = correctedPt;
+          if (JesSyst::varied()) {
+            jesUncertainty.SetJetPT(correctedPt);
+            jesUncertainty.SetJetEta(t.jteta[ijet]);
+            jesUncertainty.SetJetPhi(t.jtphi[ijet]);
+            jesUncertainty.SetJetArea(t.jtarea[ijet]);
+            jesUncertainty.SetRho(eventRho);
+            const std::pair<double, double> uncertainty = jesUncertainty.GetUncertainty();
+            if (!std::isfinite(uncertainty.first) || !std::isfinite(uncertainty.second)
+                || uncertainty.first < 0 || uncertainty.second < 0)
+              throw std::runtime_error("Invalid JES uncertainty for a reconstructed jet");
+            variedPt = JesSyst::apply(correctedPt, uncertainty);
+          }
+          t.jtpt[ijet] = std::isfinite(variedPt) && variedPt > 0 ? variedPt : -999.0f;
+        }
+        if (JerSyst::enabled()) {
+          const std::vector<int> genMatch = jerSmearer->Match(
+              t.nref, t.jtpt, t.jteta, t.jtphi,
+              t.ngen, t.genpt, t.geneta, t.genphi,
+              0.4, eventRho, JetSmearing::Mode::JME);
+          for (Int_t ijet = 0; ijet < t.nref; ++ijet) {
+            if (!(t.jtpt[ijet] > 0) || !std::isfinite(t.jtpt[ijet])) continue;
+            const int igen = genMatch[ijet];
+            const double genPt = igen >= 0 ? t.genpt[igen] : -1.0;
+            const double smearedPt = jerSmearer->SmearedPt(
+                t.jtpt[ijet], t.jteta[ijet], eventRho, genPt,
+                static_cast<std::int64_t>(t.evt), JerSyst::variation());
+            t.jtpt[ijet] = std::isfinite(smearedPt) && smearedPt > 0
+                               ? smearedPt : -999.0f;
+          }
         }
       }
       if (hltTree && cfg.dataset.RunN == 3) {
@@ -2613,7 +2780,9 @@ void create_files_for_template_fit(Int_t RunN = 3, Float_t pT_low = 80, Float_t 
                                    bool apply_jec = false,
                                    const char* sv_sf = "off",
                                    bool apply_jetveto = false,
-                                   const char* track_bdt_sf = "nominal"){
+                                   const char* track_bdt_sf = "nominal",
+                                   const char* jes_variation = "nominal",
+                                   const char* jer_variation = "off"){
  // load at prompt: gSystem->Load("libGenVector");
  // -- test use of central configuration
   AnalysisConfig cfg = buildConfig(RunN, pT_low, etaCut, n, btag, isMC, btagWP, sampleTag);
@@ -2654,6 +2823,14 @@ void create_files_for_template_fit(Int_t RunN = 3, Float_t pT_low = 80, Float_t 
 	  // ---- Jet energy corrections on/off (see the Jec namespace at the top) ----
 	  Jec::enable(apply_jec);
 	  Jec::print(cfg.dataset.isMC);
+
+	  // ---- JES uncertainty: nominal, up, or down on reconstructed MC only ----
+	  JesSyst::configure(jes_variation, apply_jec, cfg.dataset.isMC);
+	  JesSyst::print();
+
+	  // ---- JER smearing: hybrid method on reconstructed MC only ----
+	  JerSyst::configure(jer_variation, apply_jec, cfg.dataset.isMC);
+	  JerSyst::print();
 
 	  // ---- SV b scale factor (see sv_sf.h) ----
 	  SvSF::enable(sv_sf, cfg.dataset.isMC);

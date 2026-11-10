@@ -8,6 +8,10 @@ esac
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 WORK=${SCRIPT_DIR}
 ROOUNFOLD_DIR=${WORK}/RooUnfold_build_test
+if [ ! -f "${ROOUNFOLD_DIR}/build/libRooUnfold.so" ] && \
+   [ -f "${WORK}/../RooUnfold_build_test/build/libRooUnfold.so" ]; then
+  ROOUNFOLD_DIR=${WORK}/../RooUnfold_build_test
+fi
 ROOUNFOLD_INC=${ROOUNFOLD_DIR}/src/src
 ROOUNFOLD_BUILD=${ROOUNFOLD_DIR}/build
 

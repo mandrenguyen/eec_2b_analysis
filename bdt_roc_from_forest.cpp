@@ -7,6 +7,7 @@
 //       trkMatchSta == 1   -> background (fake / non-b track)
 //       trkMatchSta >= 100  -> signal     (track from a b hadron)
 //   * jets split by jtNbHad into 0b / 1b / >=2b categories
+//   * additionally fill a >=2b + >=2SV category, useful after the UParT selection
 //   * fill h_{0b,1b,2b}_score_{sg,bkg} with trkBdtScore, then build ROCs
 //     with the same MakeROC threshold scan used in plot_dist.cpp.
 //
@@ -26,8 +27,10 @@
 #include <vector>
 #include "tTree.h"
 
+static constexpr double kTrackBdtWorkingPoint = 0.365;
+
 static bool skipMC_bdt(double pt, double pthat) {
-  return (pthat < 0.35 * pt);
+  return (pthat < 0.4 * pt);
 }
 
 // Identical logic to MakeROC in updates_2002/plot_dist.cpp:
@@ -52,12 +55,49 @@ TGraph* MakeROC(TH1D* h_sg, TH1D* h_bkg, const char* name) {
   return roc;
 }
 
+double passFraction(TH1D* h, double cut) {
+  if (!h) return 0.0;
+  const int nbins = h->GetNbinsX();
+  const double total = h->Integral(1, nbins);
+  if (total <= 0.0) return 0.0;
+  const int firstPassBin = h->GetXaxis()->FindBin(cut);
+  return h->Integral(firstPassBin, nbins) / total;
+}
+
+TH1D* MakeWPPointHist(const char* name, const char* title,
+                      TH1D* h_sg, TH1D* h_bkg,
+                      double cut = kTrackBdtWorkingPoint) {
+  auto* h = new TH1D(name, title, 2, 0.5, 2.5);
+  h->GetXaxis()->SetBinLabel(1, "signal efficiency");
+  h->GetXaxis()->SetBinLabel(2, "mistag efficiency");
+  h->SetBinContent(1, passFraction(h_sg, cut));
+  h->SetBinContent(2, passFraction(h_bkg, cut));
+  return h;
+}
+
+void PrintWPPoint(const char* label, TH1D* h_sg, TH1D* h_bkg,
+                  double cut = kTrackBdtWorkingPoint) {
+  std::cout << Form("BDT > %.3f %-22s: signal efficiency = %.6f, mistag efficiency = %.6f\n",
+                    cut, label, passFraction(h_sg, cut), passFraction(h_bkg, cut));
+}
+
+void WriteWPPoint(const char* key, const char* label, TH1D* h_sg, TH1D* h_bkg,
+                  double cut = kTrackBdtWorkingPoint) {
+  PrintWPPoint(label, h_sg, h_bkg, cut);
+  auto* h = MakeWPPointHist(Form("h_wp365_%s", key),
+                            Form("BDT > %.3f ROC point, %s;coordinate;value", cut, label),
+                            h_sg, h_bkg, cut);
+  h->Write();
+  delete h;
+}
+
 // ---- Stage 1: fill the score histograms from a raw forest ----
 void fill_bdt_score_histos(TString filename, Int_t RunN, bool isMC,
                            Float_t pT_low, Float_t pT_high,
                            TH1D* h0b_sg, TH1D* h0b_bkg,
                            TH1D* h1b_sg, TH1D* h1b_bkg,
                            TH1D* h2b_sg, TH1D* h2b_bkg,
+                           TH1D* h2b2sv_sg = nullptr, TH1D* h2b2sv_bkg = nullptr,
                            bool btag = true, Float_t btagWP = 0) {
 
   // -- Check if Run3 fles have tree sructure or TChain ..-----
@@ -66,7 +106,7 @@ void fill_bdt_score_histos(TString filename, Int_t RunN, bool isMC,
   t.SetBranchStatus("*", 0);
 
   std::vector<TString> active = {
-    "jtpt", "nref", "jtNbHad",
+    "jtpt", "jteta", "nref", "jtNbHad", "jtNsvtx",
     "ntrk", "trkJetId", "trkPt", "trkBdtScore", "trkMatchSta",
     "weight", "pthat", "refpt", "refeta"
   };
@@ -112,6 +152,7 @@ void fill_bdt_score_histos(TString filename, Int_t RunN, bool isMC,
       }
 
       int nbHad = t.jtNbHad[ijet];
+      bool is2b2sv = (nbHad >= 2 && t.jtNsvtx[ijet] >= 2);
       // -- Comment: h0b_sg should not be filled! Only h0b_bkg is truth 0b (nbHad = 0 and trksta = 1)
       // while h0b_sg is filled when (nbHad= 0 and trksta >=100).
       // - - I suggest: if you want to add 0b DBT rOC, it will be opposite names (h0b_bkg --> sg, and vice versa).
@@ -121,8 +162,13 @@ void fill_bdt_score_histos(TString filename, Int_t RunN, bool isMC,
       for (Int_t itrk = 0; itrk < t.ntrk; itrk++) {
         if (t.trkJetId[itrk] != ijet) continue;
         if (t.trkPt[itrk] < 1) continue;
-        if (t.trkMatchSta[itrk] == 1)        h_bkg->Fill(t.trkBdtScore[itrk], w);
-        else if (t.trkMatchSta[itrk] >= 100) h_sg->Fill(t.trkBdtScore[itrk], w);
+        if (t.trkMatchSta[itrk] == 1) {
+          h_bkg->Fill(t.trkBdtScore[itrk], w);
+          if (is2b2sv && h2b2sv_bkg) h2b2sv_bkg->Fill(t.trkBdtScore[itrk], w);
+        } else if (t.trkMatchSta[itrk] >= 100) {
+          h_sg->Fill(t.trkBdtScore[itrk], w);
+          if (is2b2sv && h2b2sv_sg) h2b2sv_sg->Fill(t.trkBdtScore[itrk], w);
+        }
       }
     }
   }
@@ -149,11 +195,11 @@ static std::vector<TString> expand_files(TString pattern) {
 // filename : raw HiForest MC file/glob (needs trkMatchSta -> MC only).
 //            A "[0-9]" in the path is expanded to dirs 0..9 and all are chained.
 // RunN     : 2 or 3 (controls branches/trigger via tTree::Init)
-void bdt_roc_from_forest(TString filename = "/data_CMS/cms/mnguyen/bJetAggRun3/PPRef2024/QCD/HiForestMiniAOD_v2_TChains.root",
-                         Float_t pT_low = 100, Float_t pT_high = 200,
+void bdt_roc_from_forest(TString filename = "/data_CMS/cms/mnguyen/bJetAggRun3/PPRef2024/bJet/HiForestMiniAOD_v2_TChains.root",
+                         Float_t pT_low = 100, Float_t pT_high = 9999,
                          Int_t RunN = 3, bool isMC = true,
                          TString out_tag = "bdt_roc_from_forest",
-                         bool btag = true, Float_t btagWP = 0.868) {
+                         bool btag = true, Float_t btagWP = 0.712) {
 
   if (filename == "") {
     std::cerr << "Please pass a forest file path, e.g.\n"
@@ -163,7 +209,7 @@ void bdt_roc_from_forest(TString filename = "/data_CMS/cms/mnguyen/bJetAggRun3/P
   }
 
   // Physics: btag WP — custom if > 0, otherwise run-dependent default
-  Float_t effectiveBtagWP = (btagWP > 0) ? btagWP : ((RunN == 2) ? 0.898f : 0.872f);
+  Float_t effectiveBtagWP = (btagWP > 0) ? btagWP : ((RunN == 2) ? 0.898f : 0.712f);
 
   const int    nb = 1000;
   const double lo = -1.0, hi = 1.0;
@@ -173,7 +219,9 @@ void bdt_roc_from_forest(TString filename = "/data_CMS/cms/mnguyen/bJetAggRun3/P
   TH1D* h1b_bkg = new TH1D("h_1b_score_bkg", "1b background;BDT score;tracks", nb, lo, hi);
   TH1D* h2b_sg  = new TH1D("h_2b_score_sg",  "2b signal;BDT score;tracks",     nb, lo, hi);
   TH1D* h2b_bkg = new TH1D("h_2b_score_bkg", "2b background;BDT score;tracks", nb, lo, hi);
-  for (TH1D* h : {h0b_sg,h0b_bkg,h1b_sg,h1b_bkg,h2b_sg,h2b_bkg}) h->Sumw2();
+  TH1D* h2b2sv_sg  = new TH1D("h_2b2sv_score_sg",  "2b + #geq2SV signal;BDT score;tracks",     nb, lo, hi);
+  TH1D* h2b2sv_bkg = new TH1D("h_2b2sv_score_bkg", "2b + #geq2SV background;BDT score;tracks", nb, lo, hi);
+  for (TH1D* h : {h0b_sg,h0b_bkg,h1b_sg,h1b_bkg,h2b_sg,h2b_bkg,h2b2sv_sg,h2b2sv_bkg}) h->Sumw2();
 
   std::vector<TString> files = expand_files(filename);
   int n_used = 0;
@@ -190,6 +238,7 @@ void bdt_roc_from_forest(TString filename = "/data_CMS/cms/mnguyen/bJetAggRun3/P
     std::cout << "Processing file: " << f << std::endl;
     fill_bdt_score_histos(f, RunN, isMC, pT_low, pT_high,
                           h0b_sg, h0b_bkg, h1b_sg, h1b_bkg, h2b_sg, h2b_bkg,
+                          h2b2sv_sg, h2b2sv_bkg,
                           btag, effectiveBtagWP);
     n_used++;
   }
@@ -205,6 +254,7 @@ void bdt_roc_from_forest(TString filename = "/data_CMS/cms/mnguyen/bJetAggRun3/P
 
   TGraph* roc1b  = MakeROC(h1b_sg,  h1b_bkg,  "roc1b");
   TGraph* roc2b  = MakeROC(h2b_sg,  h2b_bkg,  "roc2b");
+  TGraph* roc2b2sv = MakeROC(h2b2sv_sg, h2b2sv_bkg, "roc2b2sv");
   TGraph* roc_all = MakeROC(hsg_all, hbkg_all, "roc_all");
 
   // ---- draw (log-y, same style as plot_dist.cpp's BDT ROC) ----
@@ -213,12 +263,14 @@ void bdt_roc_from_forest(TString filename = "/data_CMS/cms/mnguyen/bJetAggRun3/P
 
   roc1b->SetLineColor(kBlue);
   roc2b->SetLineColor(kRed);
+  roc2b2sv->SetLineColor(kOrange + 7);
   roc_all->SetLineColor(kGreen + 2);
 
   roc2b->GetXaxis()->SetRangeUser(0.75, 1.0);
   roc2b->GetYaxis()->SetRangeUser(1e-5, 1.0);
   roc2b->Draw("AL");
   roc1b->Draw("L SAME");
+  roc2b2sv->Draw("L SAME");
   roc_all->Draw("L SAME");
 
   TLegend* leg = new TLegend(0.2, 0.2, 0.45, 0.4);
@@ -226,6 +278,7 @@ void bdt_roc_from_forest(TString filename = "/data_CMS/cms/mnguyen/bJetAggRun3/P
   leg->AddEntry(roc_all, "all B (1b+#geq2b)", "l");
   leg->AddEntry(roc1b,   "1B", "l");
   leg->AddEntry(roc2b,   "#geq2B", "l");
+  leg->AddEntry(roc2b2sv, "#geq2B + #geq2SV", "l");
   leg->Draw();
 
   if (btag) {
@@ -244,7 +297,12 @@ void bdt_roc_from_forest(TString filename = "/data_CMS/cms/mnguyen/bJetAggRun3/P
   h0b_sg->Write(); h0b_bkg->Write();
   h1b_sg->Write(); h1b_bkg->Write();
   h2b_sg->Write(); h2b_bkg->Write();
-  roc1b->Write(); roc2b->Write(); roc_all->Write();
+  h2b2sv_sg->Write(); h2b2sv_bkg->Write();
+  roc1b->Write(); roc2b->Write(); roc2b2sv->Write(); roc_all->Write();
+  WriteWPPoint("all", "all B", hsg_all, hbkg_all);
+  WriteWPPoint("1b", "1B", h1b_sg, h1b_bkg);
+  WriteWPPoint("2b", "#geq2B", h2b_sg, h2b_bkg);
+  WriteWPPoint("2b2sv", "#geq2B + #geq2SV", h2b2sv_sg, h2b2sv_bkg);
   cROC->Write();
   fout.Close();
 
@@ -259,9 +317,9 @@ void bdt_roc_from_forest(TString filename = "/data_CMS/cms/mnguyen/bJetAggRun3/P
 //   root -l 'bdt_roc_from_forest.cpp+'   then   bdt_roc_sample(2, 1)
 // or directly:
 //   root -l 'bdt_roc_from_forest.cpp(... )'   for an arbitrary path.
-void bdt_roc_sample(Int_t RunN = 2, Int_t dataType = 1,
-                    Float_t pT_low = 80, Float_t pT_high = 200,
-                    bool btag = true, Float_t btagWP = -1) {
+void bdt_roc_sample(Int_t RunN = 3, Int_t dataType = 1,
+                    Float_t pT_low = 100, Float_t pT_high = 9999,
+                    bool btag = true, Float_t btagWP = 0.712) {
   TString filename, tag;
 
   if (RunN == 2 && dataType == 1) {
@@ -271,7 +329,7 @@ void bdt_roc_sample(Int_t RunN = 2, Int_t dataType = 1,
     filename = "/data_CMS/cms/kalipoliti/qcdMC/dijet/aggrTMVA_fixedMassBug/merged_HiForestMiniAOD.root";
     tag = "bdt_roc_run2_qcd";
   } else if (RunN == 3 && dataType == 2) {
-    filename = "/data_CMS/cms/mnguyen/bJetAggRun3/PPRef2024/QCD/HiForestMiniAOD_v2_TChains.root";
+    filename = "/data_CMS/cms/mnguyen/bJetAggRun3/PPRef2024/bJet/HiForestMiniAOD_v2_TChains.root";
     tag = "bdt_roc_run3_qcd";
   } else if (RunN == 3 && dataType == 1) {
     std::cerr << "Run 3 b-jet sample path is not set yet — fill it in here "
@@ -290,7 +348,7 @@ void bdt_roc_sample(Int_t RunN = 2, Int_t dataType = 1,
 
 // ---- Build the 1b / >=2b / all ROCs for one sample (histos suffixed to
 //      avoid name clashes when two samples are held in memory at once) ----
-struct RocSet { TGraph* r1b; TGraph* r2b; TGraph* rall; };
+struct RocSet { TGraph* r1b; TGraph* r2b; TGraph* r2b2sv; TGraph* rall; };
 
 RocSet build_rocs(TString filename, Int_t RunN, bool isMC,
                   Float_t pT_low, Float_t pT_high, TString sfx,
@@ -302,7 +360,8 @@ RocSet build_rocs(TString filename, Int_t RunN, bool isMC,
   TH1D* h0b_sg = H("h_0b_score_sg"); TH1D* h0b_bkg = H("h_0b_score_bkg");
   TH1D* h1b_sg = H("h_1b_score_sg"); TH1D* h1b_bkg = H("h_1b_score_bkg");
   TH1D* h2b_sg = H("h_2b_score_sg"); TH1D* h2b_bkg = H("h_2b_score_bkg");
-  for (TH1D* h : {h0b_sg,h0b_bkg,h1b_sg,h1b_bkg,h2b_sg,h2b_bkg}) h->Sumw2();
+  TH1D* h2b2sv_sg = H("h_2b2sv_score_sg"); TH1D* h2b2sv_bkg = H("h_2b2sv_score_bkg");
+  for (TH1D* h : {h0b_sg,h0b_bkg,h1b_sg,h1b_bkg,h2b_sg,h2b_bkg,h2b2sv_sg,h2b2sv_bkg}) h->Sumw2();
 
   int n_used = 0;
   for (const TString& f : expand_files(filename)) {
@@ -316,6 +375,7 @@ RocSet build_rocs(TString filename, Int_t RunN, bool isMC,
     std::cout << "[" << sfx << "] Processing file: " << f << std::endl;
     fill_bdt_score_histos(f, RunN, isMC, pT_low, pT_high,
                           h0b_sg, h0b_bkg, h1b_sg, h1b_bkg, h2b_sg, h2b_bkg,
+                          h2b2sv_sg, h2b2sv_bkg,
                           btag, btagWP);
     n_used++;
   }
@@ -327,7 +387,12 @@ RocSet build_rocs(TString filename, Int_t RunN, bool isMC,
   RocSet rs;
   rs.r1b  = MakeROC(h1b_sg,  h1b_bkg,  (TString("roc1b_")+sfx).Data());
   rs.r2b  = MakeROC(h2b_sg,  h2b_bkg,  (TString("roc2b_")+sfx).Data());
+  rs.r2b2sv = MakeROC(h2b2sv_sg, h2b2sv_bkg, (TString("roc2b2sv_")+sfx).Data());
   rs.rall = MakeROC(hsg_all, hbkg_all, (TString("rocall_")+sfx).Data());
+  PrintWPPoint((TString(sfx) + " all B").Data(), hsg_all, hbkg_all);
+  PrintWPPoint((TString(sfx) + " 1B").Data(), h1b_sg, h1b_bkg);
+  PrintWPPoint((TString(sfx) + " #geq2B").Data(), h2b_sg, h2b_bkg);
+  PrintWPPoint((TString(sfx) + " #geq2B + #geq2SV").Data(), h2b2sv_sg, h2b2sv_bkg);
   return rs;
 }
 
@@ -338,10 +403,10 @@ RocSet build_rocs(TString filename, Int_t RunN, bool isMC,
 //   ".../QCD/[0-9]/merged_HiForestMiniAOD.root"  (it expands dirs 0..9)
 void bdt_roc_compare(
     TString file_run2 = "/data_CMS/cms/kalipoliti/qcdMC/dijet/aggrTMVA_fixedMassBug/merged_HiForestMiniAOD.root",
-    TString file_run3 = "/data_CMS/cms/mnguyen/bJetAggRun3/PPRef2024/QCD/HiForestMiniAOD_v2_TChains.root",
-    Float_t pT_low = 100, Float_t pT_high = 120,
+    TString file_run3 = "/data_CMS/cms/mnguyen/bJetAggRun3/PPRef2024/bJet/HiForestMiniAOD_v2_TChains.root",
+    Float_t pT_low = 100, Float_t pT_high = 9999,
     TString out_tag = "bdt_roc_run2_vs_run3",
-    bool btag = true, Float_t btagWP = -1) {
+    bool btag = true, Float_t btagWP = 0.712) {
 
   // Physics: btag WP — custom if > 0, otherwise run-dependent default
   Float_t wp2 = (btagWP > 0) ? btagWP : 0.898f;
@@ -359,26 +424,29 @@ void bdt_roc_compare(
   for (RocSet* rs : {&r2, &r3}) {
     rs->r1b->SetLineColor(kBlue);
     rs->r2b->SetLineColor(kRed);
+    rs->r2b2sv->SetLineColor(kOrange + 7);
     rs->rall->SetLineColor(kGreen + 2);
   }
-  for (TGraph* g : {r2.r1b, r2.r2b, r2.rall}) g->SetLineStyle(1); // Run 2 solid
-  for (TGraph* g : {r3.r1b, r3.r2b, r3.rall}) g->SetLineStyle(2); // Run 3 dashed
+  for (TGraph* g : {r2.r1b, r2.r2b, r2.r2b2sv, r2.rall}) g->SetLineStyle(1); // Run 2 solid
+  for (TGraph* g : {r3.r1b, r3.r2b, r3.r2b2sv, r3.rall}) g->SetLineStyle(2); // Run 3 dashed
 
   r3.r2b->SetTitle("BDT ROC: Run 2 (solid) vs Run 3 (dashed);signal efficiency (TPR);mistag efficiency (FPR)");
   r3.r2b->GetXaxis()->SetRangeUser(0.75, 1.0);
   r3.r2b->GetYaxis()->SetRangeUser(1e-3, 1.0);
   r3.r2b->Draw("AL");
-  r3.r1b->Draw("L SAME");  r3.rall->Draw("L SAME");
-  r2.r2b->Draw("L SAME");  r2.r1b->Draw("L SAME"); r2.rall->Draw("L SAME");
+  r3.r1b->Draw("L SAME");  r3.r2b2sv->Draw("L SAME"); r3.rall->Draw("L SAME");
+  r2.r2b->Draw("L SAME");  r2.r1b->Draw("L SAME"); r2.r2b2sv->Draw("L SAME"); r2.rall->Draw("L SAME");
 
   TLegend* leg = new TLegend(0.18, 0.18, 0.55, 0.45);
   leg->SetBorderSize(0); leg->SetFillStyle(0);
   leg->AddEntry(r3.rall, "Run 3  all B", "l");
   leg->AddEntry(r3.r1b,  "Run 3  1B",    "l");
   leg->AddEntry(r3.r2b,  "Run 3  #geq2B","l");
+  leg->AddEntry(r3.r2b2sv, "Run 3  #geq2B + #geq2SV","l");
   leg->AddEntry(r2.rall, "Run 2  all B", "l");
   leg->AddEntry(r2.r1b,  "Run 2  1B",    "l");
   leg->AddEntry(r2.r2b,  "Run 2  #geq2B","l");
+  leg->AddEntry(r2.r2b2sv, "Run 2  #geq2B + #geq2SV","l");
   leg->Draw();
 
   if (btag) {
@@ -392,17 +460,17 @@ void bdt_roc_compare(
   c->SaveAs((folder + out_tag + ".pdf").Data());
 
   TFile fout((folder + out_tag + ".root").Data(), "RECREATE");
-  r2.r1b->Write(); r2.r2b->Write(); r2.rall->Write();
-  r3.r1b->Write(); r3.r2b->Write(); r3.rall->Write();
+  r2.r1b->Write(); r2.r2b->Write(); r2.r2b2sv->Write(); r2.rall->Write();
+  r3.r1b->Write(); r3.r2b->Write(); r3.r2b2sv->Write(); r3.rall->Write();
   c->Write();
   fout.Close();
   std::cout << "Wrote " << folder + out_tag + ".pdf and .root" << std::endl;
 }
 
 // ---- Re-plot the comparison from the saved .root (no re-processing) ----
-// Reads the 6 ROC TGraphs and redraws: Run 2 solid, Run 3 dashed, y in [1e-3, 1].
+// Reads the saved ROC TGraphs and redraws: Run 2 solid, Run 3 dashed, y in [1e-3, 1].
 void replot_compare(TString in_tag = "bdt_roc_run2_vs_run3",
-                    bool btag = true, Float_t btagWP = -1) {
+                    bool btag = true, Float_t btagWP = 0.712) {
   TString folder = TString(gSystem->DirName(__FILE__)) + "/";
   TFile* fin = TFile::Open((folder + in_tag + ".root").Data());
   if (!fin || fin->IsZombie()) {
@@ -417,6 +485,8 @@ void replot_compare(TString in_tag = "bdt_roc_run2_vs_run3",
   };
   TGraph* r2_1b = get("roc1b_run2");  TGraph* r2_2b = get("roc2b_run2");  TGraph* r2_all = get("rocall_run2");
   TGraph* r3_1b = get("roc1b_run3");  TGraph* r3_2b = get("roc2b_run3");  TGraph* r3_all = get("rocall_run3");
+  TGraph* r2_2b2sv = dynamic_cast<TGraph*>(fin->Get("roc2b2sv_run2"));
+  TGraph* r3_2b2sv = dynamic_cast<TGraph*>(fin->Get("roc2b2sv_run3"));
   if (!r2_1b || !r2_2b || !r2_all || !r3_1b || !r3_2b || !r3_all) return;
 
   gStyle->SetOptStat(0);
@@ -426,29 +496,35 @@ void replot_compare(TString in_tag = "bdt_roc_run2_vs_run3",
   for (TGraph* g : {r2_1b, r3_1b}) g->SetLineColor(kBlue);
   for (TGraph* g : {r2_2b, r3_2b}) g->SetLineColor(kRed);
   for (TGraph* g : {r2_all, r3_all}) g->SetLineColor(kGreen + 2);
+  if (r2_2b2sv) r2_2b2sv->SetLineColor(kOrange + 7);
+  if (r3_2b2sv) r3_2b2sv->SetLineColor(kOrange + 7);
   for (TGraph* g : {r2_1b, r2_2b, r2_all}) g->SetLineStyle(1); // Run 2 solid
   for (TGraph* g : {r3_1b, r3_2b, r3_all}) g->SetLineStyle(2); // Run 3 dashed
+  if (r2_2b2sv) r2_2b2sv->SetLineStyle(1);
+  if (r3_2b2sv) r3_2b2sv->SetLineStyle(2);
 
   r3_2b->SetTitle("BDT ROC: Run 2 (solid) vs Run 3 (dashed);signal efficiency (TPR);mistag efficiency (FPR)");
   r3_2b->GetXaxis()->SetRangeUser(0.75, 1.0);
   r3_2b->GetYaxis()->SetRangeUser(1e-3, 1.0);
   r3_2b->Draw("AL");
-  r3_1b->Draw("L SAME");  r3_all->Draw("L SAME");
-  r2_2b->Draw("L SAME");  r2_1b->Draw("L SAME"); r2_all->Draw("L SAME");
+  r3_1b->Draw("L SAME");  if (r3_2b2sv) r3_2b2sv->Draw("L SAME"); r3_all->Draw("L SAME");
+  r2_2b->Draw("L SAME");  r2_1b->Draw("L SAME"); if (r2_2b2sv) r2_2b2sv->Draw("L SAME"); r2_all->Draw("L SAME");
 
   TLegend* leg = new TLegend(0.18, 0.18, 0.55, 0.45);
   leg->SetBorderSize(0); leg->SetFillStyle(0);
   leg->AddEntry(r2_all, "Run 2  all B", "l");
   leg->AddEntry(r2_1b,  "Run 2  1B",    "l");
   leg->AddEntry(r2_2b,  "Run 2  #geq2B","l");
+  if (r2_2b2sv) leg->AddEntry(r2_2b2sv, "Run 2  #geq2B + #geq2SV","l");
   leg->AddEntry(r3_all, "Run 3  all B", "l");
   leg->AddEntry(r3_1b,  "Run 3  1B",    "l");
   leg->AddEntry(r3_2b,  "Run 3  #geq2B","l");
+  if (r3_2b2sv) leg->AddEntry(r3_2b2sv, "Run 3  #geq2B + #geq2SV","l");
   leg->Draw();
 
   if (btag) {
     Float_t wp2 = (btagWP > 0) ? btagWP : 0.898f;
-    Float_t wp3 = (btagWP > 0) ? btagWP : 0.872f;
+    Float_t wp3 = (btagWP > 0) ? btagWP : 0.712f;
     TLatex* btagLbl = new TLatex();
     btagLbl->SetNDC();
     btagLbl->SetTextSize(0.030);
@@ -462,10 +538,10 @@ void replot_compare(TString in_tag = "bdt_roc_run2_vs_run3",
 // ---- Compare Run 3 with btag vs Run 3 without btag ----
 // btag = solid lines, no-btag = dashed lines; colours per category.
 void bdt_roc_run3_btag_vs_nobtag(
-    TString filename = "/data_CMS/cms/mnguyen/bJetAggRun3/PPRef2024/QCD/HiForestMiniAOD_v2_TChains.root",
-    Float_t pT_low = 100, Float_t pT_high = 120,
+    TString filename = "/data_CMS/cms/mnguyen/bJetAggRun3/PPRef2024/bJet/HiForestMiniAOD_v2_TChains.root",
+    Float_t pT_low = 100, Float_t pT_high = 9999,
     TString out_tag = "bdt_roc_run3_btag_vs_nobtag",
-    Float_t btagWP = -1) {
+    Float_t btagWP = 0.712) {
 
   Float_t wp = (btagWP > 0) ? btagWP : 0.872f;
 
@@ -479,28 +555,31 @@ void bdt_roc_run3_btag_vs_nobtag(
   // colours per b-multiplicity category
   for (TGraph* g : {r_btag.r1b,   r_nobtag.r1b})  g->SetLineColor(kBlue);
   for (TGraph* g : {r_btag.r2b,   r_nobtag.r2b})  g->SetLineColor(kRed);
+  for (TGraph* g : {r_btag.r2b2sv, r_nobtag.r2b2sv}) g->SetLineColor(kOrange + 7);
   for (TGraph* g : {r_btag.rall,  r_nobtag.rall}) g->SetLineColor(kGreen + 2);
   // btag = solid, no-btag = dashed
-  for (TGraph* g : {r_btag.r1b,  r_btag.r2b,  r_btag.rall})   g->SetLineStyle(1);
-  for (TGraph* g : {r_nobtag.r1b, r_nobtag.r2b, r_nobtag.rall}) g->SetLineStyle(2);
-  for (TGraph* g : {r_btag.r1b, r_btag.r2b, r_btag.rall,
-                    r_nobtag.r1b, r_nobtag.r2b, r_nobtag.rall}) g->SetLineWidth(2);
+  for (TGraph* g : {r_btag.r1b,  r_btag.r2b,  r_btag.r2b2sv,  r_btag.rall})   g->SetLineStyle(1);
+  for (TGraph* g : {r_nobtag.r1b, r_nobtag.r2b, r_nobtag.r2b2sv, r_nobtag.rall}) g->SetLineStyle(2);
+  for (TGraph* g : {r_btag.r1b, r_btag.r2b, r_btag.r2b2sv, r_btag.rall,
+                    r_nobtag.r1b, r_nobtag.r2b, r_nobtag.r2b2sv, r_nobtag.rall}) g->SetLineWidth(2);
 
   r_btag.r2b->SetTitle("BDT ROC Run 3: btag (solid) vs no btag (dashed);signal efficiency (TPR);mistag efficiency (FPR)");
   r_btag.r2b->GetXaxis()->SetRangeUser(0.75, 1.0);
   r_btag.r2b->GetYaxis()->SetRangeUser(1e-3, 1.0);
   r_btag.r2b->Draw("AL");
-  r_btag.r1b->Draw("L SAME");   r_btag.rall->Draw("L SAME");
-  r_nobtag.r2b->Draw("L SAME"); r_nobtag.r1b->Draw("L SAME"); r_nobtag.rall->Draw("L SAME");
+  r_btag.r1b->Draw("L SAME");   r_btag.r2b2sv->Draw("L SAME"); r_btag.rall->Draw("L SAME");
+  r_nobtag.r2b->Draw("L SAME"); r_nobtag.r1b->Draw("L SAME"); r_nobtag.r2b2sv->Draw("L SAME"); r_nobtag.rall->Draw("L SAME");
 
   TLegend* leg = new TLegend(0.18, 0.18, 0.58, 0.45);
   leg->SetBorderSize(0); leg->SetFillStyle(0);
   leg->AddEntry(r_btag.rall,   "btag  all B",    "l");
   leg->AddEntry(r_btag.r1b,    "btag  1B",        "l");
   leg->AddEntry(r_btag.r2b,    "btag  #geq2B",    "l");
+  leg->AddEntry(r_btag.r2b2sv, "btag  #geq2B + #geq2SV", "l");
   leg->AddEntry(r_nobtag.rall, "no btag  all B",  "l");
   leg->AddEntry(r_nobtag.r1b,  "no btag  1B",     "l");
   leg->AddEntry(r_nobtag.r2b,  "no btag  #geq2B", "l");
+  leg->AddEntry(r_nobtag.r2b2sv, "no btag  #geq2B + #geq2SV", "l");
   leg->Draw();
 
   TLatex* lbl = new TLatex();
@@ -511,9 +590,9 @@ void bdt_roc_run3_btag_vs_nobtag(
   c->SaveAs((folder + out_tag + ".pdf").Data());
 
   TFile fout((folder + out_tag + ".root").Data(), "RECREATE");
-  r_btag.r1b->Write();   r_btag.r2b->Write();   r_btag.rall->Write();
-  r_nobtag.r1b->Write(); r_nobtag.r2b->Write(); r_nobtag.rall->Write();
+  r_btag.r1b->Write();   r_btag.r2b->Write();   r_btag.r2b2sv->Write();   r_btag.rall->Write();
+  r_nobtag.r1b->Write(); r_nobtag.r2b->Write(); r_nobtag.r2b2sv->Write(); r_nobtag.rall->Write();
   c->Write();
-  fout.Close();
-  std::cout << "Wrote " << folder + out_tag + ".pdf and .root" << std::endl;
+  fout.Close(); 
+ std::cout << "Wrote " << folder + out_tag + ".pdf and .root" << std::endl;
 }

@@ -1,0 +1,2 @@
+{1 JetEta 0 None ScaleFactor}
+-5.191 5.191 3 1.10 1.05 1.15

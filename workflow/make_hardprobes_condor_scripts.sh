@@ -2,13 +2,14 @@
 
 set -u
 
-WORK=/home/llr/cms/zaidan/analysis_lise/eec_2b_analysis/workflow
-OUT_BASE=/data_CMS/cms/zaidan/bJetAggRun3/PPRef2024/HardProbes/agg_template_chunks
+WORK=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+DATA_ROOT=${mydata:-/data_CMS/cms/mnguyen}
+OUT_BASE=${DATA_ROOT}/bJetAggRun3/PPRef2024/HardProbes/agg_template_chunks
 
 # ACLIC_BUILD_DIR must match the build dir set in rootlogon.C.
-ACLIC_BUILD_DIR=/data_CMS/cms/zaidan/bJetAggRun3/PPRef2024/build
-SCRIPT_DIR=/data_CMS/cms/zaidan/bJetAggRun3/PPRef2024/condor/hardprobes_data_scripts
-CONDOR_LOG_DIR=/data_CMS/cms/zaidan/bJetAggRun3/PPRef2024/condor/logfiles
+ACLIC_BUILD_DIR=${DATA_ROOT}/bJetAggRun3/PPRef2024/build
+SCRIPT_DIR=${DATA_ROOT}/bJetAggRun3/PPRef2024/condor/hardprobes_data_scripts
+CONDOR_LOG_DIR=${DATA_ROOT}/bJetAggRun3/PPRef2024/condor/logfiles
 
 # INPUT_TAG names the chunk subdir (<TAG>_chunks) and the per-block filenames.
 #INPUT_TAG=negTagFix
@@ -65,6 +66,41 @@ case "${OUT_TAG}" in
   *)     [ "${APPLY_JEC}" = false ] || { echo "APPLY_JEC=true needs an OUT_TAG containing 'jec' (e.g. upartv2rhojec) -- refusing"; exit 1; } ;;
 esac
 [ "${APPLY_JEC}" = true ] && echo "JEC ON: jtpt recomputed from rawpt (L1FastJet + L2Relative, + L2Residual on data)"
+
+# ---------------------------------------------------------------------------
+# JES uncertainty variation (analysis-local 1% placeholder payload)
+# ---------------------------------------------------------------------------
+# Data is never JES-shifted in this workflow. Reject a non-nominal request here, and also
+# inside create_files_for_template_fit.cpp, so a generated job cannot bypass the protection.
+JES_VARIATION=${JES_VARIATION:-nominal}   # nominal | up | down
+case "${JES_VARIATION}" in
+  nominal)
+    case "${OUT_TAG}" in
+      *jesup*|*jesdown*) echo "OUT_TAG '${OUT_TAG}' names a JES shift but JES_VARIATION=nominal -- refusing"; exit 1 ;;
+    esac
+    ;;
+  up|down)
+    echo "JES_VARIATION=${JES_VARIATION} is forbidden for data; run data with JES_VARIATION=nominal"; exit 1
+    ;;
+  *) echo "JES_VARIATION must be nominal for data, got '${JES_VARIATION}'"; exit 1 ;;
+esac
+echo "JES variation: ${JES_VARIATION}"
+
+# Data must never receive MC resolution smearing. This guard runs when jobs are generated;
+# the generated ROOT call also passes "off" literally, and the C++ macro enforces MC-only.
+JER_VARIATION=${JER_VARIATION:-off}
+case "${JER_VARIATION}" in
+  off)
+    case "${OUT_TAG}" in
+      *jernominal*|*jerup*|*jerdown*) echo "OUT_TAG '${OUT_TAG}' names JER smearing but data requires JER_VARIATION=off"; exit 1 ;;
+    esac
+    ;;
+  nominal|up|down)
+    echo "JER_VARIATION=${JER_VARIATION} is forbidden for data; use JER_VARIATION=off"; exit 1
+    ;;
+  *) echo "JER_VARIATION must be off for data, got '${JER_VARIATION}'"; exit 1 ;;
+esac
+echo "JER variation: off (data protection)"
 
 # ---------------------------------------------------------------------------
 # 2024 jet veto map (Matt's, Winter24Prompt24_2024BCDEFGHI.root; JetVeto namespace in
@@ -154,7 +190,7 @@ rm -f "${SCRIPT_DIR}"/job_*.sh "${SCRIPT_DIR}"/jobs_*.sh
 
 job_index=0
 for primary_dataset in $(seq 0 4); do
-  input_dir=/data_CMS/cms/mnguyen/bJetAggRun3/PPRef2024/HardProbes/${primary_dataset}/${INPUT_TAG}_chunks
+  input_dir=${DATA_ROOT}/bJetAggRun3/PPRef2024/HardProbes/${primary_dataset}/${INPUT_TAG}_chunks
 
   for i in $(seq 0 9); do
     block=$(printf "000%d" "${i}")
@@ -202,7 +238,7 @@ if [ ! -f "\${ACLIC_BUILD_DIR}/create_files_for_template_fit_cpp.so" ]; then
   exit 3
 fi
 
-root -l -b -q -e "gSystem->AddIncludePath(\"-I\${ROOUNFOLD_INC} -I\${ROOUNFOLD_BUILD}\"); if (gSystem->Load(\"\${ROOUNFOLD_BUILD}/libRooUnfold.so\") < 0) gSystem->Exit(3); if (gSystem->Load(\"\${ACLIC_BUILD_DIR}/create_files_for_template_fit_cpp.so\") < 0) gSystem->Exit(3); create_files_for_template_fit(3,80,2,1,true,false,${BTAG_WP},true,false,true,0,-1,\"\${INPUT}\",\"\${STAGEDIR}\",\"${SAMPLE_TAG}\",false,20260908,${EEC_WEIGHT_OFF},${APPLY_JEC},\"off\",${APPLY_JETVETO})"
+root -l -b -q -e "gSystem->AddIncludePath(\"-I\${ROOUNFOLD_INC} -I\${ROOUNFOLD_BUILD}\"); if (gSystem->Load(\"\${ROOUNFOLD_BUILD}/libRooUnfold.so\") < 0) gSystem->Exit(3); if (gSystem->Load(\"\${ACLIC_BUILD_DIR}/create_files_for_template_fit_cpp.so\") < 0) gSystem->Exit(3); create_files_for_template_fit(3,80,2,1,true,false,${BTAG_WP},true,false,true,0,-1,\"\${INPUT}\",\"\${STAGEDIR}\",\"${SAMPLE_TAG}\",false,20260908,${EEC_WEIGHT_OFF},${APPLY_JEC},\"off\",${APPLY_JETVETO},\"nominal\",\"nominal\",\"off\")"
 
 for f in "\${STAGEDIR}"/*.root; do
   [ -e "\${f}" ] || continue

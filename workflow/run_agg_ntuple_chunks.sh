@@ -51,6 +51,27 @@ SAMPLE_TAG=${SAMPLE}
 OUT_TAG=${OUT_TAG:-upartv2}
 OUT_SUFFIX="${OUT_TAG:+_${OUT_TAG}}"
 
+# ---- Real b-enriched Pythia (benrInputs() in result_paths.h, 2026-10-22/23) --------------
+# Until 10-23 Matt's bJet/Pythia8_UParTV2_chunks/*_rho.root were a copy of QCD; since 10-23 the
+# same names hold the real QCD_BEnriched_pThat-15to500 _rho production (9 blocks), so the input
+# is the default one. A "benr" OUT_TAG only keeps these outputs apart from the copy's. Refuse a
+# bjet run while any block still looks like QCD (pthat above the b-enriched sample's 500 GeV).
+case "${OUT_TAG}" in
+  *benr*)
+    if [ "${SAMPLE}_${GENERATOR}" = bjet_pythia ]; then
+      for f in "${INPUT_DIR}"/merged_block_*_${FILE_TAG}.root; do
+        # first 200k events only: ~0.1% of QCD events have pthat > 500, so a QCD block still fails
+        mx=$(root -l -b -q -e "auto t=TFile::Open(\"$f\")->Get<TTree>(\"hiEvtAnalyzer/HiTree\"); t->SetEstimate(200000); t->Draw(\"pthat\",\"\",\"goff\",200000); std::cout<<\"MAXPTHAT \"<<TMath::MaxElement(t->GetSelectedRows(),t->GetV1())<<std::endl;" 2>/dev/null | awk '/MAXPTHAT/{print int($2)}')
+        [ -n "$mx" ] && [ "$mx" -le 500 ] || { echo "$f: max pthat '$mx' > 500 -- not the b-enriched sample, refusing"; exit 1; }
+      done
+      echo "b-enriched Pythia input checked: every block has pthat <= 500"
+    fi ;;
+esac
+# 10-22 version: read a no-rho copy from EOS (never produced, superseded by Matt's _rho blocks)
+#    [ "${APPLY_JEC:-false}" = false ] || { echo "... it has no rho, APPLY_JEC must be false"; exit 1; }
+#    INPUT_DIR=$mydata/bJetAggRun3/PPRef2024/bJetBEnriched/Pythia8_${INPUT_TAG}_chunks
+#    FILE_TAG="Pythia8_${INPUT_TAG}"
+
 # ---------------------------------------------------------------------------
 # Jet energy corrections (2024 pp-reference JEC, as in Matt's JEC_Prompt24HIpp files)
 # ---------------------------------------------------------------------------
@@ -86,6 +107,58 @@ case "${OUT_TAG}" in
   *)      [ "${APPLY_JETVETO}" = false ] || { echo "APPLY_JETVETO=true needs an OUT_TAG containing 'veto' (e.g. upartv2rhojecveto) -- refusing"; exit 1; } ;;
 esac
 [ "${APPLY_JETVETO}" = true ] && echo "JET VETO MAP ON: jets in the 2024 vetoed (eta, phi) cells rejected"
+# JET_PT_MAX (2026-10-29): the hard upper jet-pT cut of step 1 (read from the environment by the
+# macro). The OUT_TAG must say "ptmax<value>" exactly when it is set, so cut and uncut files never mix.
+JET_PT_MAX=${JET_PT_MAX:-}
+case "${OUT_TAG}" in
+  *ptmax*) [ -n "${JET_PT_MAX}" ] && [[ "${OUT_TAG}" == *ptmax${JET_PT_MAX}* ]] || { echo "OUT_TAG '${OUT_TAG}' says ptmax but JET_PT_MAX='${JET_PT_MAX}' -- refusing"; exit 1; } ;;
+  *)       [ -z "${JET_PT_MAX}" ] || { echo "JET_PT_MAX=${JET_PT_MAX} needs an OUT_TAG containing 'ptmax${JET_PT_MAX}' -- refusing"; exit 1; } ;;
+esac
+[ -n "${JET_PT_MAX}" ] && { export JET_PT_MAX; echo "JET PT CUT ON: jets with pT >= ${JET_PT_MAX} GeV dropped at reco and gen"; }
+# DR_MIN (2026-10-30): the lower dR cut of step 1 (binning_histos_small.h), same rule: the OUT_TAG says
+# "drmin<value, . -> p>" (drMinTag() in result_paths.h, e.g. drmin0p05) exactly when it is set.
+DR_MIN=${DR_MIN:-}
+case "${OUT_TAG}" in
+  *drmin*) [ -n "${DR_MIN}" ] && [[ "${OUT_TAG}" == *drmin${DR_MIN/./p}* ]] || { echo "OUT_TAG '${OUT_TAG}' says drmin but DR_MIN='${DR_MIN}' -- refusing"; exit 1; } ;;
+  *)       [ -z "${DR_MIN}" ] || { echo "DR_MIN=${DR_MIN} needs an OUT_TAG containing 'drmin${DR_MIN/./p}' -- refusing"; exit 1; } ;;
+esac
+[ -n "${DR_MIN}" ] && { export DR_MIN; echo "DR CUT ON: jets with dR <= ${DR_MIN} dropped at reco and gen, every observable"; }
+# SV_SEED (2026-11-05): an SV with a track passing the BDT keeps all its tracks (makeSvtxs_withBDT). Same
+# rule: the OUT_TAG says "svseed" (svSeedTag() in result_paths.h) exactly when SV_SEED=on.
+SV_SEED=${SV_SEED:-}
+[ -z "${SV_SEED}" ] || [ "${SV_SEED}" = on ] || { echo "SV_SEED must be on or unset, got '${SV_SEED}'"; exit 1; }
+case "${OUT_TAG}" in
+  *svseed*) [ "${SV_SEED}" = on ] || { echo "OUT_TAG '${OUT_TAG}' says svseed but SV_SEED='${SV_SEED}' -- refusing"; exit 1; } ;;
+  *)        [ -z "${SV_SEED}" ]   || { echo "SV_SEED=on needs an OUT_TAG containing 'svseed' -- refusing"; exit 1; } ;;
+esac
+SV_SEED_M2B=${SV_SEED_M2B:-}   # 2026-11-06: nominal = the fit's m2B from the plain BDT selection; tag "svseednm"
+[ -z "${SV_SEED_M2B}" ] || { [ "${SV_SEED_M2B}" = nominal ] && [ "${SV_SEED}" = on ]; } || { echo "SV_SEED_M2B must be nominal (with SV_SEED=on) or unset, got '${SV_SEED_M2B}'"; exit 1; }
+case "${OUT_TAG}" in
+  *svseednm*) [ -n "${SV_SEED_M2B}" ] || { echo "OUT_TAG '${OUT_TAG}' says svseednm but SV_SEED_M2B is unset -- refusing"; exit 1; } ;;
+  *)          [ -z "${SV_SEED_M2B}" ] || { echo "SV_SEED_M2B needs an OUT_TAG containing 'svseednm' -- refusing"; exit 1; } ;;
+esac
+[ -n "${SV_SEED}" ] && { export SV_SEED; echo "SV SEED ON: an SV with a track passing the BDT keeps all its tracks"; }
+[ -n "${SV_SEED_M2B}" ] && { export SV_SEED_M2B; echo "m2B from the plain BDT selection"; }
+# SV_SEED_DIAG (2026-11-06): the data/MC histograms of the rule (h_diag_*). Own OUT_TAG, no chain reads them.
+SV_SEED_DIAG=${SV_SEED_DIAG:-}
+case "${OUT_TAG}" in
+  *svseednmdiag*) [ "${SV_SEED_DIAG}" = on ] || { echo "OUT_TAG '${OUT_TAG}' says diag but SV_SEED_DIAG='${SV_SEED_DIAG}' -- refusing"; exit 1; } ;;
+  *)              [ -z "${SV_SEED_DIAG}" ]   || { echo "SV_SEED_DIAG needs an OUT_TAG containing 'svseednmdiag' -- refusing"; exit 1; } ;;
+esac
+[ -n "${SV_SEED_DIAG}" ] && export SV_SEED_DIAG
+
+# ---- Aggregation NN (agg_nn.h, added 2026-10-22) ------------------------------
+# on: the observables (dR, A, EEC weight, mB) from the NN's two B candidates; selection and SV SF
+# nominal. The OUT_TAG must then say "vetonn" (eraTag() in result_paths.h) and must not otherwise.
+export AGG_NN=${AGG_NN:-off}   # on | off
+# DISABLED 2026-10-22 (Zoe): NN commented out (agg_nn.h, result_paths.h); only off is accepted.
+[ "${AGG_NN}" = off ] || { echo "AGG_NN=${AGG_NN}: the aggregation NN is disabled -- refusing"; exit 1; }
+# if [ "${AGG_NN}" != on ] && [ "${AGG_NN}" != off ]; then echo "AGG_NN must be exactly 'on' or 'off', got '${AGG_NN}'"; exit 1; fi
+case "${OUT_TAG}" in
+  *vetonn*) [ "${AGG_NN}" = on ]  || { echo "OUT_TAG '${OUT_TAG}' says vetonn but AGG_NN=off -- refusing"; exit 1; } ;;
+  *)        [ "${AGG_NN}" = off ] || { echo "AGG_NN=on needs an OUT_TAG containing 'vetonn' (e.g. upartv2rhojecvetonn) -- refusing"; exit 1; } ;;
+esac
+[ "${AGG_NN}" = on ] && echo "AGGREGATION NN ON: observables from the NN's two B candidates"
 
 # ---- Tracking-efficiency systematic -----------------------------------------
 # false = nominal production (nothing is dropped, output names unchanged)
@@ -134,7 +207,7 @@ case "${SV_SF}" in
   up)      SVSF_TAG="_svsfup" ;;
   down)    SVSF_TAG="_svsfdn" ;;
   # per-contribution variations (2026-10-13), see sv_sf.h
-  statup|statdn|nomuonup|nomuondn|bbup|bbdn|jpup|jpdn|qqup|qqdn) SVSF_TAG="_svsf${SV_SF}" ;;
+  statup|statdn|nomuonup|nomuondn|bbup|bbdn|jpup|jpdn|qqup|qqdn|jphf) SVSF_TAG="_svsf${SV_SF}" ;;   # jphf 2026-11-09
   *) echo "SV_SF must be off | nominal | up | down | stat|nomuon|bb|jp|qq + up|dn, got '${SV_SF}'"; exit 1 ;;
 esac
 [ "${SV_SF}" != off ] && echo "SV b SCALE FACTOR: ${SV_SF}, file tag ${SVSF_TAG}"
@@ -240,7 +313,7 @@ fi   # SKIP_COMPILE
 # previous one in place and the jobs would run the wrong code.
 for src in create_files_for_template_fit.cpp observables.h binning_histos_small.h \
            result_paths.h tTree.h tracking_efficiency_syst.h central_selections.h sv_sf.h \
-           track_bdt_sf.h; do
+           track_bdt_sf.h agg_nn.h; do
   if [ -e "${WORK}/${src}" ] && [ "${WORK}/${src}" -nt "${SO}" ]; then
     echo "compile FAILED -- ${src} is newer than ${SO}; the build did not take. Not launching."
     tail -n 40 "${COMPILE_LOG}"

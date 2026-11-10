@@ -66,6 +66,20 @@ namespace ROCColor {
   Color_t teal()   { return make(2406, 0x1F, 0x8A, 0x8A); }
 }
 
+// The analysis 2D colour scale: ROCColor blue -> purple -> red. Same as in
+// plot_purity_efficiency_response.cpp (which has its own copy and does not include this header).
+Int_t setBluePurpleRedPalette(Int_t ncontours = 255)
+{
+    const Int_t nstops = 3;
+    Double_t stops[nstops] = { 0.00,        0.50,        1.00        };
+    Double_t rr[nstops]    = { 0x4C / 255., 0x8C / 255., 0xC4 / 255. };
+    Double_t gg[nstops]    = { 0x72 / 255., 0x6B / 255., 0x4E / 255. };
+    Double_t bb[nstops]    = { 0xB0 / 255., 0xB1 / 255., 0x52 / 255. };
+    const Int_t first = TColor::CreateGradientColorTable(nstops, stops, rr, gg, bb, ncontours);
+    gStyle->SetNumberContours(ncontours);
+    return first;
+}
+
 // Category -> colour. Go through these, never through ROCColor directly:
 //   ALL / 0B -> green,  1B -> blue,  2B -> red,  Data -> black,
 //   orange vs purple when exactly TWO variants of one quantity are compared.
@@ -235,9 +249,10 @@ bool CheckInputBinning(const TH3D* h3)
 // bin (jtpt_fill() in binning_histos_small.h), so a bin whose upper edge is jtpt_max is
 // open-ended and quoted as a threshold; interior bins keep their closed range.
 TString pt_label(double pt_first, double pt_last){
-    if (pt_last == jtpt_max)
-        return Form("p_{T} > %g GeV", pt_first);
-    return Form("%g < p_{T} < %g GeV", pt_first, pt_last);
+    // if (pt_last == jtpt_max)
+    //     return Form("p_{T} > %g GeV", pt_first);
+    // return Form("%g < p_{T} < %g GeV", pt_first, pt_last);
+    return jetPtRangeLabel(pt_first, pt_last, "p_{T}");   // knows JET_PT_MAX (2026-10-29)
 }
 
 
@@ -515,6 +530,42 @@ TH3D* CutAndRebinY(TH3D* h3, double yMin, int newNyBins, const double* newyBins,
     return hNew;
 }
 
+// ----TH3D: fit-range variations of the mass axis (2026-10-26) ---
+// Keeps the 1 GeV mass bins 1..nkeep-1 and puts everything from bin nkeep up (the 10 GeV fold
+// included) into bin nkeep, so the axis is 0..nkeep GeV in 1 GeV bins. The observable and pT
+// axes keep their own (variable) edges. Replaces the two functions below: To8GeV booked 7 bins
+// on [0,8] (1.14 GeV wide) and filled 7-10 GeV into the overflow, so "fitRange0to8" was a 0-7
+// GeV fit with the tail dropped; both booked uniform y/z axes.
+TH3D* MergeMassTail(TH3D* h3, int nkeep, const char* suffix)
+{
+    auto edges = [](const TAxis* a) {
+        std::vector<double> e;
+        for (int i = 1; i <= a->GetNbins() + 1; ++i) e.push_back(a->GetBinLowEdge(i));
+        return e;
+    };
+    std::vector<double> ex = edges(h3->GetXaxis()), ey = edges(h3->GetYaxis()), ez = edges(h3->GetZaxis());
+    ex.resize(nkeep + 1);
+
+    TH3D* h3_new = new TH3D(Form("%s_%s", h3->GetName(), suffix), h3->GetTitle(),
+                            nkeep, ex.data(), (int) ey.size() - 1, ey.data(), (int) ez.size() - 1, ez.data());
+    h3_new->Sumw2();
+
+    for (int ix = 1; ix <= h3->GetNbinsX(); ++ix) {
+        int ix_new = std::min(ix, nkeep);
+        for (int iy = 1; iy <= h3->GetNbinsY(); ++iy) {
+            for (int iz = 1; iz <= h3->GetNbinsZ(); ++iz) {
+                int bin_new = h3_new->GetBin(ix_new, iy, iz);
+                h3_new->AddBinContent(bin_new, h3->GetBinContent(ix, iy, iz));
+                h3_new->SetBinError(bin_new, std::hypot(h3_new->GetBinError(bin_new), h3->GetBinError(ix, iy, iz)));
+            }
+        }
+    }
+    return h3_new;
+}
+TH3D* MergeLastMassBinTo7GeV(TH3D* h3) { return MergeMassTail(h3, 7, "0to7"); } // 6-7 GeV bin holds 6-10
+TH3D* MergeLastMassBinTo8GeV(TH3D* h3) { return MergeMassTail(h3, 8, "0to8"); } // 7-8 GeV bin holds 7-10
+
+/* ---- disabled (kept for reference): the old fit-range merges, replaced by MergeMassTail() above ----
 // ----TH3D:  Rebin historgam in xaxis from 0-10 to 0-7 where last bin contain all the overflow ---
 TH3D* MergeLastMassBinTo7GeV(TH3D* h3)
 {
@@ -603,7 +654,8 @@ TH3D* MergeLastMassBinTo8GeV(TH3D* h3)
     }
 
     return h3_new;
-} 
+}
+---- end disabled ---- */
 
 
 

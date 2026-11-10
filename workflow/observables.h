@@ -235,7 +235,11 @@ struct ObsDef {
 // dr: the original observable. suffix "" -- its names must not change.
 inline ObsDef obsDr()
 {
-    return ObsDef{"dr", "", "#DeltaR", dr_bins, dr_binsVector, dr_max_fill, 0.005, /*upperOpen=*/true};
+    // return ObsDef{"dr", "", "#DeltaR", dr_bins, dr_binsVector, dr_max_fill, 0.005, /*upperOpen=*/true};   // until 2026-10-30
+    // DR_MIN (2026-10-30, binning_histos_small.h): the axis starts at the cut, and the cut is the reco domain cut.
+    const int k = drFirstEdge();
+    return ObsDef{"dr", "", "#DeltaR", dr_bins - k, dr_binsVector + k, dr_max_fill,
+                  k > 0 ? dr_binsVector[k] : 0.005, /*upperOpen=*/true};
 }
 
 // B: the momentum balance. No lower cut -- the distribution is closed at 0.5.

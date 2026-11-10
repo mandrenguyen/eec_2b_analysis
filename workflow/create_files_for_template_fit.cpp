@@ -5,6 +5,7 @@
 #include <Math/Vector4D.h>
 #include <vector>
 #include <map>
+#include <set>
 #include <unordered_map>
 #include <random>
 #include "Math/VectorUtil.h"
@@ -38,41 +39,9 @@
 #include "sv_sf.h"         // SV b scale factor vs aggregate pT, applied per SV (MC only)
 #include "track_bdt_sf.h"  // effective track-BDT WPs for signal/non-signal tracks (MC only)
 #include "observables.h"   // the measured observables (dr, B) and the axis abstraction
+#include "agg_nn.h"        // aggregation NN (AGG_NN=on): the two B candidates for the observables
 
-// ============================================================================
-// The EEC weight, on or off
-// ============================================================================
-// The analysis measures the energy-energy correlator: every selected 2b jet enters its
-// histograms weighted by (pt1*pt2)^n, the pTs being those of its two aggregated B hadrons.
-// Turning that weight off turns the SAME chain into a plain YIELD measurement -- the final
-// unfolded distribution becomes dN/dr, the number of 2b jets per dr bin, with nothing else
-// about the selection, the corrections or the unfolding changed.
-//
-// This is one switch rather than a second analysis because the weight is computed in exactly
-// six places below, all the same expression, and everything downstream is built from those
-// six values:
-//
-//   h3D_0b / h3D_b / h3D_bb / h3D_data   the template-fit and unfolding inputs
-//   w_reco = weight_tree * eec_reco      the response matrix, the purity and efficiency
-//   w_gen  = weight_tree * eec_gen       corrections, and the MC truth
-//   hgenjet_2b_*                         the b-tag and SV efficiency corrections
-//
-// So value() returning 1 makes all of them unweighted at once, consistently, with no second
-// code path to keep in step. Two consequences worth knowing:
-//
-//   * the unweighted h3D_bb is then identical to h_count_bb, which is filled with
-//     weight_tree alone and already exists in every production -- a free cross-check that
-//     the switch does what it claims;
-//   * the EEC-weight correction (r_eec = sum(eec_gen)/sum(eec_reco), applied by multiplying
-//     the unfolded result) collapses to exactly 1 bin by bin, because its numerator and
-//     denominator become the same unweighted histogram. It needs no special case: it turns
-//     itself off.
-//
-// NOT a systematic variation -- a different observable measured with the same machinery, so
-// its outputs carry their own "_noeecw" tag (eecWeightTag() in result_paths.h) and never mix
-// with the EEC ones. Default ON, so a caller that never mentions this gets what it always
-// got.
-// ============================================================================
+
 namespace EecWeight {
 
 inline bool &enabled()
@@ -106,24 +75,7 @@ inline void print()
               << "YIELDS (dN/dr), not the EEC. Output tagged '" << tag() << "'." << std::endl;
 }
 
-} // namespace EecWeight
-
-// ============================================================================
-// Jet energy corrections (added 2026-10-01)
-// ============================================================================
-// The 2024 pp-reference JEC, exactly as in Matt's JEC_Prompt24HIpp productions (the top-level
-// eec_2b_analysis/create_files_for_template_fit.cpp): rho-dependent L1FastJet + MC-truth
-// L2Relative on MC and data, plus the dijet L2Residual on data only, applied to rawpt. The
-// corrected pT REPLACES t.jtpt right after each event is read, so the jet-pT cut, the pT
-// bins, the response and every histogram see corrected jets; gen jets are untouched.
-//
-// Default OFF, so a caller that never mentions it reproduces the uncorrected productions
-// bit for bit. Switched on by the last argument of create_files_for_template_fit(); the run
-// scripts insist the OUT_TAG then says "jec" (eraTag() in result_paths.h), so corrected and
-// uncorrected files can never share a name.
-//
-// Text files: the Run3HeavyIonJetCalibrations git submodule at the repo top, pinned commit
-// c64293a (fetched 2026-10-01 with `git submodule update --init`).
+} 
 #include "../Run3HeavyIonJetCalibrations/include/JetCorrector.h"
 #include "TLeaf.h"     // the event rho is read through its leaf
 #include <stdexcept>
@@ -162,20 +114,7 @@ inline void print(bool isMC)
     for (const std::string &s : files(isMC)) std::cout << "   " << s << std::endl;
 }
 
-} // namespace Jec
-
-// ============================================================================
-// 2024 jet veto map (added 2026-10-16)
-// ============================================================================
-// Matt's veto (top-level create_files_for_template_fit.cpp, commit cebffbc5 "add jet veto
-// map"): a jet whose (eta, phi) falls in a cell flagged in jetvetomap_all of
-// Winter24Prompt24_2024BCDEFGHI.root (repo top) is rejected, data and MC alike -- from the
-// templates, and from reco_pass of the response, so the unfolding efficiency corrects for it.
-// Non-finite eta/phi fails. The aggregation ntuple records the decision (passJetVeto).
-//
-// Default OFF, so a caller that never mentions it reproduces the earlier productions. Switched
-// on by the last argument of create_files_for_template_fit() (Run 3 only, as in Matt's); the
-// run scripts insist the OUT_TAG then says "veto" (eraTag() in result_paths.h).
+} 
 namespace JetVeto {
 
 inline bool &enabled() { static bool on = false; return on; }
@@ -323,19 +262,6 @@ void PartialBsAggregation(std::vector<ROOT::Math::PtEtaPhiMVector>& hadrons_4vec
     }
   }
 }
-
-// ⚠️ UNCALLED since 2026-09-22: its only caller was the fnb/fb/lnfb gen block, which is
-// commented out with the rest of the fraction observables. Left compiled rather than
-// disabled so that re-enabling them is an uncomment at the fill site alone.
-//
-// The gen half of the fnb observable (observables.h): the scalar pT sum of this jet's gen
-// tracks that are NOT from a B decay. Exactly the complement of PartialBsAggregation just
-// above -- same jet, same pT > 1 cut, status < 100 instead of >= 100 -- so pT_b and pT_nonb
-// between them account for every gen track of the jet above 1 GeV, and neither double counts.
-//
-// No tracking-efficiency variation here, deliberately: the systematic varies RECO only
-// (TrkEffSyst is never applied to refTrk*), because a variation that moved truth as well
-// would not change the response matrix, which is the thing it exists to probe.
 double genNonBTrackPt(tTree& t, Int_t ijet){
   double sum = 0.;
   for (Int_t itrk = 0; itrk < t.nrefTrk; itrk++) {
@@ -347,8 +273,11 @@ double genNonBTrackPt(tTree& t, Int_t ijet){
   return sum;
 }
 
-// ---- disabled (kept for reference): MatchingTracksAggregation, unused ----
-#if 0
+// ---- MatchingTracksAggregation: RECO tracks grouped by their TRUE B (trkMatchSta >= 100) ----
+// perfect assignment, i.e. the best any aggregation could do with these tracks. Only feeds the
+// orPt*/orEta*/orPhi* branches of the aggregation ntuple
+// no histogram uses it
+// #if 0
 void MatchingTracksAggregation(std::vector<ROOT::Math::PtEtaPhiMVector>& hadrons_4vec, std::vector<Int_t>& hadrons_stat, tTree& t, Int_t ijet, Int_t ient){
   hadrons_4vec.clear();
   hadrons_stat.clear();
@@ -374,7 +303,8 @@ void MatchingTracksAggregation(std::vector<ROOT::Math::PtEtaPhiMVector>& hadrons
     else if (pid == 3334) mass = 1.67245;
     else if (pid == 1)   continue;
         //skip not matched
-    else std::cout << "PDG:" << pid << std::endl;
+    // else std::cout << "PDG:" << pid << std::endl;
+    
 
     // 4 vector
     ROOT::Math::PtEtaPhiMVector v(t.trkPt [itrk], t.trkEta[itrk], t.trkPhi[itrk], mass);
@@ -400,7 +330,7 @@ void MatchingTracksAggregation(std::vector<ROOT::Math::PtEtaPhiMVector>& hadrons
   }
 
 }
-#endif // ---- end disabled: MatchingTracksAggregation ----
+// #endif 
 
 void groupVertexes1(std::vector<Vertex>& vertices)
 {
@@ -591,7 +521,8 @@ vector<ROOT::Math::PtEtaPhiMVector> makeSvtxs_withBDT(
   double& merge_fail,
   TH1D* h_score_bkg, TH1D* h_score_sg,
   double* pt_nonb = nullptr,
-  std::vector<int>* sv_sta = nullptr
+  std::vector<int>* sv_sta = nullptr,
+  bool allowSvSeed = true   // false: the plain BDT selection even with SV_SEED=on (nominalVertexMass)
 ){
   if (pt_nonb) *pt_nonb = 0.;
   if (sv_sta) sv_sta->clear();
@@ -602,6 +533,17 @@ vector<ROOT::Math::PtEtaPhiMVector> makeSvtxs_withBDT(
   std::vector<ROOT::Math::PtEtaPhiMVector> no_sv_list;
   std::vector<int> no_sv_sta_list;
   no_sv_list.reserve(t.ntrk); no_sv_sta_list.reserve(t.ntrk);
+
+  // SV_SEED=on (2026-11-05, Zoe): the vertices with >= 1 track passing the BDT keep ALL their tracks below.
+  // No vertex appears that the nominal selection did not have. A track dropped by the tracking systematic
+  // cannot seed one. Off: seedSvs stays empty, the loop below is the nominal one.
+  static const bool kSvSeed = [] { const char *e = std::getenv("SV_SEED"); return e && TString(e) == "on"; }();   // svSeedOn() in result_paths.h
+  std::set<Int_t> seedSvs;
+  if (kSvSeed && allowSvSeed)
+    for (Int_t itrk = 0; itrk < t.ntrk; itrk++)
+      if (t.trkJetId[itrk] == ijet && t.trkPt[itrk] >= 1 && t.trkSvtxId[itrk] >= 0
+          && TrackBdtSF::passes(t.trkBdtScore[itrk], t.trkMatchSta[itrk], t.trkSvtxId[itrk]) && !TrkEffSyst::dropTrack(ient, itrk))
+        seedSvs.insert(t.trkSvtxId[itrk]);
 
     // Loop over tracks
     for (Int_t itrk = 0; itrk < t.ntrk; itrk++) {
@@ -617,14 +559,9 @@ vector<ROOT::Math::PtEtaPhiMVector> makeSvtxs_withBDT(
      // {h_score_sg->Fill(t.trkBdtScore[itrk], weight_tree);}
 
     // -- Add trkbdt score
-    if (!TrackBdtSF::passes(t.trkBdtScore[itrk], t.trkMatchSta[itrk], t.trkSvtxId[itrk])) {
-      // Rejected as not b-like: this track is the NON-B part of the jet. Sum its pT for the
-      // fnb observable before dropping it. The tracking-efficiency variation is applied here
-      // too, so a 3% track drop thins the non-b side exactly as it thins the Bs -- the
-      // detector does not lose tracks according to a BDT score. Safe to call dropTrack() on
-      // a track the nominal path never reaches: it hashes (seed, ient, itrk) and reads no
-      // track property, so asking about this track changes no other track's verdict.
-      if (pt_nonb && !TrkEffSyst::dropTrack(ient, itrk)) *pt_nonb += t.trkPt[itrk];
+    // if (!TrackBdtSF::passes(t.trkBdtScore[itrk], t.trkMatchSta[itrk], t.trkSvtxId[itrk])) {   // until 2026-11-05
+    if (!TrackBdtSF::passes(t.trkBdtScore[itrk], t.trkMatchSta[itrk], t.trkSvtxId[itrk]) && !seedSvs.count(t.trkSvtxId[itrk])) {
+       if (pt_nonb && !TrkEffSyst::dropTrack(ient, itrk)) *pt_nonb += t.trkPt[itrk];
       continue;
     }
 
@@ -632,14 +569,7 @@ vector<ROOT::Math::PtEtaPhiMVector> makeSvtxs_withBDT(
         // from it, so the SVs, m_2B, dR and the EEC weight all see a jet genuinely
         // missing 3% of the tracks that would have entered the B reconstruction.
         // No-op in the nominal. See tracking_efficiency_syst.h.
-        //
-        // Placed AFTER the pT and BDT cuts on purpose: "3% of the tracks used to build
-        // the Bs". The position is in fact irrelevant -- dropTrack() hashes
-        // (seed, ient, itrk) and reads no track property, so the surviving set is the
-        // same intersection either way and the two orderings give bit-identical output
-        // (verified). That is only true because the number is hashed rather than drawn
-        // from a stream: a stream would assign different numbers to different tracks
-        // depending on how many were consumed before the cuts.
+  
         if (TrkEffSyst::dropTrack(ient, itrk)) continue;
 
         //build v1, the 4 vec of the track
@@ -683,6 +613,101 @@ vector<ROOT::Math::PtEtaPhiMVector> makeSvtxs_withBDT(
     return {vertices[0].p4, vertices[1].p4};
 }
 
+// SV_SEED_M2B=nominal (2026-11-06, with SV_SEED=on): the fit variable m2B from the vertices of the plain BDT
+// selection, for the EEC and A alike; pT, dR and the EEC weight keep the SV-seed vertices. Same jets: the
+// rule creates no vertex, so both passes find the same number of them.
+inline bool svSeedNominalM2B() { static const bool on = [] { const char *e = std::getenv("SV_SEED_M2B"); return e && TString(e) == "nominal"; }(); return on; }
+inline double nominalVertexMass(tTree& t, Int_t& ijet, Long64_t& ient, double fallback) {
+  double a = 0., b = 0., c = 0., d = 0.;   // this pass does not touch the failure counters
+  const vector<ROOT::Math::PtEtaPhiMVector> v = makeSvtxs_withBDT(t, ijet, ient, a, b, c, d, nullptr, nullptr, nullptr, nullptr, false);
+  return v.size() == 2 ? v[0].M() + v[1].M() : fallback;
+}
+
+// SV_SEED_DIAG=on (2026-11-06, with SV_SEED=on): the data/MC check of the SV seed rule. Same jets and same
+// weight as the templates, in a fine jet pT axis so the reader can apply the fit's jet-pT weights. Per
+// flavour (data | 0b | b | bb), names h_diag_<var>_<flavour>:
+//   per jet      what the response sees: seeded vs plain-BDT vertices (A, dR, pT sum, pT1*pT2, m2B)
+//   rescued trk  tracks kept only because of the rule. NOT the same set in data and MC when the track-BDT SF
+//                is on: MC's effective WPs differ from data's 0.365, so read them with the next group
+//   sv trk       ALL kept tracks of the seeded vertices: independent of that WP difference once a vertex is seeded
+struct SvSeedDiag {
+    bool on = false;
+    std::map<TString, TH2D *> h;
+    static bool requested() { const char *e = std::getenv("SV_SEED_DIAG"); return e && TString(e) == "on"; }
+    void book(bool isMC) {
+        on = requested();
+        if (!on) return;
+        struct V { const char *n; int nb; double lo, hi; };
+        const std::vector<V> vars = {
+            {"nresc", 10, 0, 10}, {"ptresc", 40, 0, 40}, {"share", 20, 0, 1}, {"ptratio", 42, 0.9, 3.0}, {"dA", 50, -0.5, 0.5},
+            {"ddR", 40, -0.2, 0.2}, {"eecratio", 42, 0.8, 5.0}, {"m2Bnom", 10, 0, 10}, {"m2Bseed", 10, 0, 10},
+            {"Anom", 5, 0.5, 1.0}, {"Aseed", 5, 0.5, 1.0}, {"drnom", 9, 0, 0.45}, {"drseed", 9, 0, 0.45},
+            {"nsvtrk", 10, 1, 11}, {"svshare", 20, 0, 1}, {"svmass", 24, 0, 6},
+            {"resc_pt", 40, 1, 21}, {"resc_bdt", 40, -1, 1}, {"resc_ip", 60, -20, 100}, {"resc_dr", 40, 0, 0.4}, {"resc_z", 30, 0, 0.3},
+            {"svtrk_pt", 40, 1, 21}, {"svtrk_ip", 60, -20, 100}, {"svtrk_dr", 40, 0, 0.4}, {"svtrk_bdt", 40, -1, 1} };
+        const int nfine = 64; double e[nfine + 1];
+        for (int i = 0; i <= nfine; ++i) e[i] = 80. + 5. * i;
+        std::vector<TString> fl; if (isMC) fl = {"0b", "b", "bb"}; else fl = {"data"};
+        for (const V &v : vars) for (const TString &f : fl) {
+            std::vector<double> x(v.nb + 1); for (int i = 0; i <= v.nb; ++i) x[i] = v.lo + (v.hi - v.lo) * i / v.nb;
+            TH2D *o = new TH2D(TString::Format("h_diag_%s_%s", v.n, f.Data()), TString::Format(";%s;p_{T} [GeV]", v.n), v.nb, x.data(), nfine, e);
+            o->Sumw2(); h[TString::Format("%s_%s", v.n, f.Data())] = o;
+        }
+    }
+    void put(const char *var, const TString &f, double x, double pt, double w) {
+        TH2D *o = h.at(TString::Format("%s_%s", var, f.Data()));
+        const TAxis *a = o->GetXaxis();
+        o->Fill(std::max(a->GetXmin() + 1e-9, std::min(a->GetXmax() - 1e-9, x)), pt, w);   // over/underflow in the edge bins
+    }
+    void fill(tTree &t, Int_t &ijet, Long64_t &ient, bool isMC, Int_t nb, const ROOT::Math::PtEtaPhiMVector &s0,
+              const ROOT::Math::PtEtaPhiMVector &s1, double pt, double w) {
+        if (!on || pt >= 400.) return;
+        const TString f = !isMC ? "data" : nb == 0 ? "0b" : nb == 1 ? "b" : "bb";
+        double a = 0., b = 0., c = 0., d = 0.;
+        const vector<ROOT::Math::PtEtaPhiMVector> n = makeSvtxs_withBDT(t, ijet, ient, a, b, c, d, nullptr, nullptr, nullptr, nullptr, false);
+        if (n.size() != 2) return;
+        std::set<Int_t> seeds;
+        for (Int_t k = 0; k < t.ntrk; ++k)
+            if (t.trkJetId[k] == ijet && t.trkPt[k] >= 1 && t.trkSvtxId[k] >= 0 && TrackBdtSF::passes(t.trkBdtScore[k], t.trkMatchSta[k], t.trkSvtxId[k]))
+                seeds.insert(t.trkSvtxId[k]);
+        std::map<Int_t, ROOT::Math::PtEtaPhiMVector> axis; std::map<Int_t, int> nsv; std::map<Int_t, double> ptsv, rescsv;
+        double ptkept = 0., ptresc = 0.; int nresc = 0;
+        for (Int_t k = 0; k < t.ntrk; ++k) {
+            if (t.trkJetId[k] != ijet || t.trkPt[k] < 1) continue;
+            const Int_t sv = t.trkSvtxId[k];
+            const bool pass = TrackBdtSF::passes(t.trkBdtScore[k], t.trkMatchSta[k], sv), seeded = sv >= 0 && seeds.count(sv);
+            if (pass || seeded) ptkept += t.trkPt[k];
+            if (seeded) { axis[sv] += recoTrackP4(t, k); ++nsv[sv]; ptsv[sv] += t.trkPt[k]; }
+            if (seeded && !pass) { ptresc += t.trkPt[k]; ++nresc; rescsv[sv] += t.trkPt[k]; }
+        }
+        for (Int_t k = 0; k < t.ntrk; ++k) {
+            if (t.trkJetId[k] != ijet || t.trkPt[k] < 1) continue;
+            const Int_t sv = t.trkSvtxId[k];
+            if (sv < 0 || !seeds.count(sv)) continue;
+            const ROOT::Math::PtEtaPhiMVector tr = recoTrackP4(t, k);
+            const double ip = std::isfinite(t.trkIp3dSig[k]) ? t.trkIp3dSig[k] : 0.;
+            const double dra = t.calc_dr(tr.Eta(), tr.Phi(), axis[sv].Eta(), axis[sv].Phi());
+            put("svtrk_pt", f, t.trkPt[k], pt, w); put("svtrk_ip", f, ip, pt, w); put("svtrk_dr", f, dra, pt, w); put("svtrk_bdt", f, t.trkBdtScore[k], pt, w);
+            if (!TrackBdtSF::passes(t.trkBdtScore[k], t.trkMatchSta[k], sv)) {
+                put("resc_pt", f, t.trkPt[k], pt, w); put("resc_bdt", f, t.trkBdtScore[k], pt, w); put("resc_ip", f, ip, pt, w);
+                put("resc_dr", f, dra, pt, w); put("resc_z", f, t.trkPt[k] / pt, pt, w);
+            }
+        }
+        for (const auto &kv : nsv) {
+            put("nsvtrk", f, kv.second, pt, w); put("svshare", f, rescsv[kv.first] / ptsv[kv.first], pt, w); put("svmass", f, axis[kv.first].M(), pt, w);
+        }
+        const double ns = s0.Pt() + s1.Pt(), nn = n[0].Pt() + n[1].Pt();
+        const double As = std::max(s0.Pt(), s1.Pt()) / ns, An = std::max(n[0].Pt(), n[1].Pt()) / nn;
+        const double ds = t.calc_dr(s0.Eta(), s0.Phi(), s1.Eta(), s1.Phi()), dn = t.calc_dr(n[0].Eta(), n[0].Phi(), n[1].Eta(), n[1].Phi());
+        put("nresc", f, nresc, pt, w); put("ptresc", f, ptresc, pt, w); put("share", f, ptkept > 0. ? ptresc / ptkept : 0., pt, w);
+        put("ptratio", f, ns / nn, pt, w); put("dA", f, As - An, pt, w); put("ddR", f, ds - dn, pt, w);
+        put("eecratio", f, (s0.Pt() * s1.Pt()) / (n[0].Pt() * n[1].Pt()), pt, w);
+        put("m2Bnom", f, n[0].M() + n[1].M(), pt, w); put("m2Bseed", f, s0.M() + s1.M(), pt, w);
+        put("Anom", f, An, pt, w); put("Aseed", f, As, pt, w); put("drnom", f, dn, pt, w); put("drseed", f, ds, pt, w);
+    }
+    void write() const { for (const auto &kv : h) kv.second->Write(); }
+};
+
 //fill_jk_resampling_response to be added
 // Jackknife resampling: fill all but one of the 10 objects; num in [0,1) picks the one left
 // out. Works for TH1D/TH2D/TH3D (x..., w) and RooUnfoldResponse (reco..., gen..., w) alike --
@@ -708,6 +733,12 @@ struct AggBHadronNtupleRow {
   Float_t btagScore;
   Int_t passRecoKin, passGenKin, passBtag, passJetVeto, nRecoAgg, nGenAgg, genStatus1, genStatus2;
   Float_t recoPt1, recoEta1, recoPhi1, recoM1, recoPt2, recoEta2, recoPhi2, recoM2, recoDr, recoMB, recoEec, genPt1, genEta1, genPhi1, genM1, genPt2, genEta2, genPhi2, genM2, genDr, genMB, genEec;
+  Float_t tsPt1, tsEta1, tsPhi1, tsPt2, tsEta2, tsPhi2, orPt1, orEta1, orPhi1, orPt2, orEta2, orPhi2;
+  Float_t jtphi;
+  Float_t cxPt1, cxEta1, cxPhi1, cxPt2, cxEta2, cxPhi2; Int_t cxStatus;
+  std::vector<float> trk_pt, trk_eta, trk_phi, trk_ip3d, trk_ip3dsig, trk_dist, trk_bdt,
+                     trk_sv_m, trk_sv_mcorr, trk_sv_pt, trk_sv_dl, trk_sv_dls, trk_sv_dl2d, trk_sv_dls2d, trk_sv_chi2;
+  std::vector<int> trk_pdg, trk_svidx, trk_sv_ntrk, trk_nomsel, truth_sta, truth_label;
 
   void reset() {
     entry = -1;
@@ -727,6 +758,13 @@ struct AggBHadronNtupleRow {
     genPt1 = genEta1 = genPhi1 = genM1 = -999.0;
     genPt2 = genEta2 = genPhi2 = genM2 = -999.0;
     genDr = genMB = genEec = -999.0;
+    tsPt1 = tsEta1 = tsPhi1 = tsPt2 = tsEta2 = tsPhi2 = -999.0;
+    orPt1 = orEta1 = orPhi1 = orPt2 = orEta2 = orPhi2 = -999.0;
+    jtphi = -999.0;
+    cxPt1 = cxEta1 = cxPhi1 = cxPt2 = cxEta2 = cxPhi2 = -999.0; cxStatus = -1;
+    for (auto *v : {&trk_pt, &trk_eta, &trk_phi, &trk_ip3d, &trk_ip3dsig, &trk_dist, &trk_bdt, &trk_sv_m, &trk_sv_mcorr,
+                    &trk_sv_pt, &trk_sv_dl, &trk_sv_dls, &trk_sv_dl2d, &trk_sv_dls2d, &trk_sv_chi2}) v->clear();
+    for (auto *v : {&trk_pdg, &trk_svidx, &trk_sv_ntrk, &trk_nomsel, &truth_sta, &truth_label}) v->clear();
   }
 
   // Kinematics of the two aggregated B hadrons: the reco SVs, or the chosen gen pair.
@@ -758,9 +796,25 @@ void makeAggBHadronBranches(TTree* tree, AggBHadronNtupleRow& row) {
   br("genPt1", &row.genPt1, "F"); br("genEta1", &row.genEta1, "F"); br("genPhi1", &row.genPhi1, "F"); br("genM1", &row.genM1, "F");
   br("genPt2", &row.genPt2, "F"); br("genEta2", &row.genEta2, "F"); br("genPhi2", &row.genPhi2, "F"); br("genM2", &row.genM2, "F");
   br("genDr", &row.genDr, "F"); br("genMB", &row.genMB, "F"); br("genEec", &row.genEec, "F");
+  br("tsPt1", &row.tsPt1, "F"); br("tsEta1", &row.tsEta1, "F"); br("tsPhi1", &row.tsPhi1, "F");
+  br("tsPt2", &row.tsPt2, "F"); br("tsEta2", &row.tsEta2, "F"); br("tsPhi2", &row.tsPhi2, "F");
+  br("orPt1", &row.orPt1, "F"); br("orEta1", &row.orEta1, "F"); br("orPhi1", &row.orPhi1, "F");
+  br("orPt2", &row.orPt2, "F"); br("orEta2", &row.orEta2, "F"); br("orPhi2", &row.orPhi2, "F");
+  br("jtphi", &row.jtphi, "F");
+  br("cxPt1", &row.cxPt1, "F"); br("cxEta1", &row.cxEta1, "F"); br("cxPhi1", &row.cxPhi1, "F");
+  br("cxPt2", &row.cxPt2, "F"); br("cxEta2", &row.cxEta2, "F"); br("cxPhi2", &row.cxPhi2, "F");
+  br("cxStatus", &row.cxStatus, "I");
+  // Per-track arrays (std::vector branches; uproot reads them as jagged arrays).
+  tree->Branch("trk_pt", &row.trk_pt); tree->Branch("trk_eta", &row.trk_eta); tree->Branch("trk_phi", &row.trk_phi);
+  tree->Branch("trk_ip3d", &row.trk_ip3d); tree->Branch("trk_ip3dsig", &row.trk_ip3dsig); tree->Branch("trk_dist", &row.trk_dist);
+  tree->Branch("trk_bdt", &row.trk_bdt); tree->Branch("trk_pdg", &row.trk_pdg); tree->Branch("trk_nomsel", &row.trk_nomsel);
+  tree->Branch("trk_svidx", &row.trk_svidx); tree->Branch("trk_sv_ntrk", &row.trk_sv_ntrk);
+  tree->Branch("trk_sv_m", &row.trk_sv_m); tree->Branch("trk_sv_mcorr", &row.trk_sv_mcorr); tree->Branch("trk_sv_pt", &row.trk_sv_pt);
+  tree->Branch("trk_sv_dl", &row.trk_sv_dl); tree->Branch("trk_sv_dls", &row.trk_sv_dls);
+  tree->Branch("trk_sv_dl2d", &row.trk_sv_dl2d); tree->Branch("trk_sv_dls2d", &row.trk_sv_dls2d); tree->Branch("trk_sv_chi2", &row.trk_sv_chi2);
+  tree->Branch("truth_sta", &row.truth_sta); tree->Branch("truth_label", &row.truth_label);
 }
 
-// ---- disabled (kept for reference): make_templates, superseded by Build_templates ----
 #if 0
 // Build templates for the template fit.
 // MC:   fills h3D_b (jtNbHad==1) and h3D_bb (jtNbHad==2) using reco-level cuts and reco SV reconstruction.
@@ -886,9 +940,7 @@ void make_templates(const AnalysisConfig& cfg, Long64_t ev_first = 0, Long64_t e
   }
   outFile.Close();
 }
-#endif // ---- end disabled: make_templates ----
-
-// ---- disabled (kept for reference): create_response_templatefit, now in Build_templates ----
+#endif 
 #if 0
 // Creates a 3D response matrix in (mB, dr_SV, jtpt) for unfolding the bb template
 // fit distributions. One entry per jet (not per track pair).
@@ -1024,7 +1076,8 @@ void create_response_templatefit(
             // jtpt_fill() folds jets above the last bin edge into that bin, so they are
             // not lost to the overflow bin (see binning_histos_small.h).
             double jpt_reco = jtpt_fill(reco_jet_pt(t, ijet));
-            double jpt_gen = jtpt_fill(gen_jet_pt(t, ijet));
+            // double jpt_gen = jtpt_fill(gen_jet_pt(t, ijet));   // until 2026-10-29
+            double jpt_gen = jtptGenFill(gen_jet_pt(t, ijet));   // = jtpt_fill unless JET_PT_MAX (gen overflow)
             double jeta_reco = reco_jet_eta(t, ijet);
             double jeta_gen = gen_jet_eta(t, ijet);
               // -- for cout only
@@ -1270,6 +1323,24 @@ struct TemplateHistos {
     TH3D *h3D_pseudo_0b = nullptr, *h3D_pseudo_b = nullptr, *h3D_pseudo_bb = nullptr;
     TH3D *h3D_data = nullptr, *h3D_pseudodata = nullptr, *h3D_pseudodata_bb = nullptr;
     TH3D *h_count_0b = nullptr, *h_count_b = nullptr, *h_count_bb = nullptr, *h_count_data = nullptr;
+    // Same templates in 5 GeV jet-pT bins, 80-300 GeV (above 300 folded into the last bin), for the
+    // jet-pT reweighting of the MC in template_fit.cpp (2026-10-27, Zoe). Same fill weights.
+    // 2026-10-28 (Zoe: "dont keep jets with more than 400 GeV, adding the correspondant bins"):
+    // 80-400 GeV, 64 bins, no fold -- jets >= 400 GeV are not filled (kPtFineMax).
+    TH3D *h3D_0b_ptfine = nullptr, *h3D_b_ptfine = nullptr, *h3D_bb_ptfine = nullptr, *h3D_data_ptfine = nullptr;
+    static constexpr double kPtFineMax = 400.;
+
+    TH3D *book3Dptfine(const char *base, const char *what) const {
+        // const int nfine = 44; double e[nfine + 1];   // 80-300 GeV, until 2026-10-28
+        const int nfine = 64; double e[nfine + 1];
+        for (int i = 0; i <= nfine; ++i) e[i] = 80. + 5. * i;
+        TH3D *h = new TH3D(o.n(base),
+                           Form("%s;m_{2B} [GeV];%s;p_{T} [GeV]", what, o.axis.Data()),
+                           bins_mb, mb_binsVector, o.nbins, o.bins, nfine, e);
+        h->Sumw2();
+        h->SetCanExtend(TH1::kNoAxis);
+        return h;
+    }
 
     TH3D *book3D(const char *base, const char *what) const {
         TH3D *h = new TH3D(o.n(base),
@@ -1295,17 +1366,29 @@ struct TemplateHistos {
         h_count_b    = book3D("h_count_b",    "jet counts 1b");
         h_count_bb   = book3D("h_count_bb",   "jet counts 2b");
         h_count_data = book3D("h_count_data", "jet counts data");
+        h3D_0b_ptfine   = book3Dptfine("h3D_0b_ptfine",   "EEC 0b, fine jet pT");
+        h3D_b_ptfine    = book3Dptfine("h3D_b_ptfine",    "EEC 1b, fine jet pT");
+        h3D_bb_ptfine   = book3Dptfine("h3D_bb_ptfine",   "EEC 2b, fine jet pT");
+        h3D_data_ptfine = book3Dptfine("h3D_data_ptfine", "EEC data, fine jet pT");
     }
 
     // x is this observable's RECO value, already past o.passReco(). eec carries the data
-    // prescale the caller applied; w is the tree weight.
+    // prescale the caller applied; w is the tree weight. jtpt is the folded template pT,
+    // jtpt_raw the jet pT itself (for the _ptfine histograms).
     void fill(bool isMC, Int_t jtNbHad, Long64_t ient,
-              double mB, double x, double jtpt, double eec, double w) {
+              double mB, double x, double jtpt, double eec, double w, double jtpt_raw) {
         const double xf = o.fill(x);
+        // const double ptf = std::min(jtpt_raw, 299.9);   // fold above 300 GeV into the last fine bin (until 2026-10-28)
+        const double ptf = jtpt_raw;
+        const bool fine_in = jtpt_raw < kPtFineMax;    // jets >= 400 GeV: not in the _ptfine histograms
         if (isMC) {
             if      (jtNbHad == 0) { h3D_0b->Fill(mB, xf, jtpt, eec * w); h_count_0b->Fill(mB, xf, jtpt, w); }
             else if (jtNbHad == 1) { h3D_b ->Fill(mB, xf, jtpt, eec * w); h_count_b ->Fill(mB, xf, jtpt, w); }
             else if (jtNbHad >= 2) { h3D_bb->Fill(mB, xf, jtpt, eec * w); h_count_bb->Fill(mB, xf, jtpt, w); }
+            if      (!fine_in)     ;
+            else if (jtNbHad == 0) h3D_0b_ptfine->Fill(mB, xf, ptf, eec * w);
+            else if (jtNbHad == 1) h3D_b_ptfine ->Fill(mB, xf, ptf, eec * w);
+            else if (jtNbHad >= 2) h3D_bb_ptfine->Fill(mB, xf, ptf, eec * w);
 
             if (ient % 2 == 0) {
                 h3D_pseudodata->Fill(mB, xf, jtpt, eec * w);
@@ -1319,6 +1402,8 @@ struct TemplateHistos {
         } else {
             h3D_data    ->Fill(mB, xf, jtpt, eec * w);
             h_count_data->Fill(mB, xf, jtpt, w);
+            // h3D_data_ptfine->Fill(mB, xf, ptf, eec * w);   // until 2026-10-28
+            if (fine_in) h3D_data_ptfine->Fill(mB, xf, ptf, eec * w);
         }
     }
 
@@ -1329,8 +1414,10 @@ struct TemplateHistos {
             // Odd-half templates, for fitting the even-half pseudodata in the split test
             h3D_pseudo_0b->Write(); h3D_pseudo_b->Write(); h3D_pseudo_bb->Write();
             h_count_0b->Write(); h_count_b->Write(); h_count_bb->Write();
+            h3D_0b_ptfine->Write(); h3D_b_ptfine->Write(); h3D_bb_ptfine->Write();
         } else {
             h3D_data->Write(); h_count_data->Write();
+            h3D_data_ptfine->Write();
         }
     }
 };
@@ -1351,6 +1438,10 @@ struct ResponseHistos {
     TH2D *book2D(const char *base, const char *title) const {
         return new TH2D(o.n(base), title, o.nbins, o.bins, jtpt_bins, jtpt_binsVector);
     }
+    // gen-level histograms: the gen pT binning (= the reco one unless JET_PT_MAX, then + a gen overflow bin)
+    TH2D *book2Dgen(const char *base, const char *title) const {
+        return new TH2D(o.n(base), title, o.nbins, o.bins, jtptGenNbins(), jtptGenEdges());
+    }
 
     void book(const ObsDef &def) {
         o = def;
@@ -1359,16 +1450,16 @@ struct ResponseHistos {
         for (int h = 0; h < 2; ++h) {
             purity_num[h] = book2D(Form("h_half%d_purity_numerator_tf",   h), xr);
             purity_den[h] = book2D(Form("h_half%d_purity_denominator_tf", h), xr);
-            eff_num[h]    = book2D(Form("h_half%d_efficiency_numerator_tf",   h), xg);
-            eff_den[h]    = book2D(Form("h_half%d_efficiency_denominator_tf", h), xg);
+            eff_num[h]    = book2Dgen(Form("h_half%d_efficiency_numerator_tf",   h), xg);   // book2D until 2026-10-29
+            eff_den[h]    = book2Dgen(Form("h_half%d_efficiency_denominator_tf", h), xg);
             ps_purity_num[h] = book2D(Form("h_half%d_pseudo_purity_numerator_tf",   h), xr);
             ps_purity_den[h] = book2D(Form("h_half%d_pseudo_purity_denominator_tf", h), xr);
-            ps_eff_num[h]    = book2D(Form("h_half%d_pseudo_efficiency_numerator_tf",   h), xg);
-            ps_eff_den[h]    = book2D(Form("h_half%d_pseudo_efficiency_denominator_tf", h), xg);
+            ps_eff_num[h]    = book2Dgen(Form("h_half%d_pseudo_efficiency_numerator_tf",   h), xg);
+            ps_eff_den[h]    = book2Dgen(Form("h_half%d_pseudo_efficiency_denominator_tf", h), xg);
         }
         // Closure target for the split test: the pseudodata half's gen-level distribution,
         // with the same gate (gen_pass) and weight (w_reco) as the purity/response chain.
-        pseudodata_truth = book2D("h_pseudodata_truth_tf", xg);
+        pseudodata_truth = book2Dgen("h_pseudodata_truth_tf", xg);
         pseudodata_truth->Sumw2();
 
         for (int h = 0; h < 2; ++h) {
@@ -1386,28 +1477,31 @@ struct ResponseHistos {
                                                  "tf response pseudo full");
 
         // -- For b-tagging eff. correction after unfolding (at particle level)
-        hgenjet_2b          = book2D("hgenjet_2b",          Form("b-tagging eff. DENO;%s;p_{T} [GeV]", o.axis.Data()));
-        hgenjet_2b_passbtag = book2D("hgenjet_2b_passbtag", Form("b-tagging eff. NUM;%s;p_{T} [GeV]",  o.axis.Data()));
+        hgenjet_2b          = book2Dgen("hgenjet_2b",          Form("b-tagging eff. DENO;%s;p_{T} [GeV]", o.axis.Data()));
+        hgenjet_2b_passbtag = book2Dgen("hgenjet_2b_passbtag", Form("b-tagging eff. NUM;%s;p_{T} [GeV]",  o.axis.Data()));
         // Combined SV-reco + b-tag efficiency, gen-EEC weighted (w_gen) so the denominator
         // is defined even for true 2b jets without 2 reco SVs.
-        hgenjet_2b_all       = book2D("hgenjet_2b_all",       Form("SV+btag eff. DENO;%s;p_{T} [GeV]", o.axis.Data()));
-        hgenjet_2b_reco_btag = book2D("hgenjet_2b_reco_btag", Form("SV+btag eff. NUM;%s;p_{T} [GeV]",  o.axis.Data()));
+        hgenjet_2b_all       = book2Dgen("hgenjet_2b_all",       Form("SV+btag eff. DENO;%s;p_{T} [GeV]", o.axis.Data()));
+        hgenjet_2b_reco_btag = book2Dgen("hgenjet_2b_reco_btag", Form("SV+btag eff. NUM;%s;p_{T} [GeV]",  o.axis.Data()));
     }
 
-    // ⚠️ The four hgenjet_* histograms are filled with the RAW gen value, not the folded one,
-    // while the response and purity/efficiency use the folded value. That asymmetry is
-    // inherited from the original dr code: a gen value at or above the top edge lands in
-    // ROOT's overflow here but in the last bin there. Preserved deliberately -- "fixing" it
-    // would silently change every existing dr correction.
+  
+    // Gen values are folded with o.fill(), like the response/efficiency fills, so the last
+    // bin means the same thing here as in the unfolded result (dr_gen >= 0.45 -> last bin,
+    // not ROOT's overflow). Changed 2026-10-26; before, these were filled unfolded.
     void fillGenAll(double x_gen_raw, double jpt_gen, double w_gen) const {
-        hgenjet_2b_all->Fill(x_gen_raw, jpt_gen, w_gen);
+        // hgenjet_2b_all->Fill(x_gen_raw, jpt_gen, w_gen);
+        hgenjet_2b_all->Fill(o.fill(x_gen_raw), jpt_gen, w_gen);
     }
     void fillGenPreBtag(double x_gen_raw, double jpt_gen, double w_reco) const {
-        hgenjet_2b->Fill(x_gen_raw, jpt_gen, w_reco);
+        // hgenjet_2b->Fill(x_gen_raw, jpt_gen, w_reco);
+        hgenjet_2b->Fill(o.fill(x_gen_raw), jpt_gen, w_reco);
     }
     void fillGenPostBtag(double x_gen_raw, double jpt_gen, double w_reco, double w_gen) const {
-        hgenjet_2b_passbtag  ->Fill(x_gen_raw, jpt_gen, w_reco);
-        hgenjet_2b_reco_btag ->Fill(x_gen_raw, jpt_gen, w_gen);
+        // hgenjet_2b_passbtag  ->Fill(x_gen_raw, jpt_gen, w_reco);
+        // hgenjet_2b_reco_btag ->Fill(x_gen_raw, jpt_gen, w_gen);
+        hgenjet_2b_passbtag  ->Fill(o.fill(x_gen_raw), jpt_gen, w_reco);
+        hgenjet_2b_reco_btag ->Fill(o.fill(x_gen_raw), jpt_gen, w_gen);
     }
 
     // The response/purity/efficiency fills. x_reco_fill and x_gen_fill are already folded.
@@ -1518,6 +1612,120 @@ struct ResponseHistos {
     }
 };
 
+// ---- 3D response in (dR, A, jet pT), added 2026-10-27 ---------------------------------------
+// For the 3D Bayesian unfolding. Reco and gen have DIFFERENT binnings (the gen-only side bins,
+// see u3d_* in binning_histos_small.h), so the response is non-square. Axes: x = dR, y = A,
+// z = jet pT -- the 2D convention (observable first, pT last) extended by one.
+//
+// Same fill pattern and weights as ResponseHistos, except:
+//  - the gates are the 3D ones: gen pT >= u3d_gen_pt[0] (60, not ptLow) and the reco hard
+//    edges (u3d_reco_in), so these purity/efficiency are NOT the 2D ones;
+//  - full sample + split test only (odd half = response, even half = pseudodata reco and
+//    truth), no jackknife halves;
+//  - values come in RAW (no jtpt_fill / o.fill), the clamps are applied here;
+//  - only num/den are written, the ratios are formed in the unfolding from the block sums.
+// One weight per production, like everything else: EEC-weighted in the nominal production,
+// unweighted in the _noeecw one.
+struct Response3D {
+    TH3D *purity_num = nullptr, *purity_den = nullptr, *eff_num = nullptr, *eff_den = nullptr;
+    TH3D *ps_purity_num = nullptr, *ps_purity_den = nullptr, *ps_eff_num = nullptr, *ps_eff_den = nullptr;
+    TH3D *pseudodata_reco = nullptr, *pseudodata_truth = nullptr;
+    TH3D *hgenjet_2b = nullptr, *hgenjet_2b_passbtag = nullptr;
+    TH3D *hgenjet_2b_all = nullptr, *hgenjet_2b_reco_btag = nullptr;
+    RooUnfoldResponse *response_full = nullptr, *ps_response_full = nullptr;
+
+    TH3D *bookReco(const char *name, const char *title) const {
+        TH3D *h = new TH3D(name, title, u3d_reco_dr_size - 1, u3d_reco_dr,
+                           B_binsVectorSize - 1, B_binsVector, u3d_reco_pt_size - 1, u3d_reco_pt);
+        h->Sumw2();
+        return h;
+    }
+    TH3D *bookGen(const char *name, const char *title) const {
+        TH3D *h = new TH3D(name, title, u3d_gen_dr_size - 1, u3d_gen_dr,
+                           B_binsVectorSize - 1, B_binsVector, u3d_gen_pt_size - 1, u3d_gen_pt);
+        h->Sumw2();
+        return h;
+    }
+
+    void book() {
+        const char *xr = "x=dr_reco, y=A_reco, z=jtpt_reco";
+        const char *xg = "x=dr_gen, y=A_gen, z=jtpt_gen";
+        purity_num = bookReco("h_full_purity_numerator_3d",   xr);
+        purity_den = bookReco("h_full_purity_denominator_3d", xr);
+        eff_num    = bookGen("h_full_efficiency_numerator_3d",   xg);
+        eff_den    = bookGen("h_full_efficiency_denominator_3d", xg);
+        ps_purity_num = bookReco("h_full_pseudo_purity_numerator_3d",   xr);
+        ps_purity_den = bookReco("h_full_pseudo_purity_denominator_3d", xr);
+        ps_eff_num    = bookGen("h_full_pseudo_efficiency_numerator_3d",   xg);
+        ps_eff_den    = bookGen("h_full_pseudo_efficiency_denominator_3d", xg);
+        // Split test: the even half, what the odd-half chain must recover.
+        pseudodata_reco  = bookReco("h_pseudodata_reco_3d",  xr);
+        pseudodata_truth = bookGen("h_pseudodata_truth_3d", xg);
+        response_full    = new RooUnfoldResponse(purity_den, eff_den, "response_full_3d",
+                                                 "3D response full");
+        ps_response_full = new RooUnfoldResponse(ps_purity_den, ps_eff_den, "response_pseudo_full_3d",
+                                                 "3D response pseudo (odd half)");
+        // Post-unfolding corrections, gen binning, same definitions as the 2D hgenjet_2b_*.
+        hgenjet_2b           = bookGen("hgenjet_2b_3d",           "b-tagging eff. DENO");
+        hgenjet_2b_passbtag  = bookGen("hgenjet_2b_passbtag_3d",  "b-tagging eff. NUM");
+        hgenjet_2b_all       = bookGen("hgenjet_2b_all_3d",       "SV+btag eff. DENO");
+        hgenjet_2b_reco_btag = bookGen("hgenjet_2b_reco_btag_3d", "SV+btag eff. NUM");
+    }
+
+    void fillGen(TH3D *h, double dr, double A, double pt, double w) const {
+        h->Fill(u3d_gen_dr_fill(dr), u3d_A_fill(A), u3d_gen_pt_fill(pt), w);
+    }
+    void fillGenAll(double dr, double A, double pt, double w_gen) const {
+        fillGen(hgenjet_2b_all, dr, A, pt, w_gen);
+    }
+    void fillGenPreBtag(double dr, double A, double pt, double w_reco) const {
+        fillGen(hgenjet_2b, dr, A, pt, w_reco);
+    }
+    void fillGenPostBtag(double dr, double A, double pt, double w_reco, double w_gen) const {
+        fillGen(hgenjet_2b_passbtag,  dr, A, pt, w_reco);
+        fillGen(hgenjet_2b_reco_btag, dr, A, pt, w_gen);
+    }
+
+    // reco_pass must already include u3d_reco_in, gen_pass the 60 GeV gen threshold.
+    void fillResponse(bool reco_pass, bool gen_pass, Long64_t ient,
+                      double dr_reco, double A_reco, double pt_reco,
+                      double dr_gen,  double A_gen,  double pt_gen, double w_reco) const {
+        const bool odd = (ient % 2 == 1);
+        const double ar = u3d_A_fill(A_reco);
+        const double dg = u3d_gen_dr_fill(dr_gen), ag = u3d_A_fill(A_gen), pg = u3d_gen_pt_fill(pt_gen);
+        if (reco_pass) {
+            purity_den->Fill(dr_reco, ar, pt_reco, w_reco);
+            if (odd) ps_purity_den->Fill(dr_reco, ar, pt_reco, w_reco);
+            else     pseudodata_reco->Fill(dr_reco, ar, pt_reco, w_reco);
+        }
+        if (gen_pass) {
+            eff_den->Fill(dg, ag, pg, w_reco);   // reco-side weight, as in the 2D efficiency
+            if (odd) ps_eff_den->Fill(dg, ag, pg, w_reco);
+            else     pseudodata_truth->Fill(dg, ag, pg, w_reco);
+        }
+        if (reco_pass && gen_pass) {
+            purity_num->Fill(dr_reco, ar, pt_reco, w_reco);
+            eff_num->Fill(dg, ag, pg, w_reco);
+            response_full->Fill(dr_reco, ar, pt_reco, dg, ag, pg, w_reco);
+            if (odd) {
+                ps_purity_num->Fill(dr_reco, ar, pt_reco, w_reco);
+                ps_eff_num->Fill(dg, ag, pg, w_reco);
+                ps_response_full->Fill(dr_reco, ar, pt_reco, dg, ag, pg, w_reco);
+            }
+        }
+    }
+
+    void write() const {
+        for (TH3D *h : {purity_num, purity_den, eff_num, eff_den,
+                        ps_purity_num, ps_purity_den, ps_eff_num, ps_eff_den,
+                        pseudodata_reco, pseudodata_truth,
+                        hgenjet_2b, hgenjet_2b_passbtag, hgenjet_2b_all, hgenjet_2b_reco_btag})
+            h->Write();
+        response_full->Write();
+        ps_response_full->Write();
+    }
+};
+
 void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, bool isCreateRmatrix = true,
                      Long64_t ev_first = 0, Long64_t ev_last = -1, Int_t job_idx = -1, bool makeAggNtuple = true) {
   // -- make templates of Data/MC, and Response matrix for MC
@@ -1533,16 +1741,7 @@ void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, boo
 
   // -- Output files name
   TString job_suffix = (job_idx >= 0) ? Form("_job%d", job_idx) : "";
-  // No kinematic label in the names: the pT range is fixed by jtpt_binsVector in
-  // binning_histos_small.h, so spelling it into every filename only invited drift.
-  // Systematic-variation tag: "" for the nominal, so nominal names are unchanged;
-  // "_trkdrop030" for the 3% tracking-efficiency variation. It goes last, right before
-  // ".root", which is where apply_unfolding_2d.C's MC_TAG expects it (the run scripts
-  // then append their own OUT_TAG after it).
-  // EecWeight::tag() is "_noeecw" for the yield run: not a systematic, a different
-  // observable, so it must never land in the same file as the EEC histograms.
-  // SvSF::tag() is "_svsf" / "_svsfup" / "_svsfdn" when the SV b scale factor is applied
-  // (MC only), "" when off -- see sv_sf.h.
+ 
   TString syst_suffix = TrkEffSyst::tag() + SvSF::tag() + TrackBdtSF::tag() + EecWeight::tag();
   TString fout_name = cfg.dataset.output_folder + cfg.dataset.output_hist + job_suffix + "MCGEN" + syst_suffix + ".root"; // for reposnse matrix: has Prefix: Response
   TString ResponseMatrix_fout_name =  cfg.dataset.output_folder + "RMatrix_" + cfg.dataset.output_hist + job_suffix + syst_suffix + ".root";
@@ -1550,16 +1749,8 @@ void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, boo
   gSystem->mkdir(cfg.dataset.output_folder, true);
 
   // ---- Histograms ----
-  // One set per measured observable. dr's ObsDef has an empty suffix, so its histograms are
-  // booked under exactly the names they have always had; B's carry "_B". Both sets are
-  // filled from the SAME jets in the SAME pass -- adding an observable costs no extra run.
   const std::vector<ObsDef> observables = obsList();
-  // obsList() and obsValues() must stay the same length, or the per-jet value of one
-  // observable would be filled into another's histograms. Caught here, at startup, rather
-  // than as a plausible-looking distribution three hours into a production.
-  // The zero-argument list below has to be widened when an observable is added, so the
-  // COMPILER catches a half-done addition before this runtime check ever runs. That is the
-  // stronger guard of the two; keep both.
+ 
   if (obsValues(0., 0.).size() != observables.size()) {
     std::cerr << "FATAL: obsList() has " << observables.size() << " observables but "
               << "obsValues() returns " << obsValues(0., 0.).size() << " values. "
@@ -1575,6 +1766,7 @@ void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, boo
               << std::endl;
 
   std::vector<TemplateHistos> tmpl(observables.size());
+  SvSeedDiag svDiag; svDiag.book(cfg.dataset.isMC);   // 2026-11-06, empty unless SV_SEED_DIAG=on
   for (size_t i = 0; i < observables.size(); ++i) tmpl[i].book(observables[i]);
 
   // Selected jets after btagging + >=2 SV, within the kinematic selection
@@ -1599,6 +1791,13 @@ void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, boo
     // are unchanged; B's carry "_B".
     std::vector<ResponseHistos> resp(observables.size());
     for (size_t i = 0; i < observables.size(); ++i) resp[i].book(observables[i]);
+    // The 3D (dR, A, jet pT) response, filled next to the 2D ones (2026-10-27).
+    Response3D resp3d;
+    resp3d.book();
+    // Its gen pT threshold is the bottom of the 60-80 underflow bin, not ptLow.
+    AnalysisConfig cfg3d = cfg;
+    cfg3d.kin.ptLow = u3d_gen_pt[0];
+    cfg3d.kin.ptHigh = 0.;   // the 3D keeps its own edges (gen overflow to 1000, reco hard edge at 200)
 
 	// DEBUG: reco SV pt vs gen partial-B pt (EEC weight = pt_i * pt_j).
 	TH2D* h_svpt_vs_bpt = new TH2D("h_svpt_vs_bpt", "reco SV p_{T} vs gen B p_{T};gen partial-B p_{T} [GeV];reco SV p_{T} [GeV]", 60, 0, 120, 60, 0, 120);
@@ -1630,14 +1829,7 @@ void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, boo
       double agg_fail_rm = 0, nb_sv_rm = 0, sv_fail_rm = 0, merge_fail_rm = 0; // for Response matrix conditions
 
   // Response-matrix variables
-    // -- To split any sample into two parts randomly.
-    // Was std::mt19937 seeded from std::random_device, which made two runs of the same
-    // job disagree in the half0/half1 histograms and made the split depend on how the
-    // sample was chunked. TrkEffSyst::jetSplitRandom() hashes (ient, ijet) instead, so
-    // the half a jet lands in is a property of the jet: reproducible across reruns, and
-    // identical between the nominal and a systematic variation, which is what keeps the
-    // split noise out of the systematic. See tracking_efficiency_syst.h.
-
+    
     //-- debugging variables
     long n_bb_jets = 0, n_reco_pass = 0, n_gen_pass = 0, n_both_pass = 0;
     long n_gen_bh_ok = 0;  // jets passing gen_bh.size() >= 2
@@ -1784,7 +1976,7 @@ void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, boo
 
       double weight_tree = cfg.dataset.isMC ? (weightTree ? hiEvtWeight : t.weight) : 1.0;
 
-      // -- NEW:
+    
       if (! passPVQuality_EventSelection(t, cfg)) continue;
 
         // cout << "PV quality pass ok: t.vz = "<< t.vz  << endl;
@@ -1818,14 +2010,27 @@ void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, boo
 
               if (reco_sv.size() == 2){ // #sv must = 2 (default of makeSvtxs_withBDT())
 
-                double dr   = t.calc_dr(reco_sv[0].Eta(), reco_sv[0].Phi(), reco_sv[1].Eta(), reco_sv[1].Phi());
-                double pt1  = reco_sv[0].Pt();
-                double pt2  = reco_sv[1].Pt();
                 // SV b scale factor, one per b-matched SV (sv_sf.h). 1 for data and when off.
-                double w_svsf = SvSF::jetWeight(pt1, reco_sv_sta[0], pt2, reco_sv_sta[1]);
-                double eec  = EecWeight::value(pt1, pt2, cfg.n);
+                // Always from the NOMINAL vertices: they make the selection the SF corrects.
+                double w_svsf = SvSF::jetWeight(reco_sv[0].Pt(), reco_sv_sta[0], reco_sv[1].Pt(), reco_sv_sta[1]);
                 double jtpt = jtpt_fill(t.jtpt[ijet]);
-                double mB   = reco_sv[0].M() + reco_sv[1].M();
+                // The two B candidates of the observables: the nominal vertices, or with AGG_NN=on
+                // the aggregation NN's two clusters (agg_nn.h). Selection unchanged either way.
+                ROOT::Math::PtEtaPhiMVector cand0 = reco_sv[0], cand1 = reco_sv[1];
+                if (AggNN::enabled()) {
+                  const AggNN::Result nn = AggNN::run(t, ijet, ient, jtpt);
+                  if (nn.status >= 0) {
+                    cand0 = cand1 = ROOT::Math::PtEtaPhiMVector();
+                    for (int k : nn.g1) cand0 += recoTrackP4(t, k);
+                    for (int k : nn.g2) cand1 += recoTrackP4(t, k);
+                  }
+                }
+                double dr   = t.calc_dr(cand0.Eta(), cand0.Phi(), cand1.Eta(), cand1.Phi());
+                double pt1  = cand0.Pt();
+                double pt2  = cand1.Pt();
+                double eec  = EecWeight::value(pt1, pt2, cfg.n);
+                double mB   = cand0.M() + cand1.M();
+                if (svSeedNominalM2B()) mB = nominalVertexMass(t, ijet, ient, mB);   // 2026-11-06
                
                 double Bbal = MomBalance::value(pt1, pt2);
                  (void)pt_nonb_reco;
@@ -1853,8 +2058,9 @@ void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, boo
                 for (size_t io = 0; io < tmpl.size(); ++io) {
                   if (xreco[io] < 0.) continue;   // unusable pair for this observable
                   tmpl[io].fill(cfg.dataset.isMC, t.jtNbHad[ijet], ient,
-                                mB, xreco[io], jtpt, eec, weight_tree * w_svsf);
+                                mB, xreco[io], jtpt, eec, weight_tree * w_svsf, t.jtpt[ijet]);
                 }
+                svDiag.fill(t, ijet, ient, cfg.dataset.isMC, t.jtNbHad[ijet], cand0, cand1, t.jtpt[ijet], eec * weight_tree * w_svsf);
 
                 } // end if (dr > 0.005)
                 }// Fill Templates
@@ -1868,7 +2074,8 @@ void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, boo
             // jtpt_fill() folds jets above the last bin edge into that bin, so they are
             // not lost to the overflow bin (see binning_histos_small.h).
             double jpt_reco = jtpt_fill(reco_jet_pt(t, ijet));
-            double jpt_gen = jtpt_fill(gen_jet_pt(t, ijet));
+            // double jpt_gen = jtpt_fill(gen_jet_pt(t, ijet));   // until 2026-10-29
+            double jpt_gen = jtptGenFill(gen_jet_pt(t, ijet));   // = jtpt_fill unless JET_PT_MAX (gen overflow)
             double jeta_reco = reco_jet_eta(t, ijet);
             double jeta_gen = gen_jet_eta(t, ijet);
             // -- for cout only
@@ -1963,17 +2170,82 @@ void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, boo
 	        aggRow.setReco(reco_sv_rm[0], reco_sv_rm[1]);
 	        aggRow.recoDr = dr_reco_diag; aggRow.recoMB = mB_reco_diag; aggRow.recoEec = eec_reco_diag;
 	      }
+	      // Aggregation NN (AGG_NN=on, agg_nn.h): the two candidates the observables use below, for
+	      // the jets the nominal aggregation selects. Kept in the ntuple (cx* branches) as well.
+	      ROOT::Math::PtEtaPhiMVector cand0_rm, cand1_rm;
+	      if (reco_sv_ok) { cand0_rm = reco_sv_rm[0]; cand1_rm = reco_sv_rm[1]; }
+	      if (reco_sv_ok && AggNN::enabled()) {
+	        const AggNN::Result nn = AggNN::run(t, ijet, ient, jpt_reco);
+	        aggRow.cxStatus = nn.status;
+	        if (nn.status >= 0) {
+	          cand0_rm = cand1_rm = ROOT::Math::PtEtaPhiMVector();
+	          for (int k : nn.g1) cand0_rm += recoTrackP4(t, k);
+	          for (int k : nn.g2) cand1_rm += recoTrackP4(t, k);
+	          aggRow.cxPt1 = cand0_rm.Pt(); aggRow.cxEta1 = cand0_rm.Eta(); aggRow.cxPhi1 = cand0_rm.Phi();
+	          aggRow.cxPt2 = cand1_rm.Pt(); aggRow.cxEta2 = cand1_rm.Eta(); aggRow.cxPhi2 = cand1_rm.Phi();
+	        }
+	      }
+	    // Reconstruction-ceiling study (2026-10-21): the same jet's reco tracks aggregated two
+	    // other ways (see the ts*/or* branches). Ntuple only -- no histogram reads these.
+	    if (aggBHadronTree) {
+	      double ts_af = 0., ts_nb = 0., ts_sf = 0., ts_mf = 0.;
+	      const std::vector<ROOT::Math::PtEtaPhiMVector> ts = makeSvtxs(t, ijet, ient, ts_af, ts_nb, ts_sf, ts_mf);
+	      if (ts.size() == 2) {
+	        aggRow.tsPt1 = ts[0].Pt(); aggRow.tsEta1 = ts[0].Eta(); aggRow.tsPhi1 = ts[0].Phi();
+	        aggRow.tsPt2 = ts[1].Pt(); aggRow.tsEta2 = ts[1].Eta(); aggRow.tsPhi2 = ts[1].Phi();
+	      }
+	      if (gen_ok) {
+	        std::vector<ROOT::Math::PtEtaPhiMVector> orc; std::vector<Int_t> orc_sta;
+	        MatchingTracksAggregation(orc, orc_sta, t, ijet, ient);
+	        aggRow.orPt1 = aggRow.orPt2 = 0.;
+	        for (size_t k = 0; k < orc.size(); ++k) {
+	          if (orc_sta[k] == aggRow.genStatus1) { aggRow.orPt1 = orc[k].Pt(); aggRow.orEta1 = orc[k].Eta(); aggRow.orPhi1 = orc[k].Phi(); }
+	          if (orc_sta[k] == aggRow.genStatus2) { aggRow.orPt2 = orc[k].Pt(); aggRow.orEta2 = orc[k].Eta(); aggRow.orPhi2 = orc[k].Phi(); }
+	        }
+	      }
+	      // Aggregation-NN training set: the per-track arrays (see AggBHadronNtupleRow).
+	      aggRow.jtphi = t.jtphi[ijet];
+	      for (Int_t itrk = 0; itrk < t.ntrk; ++itrk) {
+	        if (t.trkJetId[itrk] != ijet || t.trkPt[itrk] < 1) continue;
+	        const Int_t sv = t.trkSvtxId[itrk];
+	        const bool in_sv = (sv >= 0 && sv < t.nsvtx);
+	        aggRow.trk_pt.push_back(t.trkPt[itrk]); aggRow.trk_eta.push_back(t.trkEta[itrk]); aggRow.trk_phi.push_back(t.trkPhi[itrk]);
+	        aggRow.trk_ip3d.push_back(t.trkIp3d[itrk]); aggRow.trk_ip3dsig.push_back(t.trkIp3dSig[itrk]); aggRow.trk_dist.push_back(t.trkDistToAxis[itrk]);
+	        aggRow.trk_bdt.push_back(t.trkBdtScore[itrk]); aggRow.trk_pdg.push_back(t.trkPdgId[itrk]);
+	        aggRow.trk_nomsel.push_back(TrackBdtSF::passes(t.trkBdtScore[itrk], t.trkMatchSta[itrk], sv) ? 1 : 0);
+	        aggRow.trk_svidx.push_back(in_sv ? sv : -1);
+	        aggRow.trk_sv_ntrk.push_back(in_sv ? t.svtxNtrk[sv] : -1);
+	        aggRow.trk_sv_m.push_back(in_sv ? t.svtxm[sv] : -999.f);       aggRow.trk_sv_mcorr.push_back(in_sv ? t.svtxmcorr[sv] : -999.f);
+	        aggRow.trk_sv_pt.push_back(in_sv ? t.svtxpt[sv] : -999.f);     aggRow.trk_sv_dl.push_back(in_sv ? t.svtxdl[sv] : -999.f);
+	        aggRow.trk_sv_dls.push_back(in_sv ? t.svtxdls[sv] : -999.f);   aggRow.trk_sv_dl2d.push_back(in_sv ? t.svtxdl2d[sv] : -999.f);
+	        aggRow.trk_sv_dls2d.push_back(in_sv ? t.svtxdls2d[sv] : -999.f); aggRow.trk_sv_chi2.push_back(in_sv ? t.svtxnormchi2[sv] : -999.f);
+	        const Int_t sta = t.trkMatchSta[itrk];
+	        aggRow.truth_sta.push_back(sta);
+	        aggRow.truth_label.push_back(sta < 100 ? 0 : (gen_ok && sta == aggRow.genStatus1) ? 1 : (gen_ok && sta == aggRow.genStatus2) ? 2 : 3);
+	      }
+	    }
 	    if (aggBHadronTree) aggBHadronTree->Fill();
 	    if (!isCreateRmatrix) continue;
 
-	    // Combined SV-reco + b-tag efficiency: DENOMINATOR = all true 2b jets, before the
-	    // 2-SV cut. Gen-EEC weighted (w_gen), reused for the numerator below.
+	    // Combined SV-reco + b-tag efficiency: DENOMINATOR = all true 2b jets passing the gen
+	    // cuts (gen_kin), before the 2-SV cut. Gen-EEC weighted (w_gen), reused for the numerator below.
 	    double w_gen = gen_ok ? weight_tree * eec_gen : 0.0;
 	    // Gen values in observable order. Reused by every hgenjet_* fill below.
 	    const std::vector<double> xgen_raw = obsValues(dr_gen, B_gen);
-	    if (gen_ok)
+	    // The hgenjet_* fills (SV+b-tag, b-tag and EEC-weight corrections) use the same gen
+	    // cuts as gen_pass below (pT_gen, |eta_gen|, pthat cleaning): they are applied after
+	    // h_full_efficiency, whose result is already restricted to that phase space.
+	    // Changed 2026-10-26; before, these three fills were gated on gen_ok only.
+	    // const bool gen_kin = gen_ok && passGenJetKinematics(t, ijet, cfg);   // until 2026-10-30
+    const bool gen_kin = gen_ok && passGenJetKinematics(t, ijet, cfg) && passDrMinGen(dr_gen);   // + DR_MIN, as gen_pass
+	    // if (gen_ok)
+	    if (gen_kin)
 	      for (size_t io = 0; io < resp.size(); ++io)
 	        if (xgen_raw[io] >= 0.) resp[io].fillGenAll(xgen_raw[io], jpt_gen, w_gen);
+	    // 3D: raw pT (no jtpt_fill), gen threshold 60, and the jet needs BOTH dR and A.
+	    const double pt_gen3d = gen_jet_pt(t, ijet), pt_reco3d = reco_jet_pt(t, ijet);
+	    const bool gen_kin3d = gen_ok && passGenJetKinematics(t, ijet, cfg3d) && dr_gen >= 0. && B_gen >= 0.;
+	    if (gen_kin3d) resp3d.fillGenAll(dr_gen, B_gen, pt_gen3d, w_gen);
 
 	    // Guard the reco pair access: makeSvtxs_withBDT returns an empty vector when the
 	    // jet has < 2 secondary vertices, and reco_sv_rm[0] below would then segfault.
@@ -1981,10 +2253,16 @@ void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, boo
 
       // -- Prepare to Fill Rmatrix --
 		  // -- Reco pair info
-      double mB_reco  = reco_sv_rm[0].M() + reco_sv_rm[1].M();
-      double dr_reco  = t.calc_dr(reco_sv_rm[0].Eta(), reco_sv_rm[0].Phi(), reco_sv_rm[1].Eta(), reco_sv_rm[1].Phi());
-      double eec_reco = EecWeight::value(reco_sv_rm[0].Pt(), reco_sv_rm[1].Pt(), cfg.n);
-      double B_reco = MomBalance::value(reco_sv_rm[0].Pt(), reco_sv_rm[1].Pt());
+      // The candidates: the nominal vertices, or the NN's two clusters with AGG_NN=on (above).
+      // double mB_reco  = reco_sv_rm[0].M() + reco_sv_rm[1].M();
+      // double dr_reco  = t.calc_dr(reco_sv_rm[0].Eta(), reco_sv_rm[0].Phi(), reco_sv_rm[1].Eta(), reco_sv_rm[1].Phi());
+      // double eec_reco = EecWeight::value(reco_sv_rm[0].Pt(), reco_sv_rm[1].Pt(), cfg.n);
+      // double B_reco = MomBalance::value(reco_sv_rm[0].Pt(), reco_sv_rm[1].Pt());
+      double mB_reco  = cand0_rm.M() + cand1_rm.M();
+      if (svSeedNominalM2B()) mB_reco = nominalVertexMass(t, ijet, ient, mB_reco);   // 2026-11-06, as the templates
+      double dr_reco  = t.calc_dr(cand0_rm.Eta(), cand0_rm.Phi(), cand1_rm.Eta(), cand1_rm.Phi());
+      double eec_reco = EecWeight::value(cand0_rm.Pt(), cand1_rm.Pt(), cfg.n);
+      double B_reco = MomBalance::value(cand0_rm.Pt(), cand1_rm.Pt());
       // DISABLED 2026-09-22 with the fraction observables:
       //   double fnb_reco  = NonBFraction::value(reco_sv_rm[0].Pt() + reco_sv_rm[1].Pt(),
       //                                          pt_nonb_reco_rm);
@@ -2001,9 +2279,11 @@ void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, boo
 		  double w_reco = weight_tree * eec_reco * w_svsf;
 
       // Fill total number of True 2b Jets (Deno of b-tagging eff. correction) before b-tagger: simialr axis to what we unfold to. - used after unfolding
-			if (gen_ok)
+			// if (gen_ok)
+			if (gen_kin)
 			  for (size_t io = 0; io < resp.size(); ++io)
 			    if (xgen_raw[io] >= 0.) resp[io].fillGenPreBtag(xgen_raw[io], jpt_gen, w_reco);
+			if (gen_kin3d) resp3d.fillGenPreBtag(dr_gen, B_gen, pt_gen3d, w_reco);
 
 			// -- Use combined b-tagger: Upart tagger + 2SV of aggreagted Bs., for Rmatrix unfolding, purity, reconstruction eff.
 			if (!passBtag(t, ijet, cfg)) continue; // select btagged jets only (reco_sv_ok already required above)
@@ -2012,9 +2292,11 @@ void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, boo
 			// and the combined SV-reco + b-tag efficiency NUMERATOR = 2b jets reconstructed
 			// with 2 SV AND tagged (this point is past both cuts). Same gen-EEC weight as
 			// hgenjet_2b_all.
-			if (gen_ok)
+			// if (gen_ok)
+			if (gen_kin)
 			  for (size_t io = 0; io < resp.size(); ++io)
 			    if (xgen_raw[io] >= 0.) resp[io].fillGenPostBtag(xgen_raw[io], jpt_gen, w_reco, w_gen * w_svsf);
+			if (gen_kin3d) resp3d.fillGenPostBtag(dr_gen, B_gen, pt_gen3d, w_reco, w_gen * w_svsf);
 
 			// DEBUG: reco SV pt vs gen partial-B pt (pt-rank matched), to explain the EEC-weight factor.
 			if (gen_ok) {
@@ -2032,11 +2314,14 @@ void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, boo
                   if (dr_reco_fill >= dr_max) dr_reco_fill = dr_max_fill;
 
             // Define reco_pass: full detector-level selection
-            bool reco_pass = passJetVeto && passRecoJetKinematics(t, ijet, cfg) && dr_reco_fill > 0.005;
+            // bool reco_pass = passJetVeto && passRecoJetKinematics(t, ijet, cfg) && dr_reco_fill > 0.005;   // until 2026-10-30
+            // obsDr().passReco: dr > 0.005, or dr > DR_MIN when set (the same gate as the templates)
+            bool reco_pass = passJetVeto && passRecoJetKinematics(t, ijet, cfg) && obsDr().passReco(dr_reco_fill);
 
             // Define gen_pass: particle-level jet kinematics + gen observable range.
             // Requires gen_ok, so a jet with < 2 gen B-hadrons stays out of num/eff/response.
-            bool gen_pass  = gen_ok && passGenJetKinematics(t, ijet, cfg);
+            // DR_MIN (2026-10-30): the dR cut at gen too (Zoe: cut at reco and gen), for every observable.
+            bool gen_pass  = gen_ok && passGenJetKinematics(t, ijet, cfg) && passDrMinGen(dr_gen);
 
             ++n_weight_checked;
             sum_weight_tree_checked += weight_tree;
@@ -2123,6 +2408,10 @@ void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, boo
                                     has_reco ? o.fill(xreco_raw[io]) : 0., jpt_reco,
                                     has_gen  ? o.fill(xgen_raw[io])  : 0., jpt_gen, w_reco);
             }
+            // 3D: same jet, weight and halves; reco must also sit inside the reco hard edges.
+            const bool reco_pass3d = reco_pass && B_reco >= 0. && u3d_reco_in(dr_reco, pt_reco3d);
+            resp3d.fillResponse(reco_pass3d, gen_kin3d, ient,
+                                dr_reco, B_reco, pt_reco3d, dr_gen, B_gen, pt_gen3d, w_reco);
 
           } // END if MC()
 
@@ -2180,6 +2469,7 @@ void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, boo
     std::cout << "Creating: " << ResponseMatrix_fout_name << std::endl;
     TFile *fout_rm = new TFile(ResponseMatrix_fout_name, "recreate");
     for (const ResponseHistos &r : resp) r.write();
+    resp3d.write();
 
     // Observable-independent debug histograms, written once.
     std::cout << "[EEC-weight debug] mean reco/gen SV pt = " << h_ptratio->GetMean() << std::endl;
@@ -2196,13 +2486,13 @@ if(isMakeTemplates)
 
   // One template set per observable; dr's names are unchanged, B's carry "_B".
   for (const TemplateHistos &h : tmpl) h.write(cfg.dataset.isMC);
+  svDiag.write();
 
   outFile->Close(); delete outFile;
 }
 
 } // end Function
 
-// ---- disabled (kept for reference): filter_b_bb_as_data_and_mc, split-sample variant ----
 #if 0
 void filter_b_bb_as_data_and_mc(const AnalysisConfig& cfg) {
   TString output_hist =  Form("SPLIT_TEST_templatefit_n%d_bjet_Run%d", 1, cfg.dataset.RunN);
@@ -2312,12 +2602,8 @@ void filter_b_bb_as_data_and_mc(const AnalysisConfig& cfg) {
   outFile.Close();
 
 }
-#endif // ---- end disabled: filter_b_bb_as_data_and_mc ----
+#endif 
 
-// NOTE: pT_high (4th) and foldPtOverflow (last) were removed; the upper pT edge lives in
-// jtpt_binsVector in binning_histos_small.h. Old callers must drop the 4th argument.
-// NOTE: dataType (2nd) was removed too — isMC says data vs MC, and sampleTag (last, set by
-// the run scripts) says which sample the output files are named for.
 void create_files_for_template_fit(Int_t RunN = 3, Float_t pT_low = 80, Float_t etaCut = 2, Int_t n = 1,
                                    bool btag = true, bool isMC = true, Double_t btagWP = 0.712, bool makeTemplates = true, bool createRmatrix = true,
                                    bool makeAggNtuple = true, Long64_t ev_first = 0, Long64_t ev_last = -1, const char* inputFileOverride = "", const char* outputFolderOverride = "",
@@ -2331,6 +2617,20 @@ void create_files_for_template_fit(Int_t RunN = 3, Float_t pT_low = 80, Float_t 
  // load at prompt: gSystem->Load("libGenVector");
  // -- test use of central configuration
   AnalysisConfig cfg = buildConfig(RunN, pT_low, etaCut, n, btag, isMC, btagWP, sampleTag);
+  // JET_PT_MAX (env, 2026-10-29): hard upper jet-pT cut at reco and gen (KinematicConfig::ptHigh).
+  // Unset = no cut. The OUT_TAG must then say "ptmax<value>" (checked by the run scripts).
+  if (const char *pm = std::getenv("JET_PT_MAX")) if (std::atof(pm) > 0.) cfg.kin.ptHigh = std::atof(pm);
+  std::cout << "Jet pT upper cut (JET_PT_MAX): " << (cfg.kin.ptHigh > 0. ? Form("%g GeV, reco and gen", cfg.kin.ptHigh) : "none") << std::endl;
+  // DR_MIN (env, 2026-10-30): lower dR cut at reco and gen, a jet selection for every observable
+  // (binning_histos_small.h). It must sit on a dR bin edge, or the new first bin would be cut in two.
+  if (drMinCut() > 0. && std::abs(dr_binsVector[drFirstEdge()] - drMinCut()) > 1e-9) {
+    std::cerr << "FATAL: DR_MIN=" << drMinCut() << " is not a dR bin edge -- refusing" << std::endl;
+    return;
+  }
+  std::cout << "Jet dR lower cut (DR_MIN): " << (drFirstEdge() > 0 ? Form("dR > %g, reco and gen; dR axis %d bins from %g", dr_binsVector[drFirstEdge()], obsDr().nbins, obsDr().bins[0]) : "none (reco dR > 0.005)") << std::endl;
+  { const char *ss = std::getenv("SV_SEED");   // 2026-11-05, see makeSvtxs_withBDT
+    std::cout << "SV seed rule (SV_SEED): " << ((ss && TString(ss) == "on") ? "ON, an SV with a track passing the BDT keeps all its tracks" : "off") << std::endl;
+    std::cout << "m2B from the nominal vertices (SV_SEED_M2B): " << (svSeedNominalM2B() ? "ON" : "off") << std::endl; }
 
 	  if (inputFileOverride && std::string(inputFileOverride).size() > 0) {
 	    cfg.dataset.filename = inputFileOverride;
@@ -2343,20 +2643,11 @@ void create_files_for_template_fit(Int_t RunN = 3, Float_t pT_low = 80, Float_t 
 	  }
 
 	  // ---- Tracking-efficiency systematic ----
-	  // track_eff_unc = false is the nominal and changes nothing. true throws away 3%
-	  // (TrkEffSyst::kDropFraction) of the reconstructed tracks in MC during the B
-	  // reconstruction, chosen per track from a hash of (seed, entry, track index) so
-	  // the same job rerun -- or the same sample re-chunked, or run in parallel instead
-	  // of serially -- drops exactly the same tracks.
-	  // Data is never varied, hence the isMC guard. See tracking_efficiency_syst.h.
+
 	  TrkEffSyst::enable(track_eff_unc, cfg.dataset.isMC, trkSeed);
 	  TrkEffSyst::print();
 
 	  // ---- EEC weight on/off ----
-	  // eec_weight_off = false is the nominal EEC analysis and changes nothing. true drops
-	  // the (pt1*pt2)^n weight everywhere, turning the same chain into a yield measurement
-	  // whose unfolded result is dN/dr. Applies to MC and data alike -- it is the observable,
-	  // not a correction -- so there is no isMC guard here. See EecWeight at the top.
 	  EecWeight::enable(!eec_weight_off);
 	  EecWeight::print();
 
@@ -2365,21 +2656,14 @@ void create_files_for_template_fit(Int_t RunN = 3, Float_t pT_low = 80, Float_t 
 	  Jec::print(cfg.dataset.isMC);
 
 	  // ---- SV b scale factor (see sv_sf.h) ----
-	  // "off" (default) changes nothing. "nominal" weights every b-matched reco SV in MC by
-	  // SF(aggregate pT); "up"/"down" shift that SF by its stat (+) syst uncertainty. Data is
-	  // never weighted, hence the isMC guard inside.
 	  SvSF::enable(sv_sf, cfg.dataset.isMC);
 	  SvSF::print();
 
 	  // ---- Track-BDT efficiency/mistag scale factors ----
-	  // MC uses category-dependent effective working points derived from the measured SFb
-	  // and SFl. "boff" and "loff" independently remove the corresponding correction;
-	  // "off" is the uncorrected cross-check. Data always keeps the nominal 0.365 cut.
 	  TrackBdtSF::enable(track_bdt_sf, cfg.dataset.isMC);
 	  TrackBdtSF::print();
 
 	  // ---- 2024 jet veto map on/off (see the JetVeto namespace at the top) ----
-	  // Run 3 only, as in Matt's version. Data and MC alike.
 	  JetVeto::enable(apply_jetveto && cfg.dataset.RunN == 3);
 	  JetVeto::print();
 

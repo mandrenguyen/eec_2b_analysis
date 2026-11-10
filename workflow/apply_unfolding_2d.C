@@ -2,7 +2,11 @@
 #include "result_paths.h"
 #include "observables.h"   // ObsDef + gFitObs(): which observable is on the second axis   // the ONE definition of every result path and variation tag
 #include <algorithm>
+#include <map>
 #include <vector>
+#include "TRandom3.h"
+#include "TMatrixDSymEigen.h"
+#include "TMatrixDEigen.h"
 
 namespace ROCColor {
   Color_t blue()   { return TColor::GetColor("#4C72B0"); }
@@ -59,6 +63,21 @@ std::vector<TFile *> openAllOrWarn(const std::vector<TString> &names)
 // ONLY count histograms and the response may be summed like this. The pre-divided ratios
 // (h_full_purity_tf, h_full_efficiency_tf, ...) must NOT be: adding N of them gives N x the
 // true value. They are recomputed from the summed counts by ratioFromCounts() below.
+//
+// 2026-10-24 (Zoe): "both" is a WEIGHTED qcd + bjet combination, as in template_fit.cpp. The
+// b-enriched sample's weights are normalised like an inclusive sample (its 2B yield is ~14.5x
+// qcd's), so every bjet file is scaled to qcd's 2B yield (k = S_qcd / S_bjet) and the two are
+// mixed with statistics weights (w_bjet = Neff_bjet / (Neff_qcd + Neff_bjet), w_qcd = 1 - w_bjet).
+// gMixWeight holds the factor per sample directory (QCD, bJet, QCDHerwig, bJetHerwig); a file
+// in none of them, or any single-sample run, gets 1. Set by setMixWeights() below.
+std::map<TString, double> gMixWeight;
+double fileMixWeight(const TFile *f)
+{
+    const TString path = f->GetName();
+    for (const auto &kv : gMixWeight)
+        if (path.Contains("/" + kv.first + "/agg_ntuple_chunks/")) return kv.second;
+    return 1.;
+}
 template <typename T>
 T *sumOverFiles(const std::vector<TFile *> &files, const TString &name)
 {
@@ -66,25 +85,64 @@ T *sumOverFiles(const std::vector<TFile *> &files, const TString &name)
     for (TFile *f : files) {
         T *h = getOrWarn<T>(f, name);
         if (!h) { delete out; return nullptr; }
+        const double w = fileMixWeight(f);
         if (!out) {
             out = (T *) h->Clone(name + "_sum");
             out->SetDirectory(nullptr); // outlives the input files
+            if (w != 1.) out->Scale(w);
         } else {
-            out->Add(h);
+            // out->Add(h);   // until 2026-10-24: raw weights
+            out->Add(h, w);
         }
     }
     if (!out) std::cerr << "ERROR: no input files to sum '" << name << "' from" << std::endl;
     return out;
 }
 
-// RooUnfoldResponse::Add() adds the migration matrix together with the truth and measured
-// projections, which is what keeps the efficiency built into the response consistent.
+RooUnfoldResponse *reweightPrior(const RooUnfoldResponse *r, const TH1 *prior)
+{
+    TH1 *meas  = (TH1 *) r->Hmeasured()->Clone("prior_meas");
+    TH1 *truth = (TH1 *) r->Htruth()->Clone("prior_truth");
+    TH2 *resp  = (TH2 *) r->Hresponse()->Clone("prior_resp");
+    meas->SetDirectory(nullptr); truth->SetDirectory(nullptr); resp->SetDirectory(nullptr);
+    const int nt = r->GetNbinsTruth(), nm = r->GetNbinsMeasured();
+    double sumT = 0., sumP = 0.;
+    for (int j = 0; j < nt; ++j) { sumT += RooUnfoldResponse::GetBinContent(truth, j); sumP += RooUnfoldResponse::GetBinContent(prior, j); }
+    for (int j = 0; j < nt; ++j) {
+        const int gj = RooUnfoldResponse::GetBin(truth, j);
+        const double T = truth->GetBinContent(gj);
+        const double w = (T > 0. && sumP > 0.) ? RooUnfoldResponse::GetBinContent(prior, j) * (sumT / sumP) / T : 1.;
+        for (int i = 0; i < nm; ++i) {
+            const double old = resp->GetBinContent(i + 1, j + 1);
+            const int gi = RooUnfoldResponse::GetBin(meas, i);
+            meas->SetBinContent(gi, meas->GetBinContent(gi) + old * (w - 1.));
+            resp->SetBinContent(i + 1, j + 1, old * w);
+            resp->SetBinError(i + 1, j + 1, resp->GetBinError(i + 1, j + 1) * w);
+        }
+        truth->SetBinContent(gj, T * w);
+        truth->SetBinError(gj, truth->GetBinError(gj) * w);
+    }
+    return new RooUnfoldResponse(meas, truth, resp, TString(r->GetName()) + "_prior", r->GetTitle());
+}
+
+// A response with every histogram scaled by w (the weighted combination above). Built the
+// same way as reweightPrior(): (measured, truth, response), fakes = measured - matched.
+RooUnfoldResponse *scaledResponse(const RooUnfoldResponse *r, double w)
+{
+    TH1 *meas  = (TH1 *) r->Hmeasured()->Clone("mix_meas");  meas->SetDirectory(nullptr);  meas->Scale(w);
+    TH1 *truth = (TH1 *) r->Htruth()->Clone("mix_truth");    truth->SetDirectory(nullptr); truth->Scale(w);
+    TH2 *resp  = (TH2 *) r->Hresponse()->Clone("mix_resp");  resp->SetDirectory(nullptr);  resp->Scale(w);
+    return new RooUnfoldResponse(meas, truth, resp, r->GetName(), r->GetTitle());
+}
+
 RooUnfoldResponse *sumResponseOverFiles(const std::vector<TFile *> &files, const TString &name)
 {
     RooUnfoldResponse *out = nullptr;
     for (TFile *f : files) {
         RooUnfoldResponse *r = getOrWarn<RooUnfoldResponse>(f, name);
         if (!r) { delete out; return nullptr; }
+        const double w = fileMixWeight(f);
+        if (w != 1.) r = scaledResponse(r, w);
         if (!out) {
             out = new RooUnfoldResponse(*r);
             out->SetName(r->GetName());
@@ -131,7 +189,13 @@ TString templateFitFile(const TString &sample, const TString &tfGenerator,
     // Written by template_fit.cpp(SAMPLE, GENERATOR), one directory per combination.
     // Its SAMPLE is qcd | both only -- there is no bjet-only fit, since h3D_0b exists in
     // the qcd sample alone -- so a bjet unfolding takes the qcd fit.
-    const TString tf_sample = (sample == "both") ? "both" : "qcd";
+    // const TString tf_sample = (sample == "both") ? "both" : "qcd";
+    // Diagnostic (2026-10-24): TF_SAMPLE = qcd | both takes the fit of that sample whatever the
+    // response sample is, to separate the two places the bjet sample enters. Unset = as before.
+    // The results path carries it as tfSampleTag() (result_paths.h), so a TF_SAMPLE run cannot
+    // land on the nominal result.
+    const char *tfs = std::getenv("TF_SAMPLE");
+    const TString tf_sample = (tfs && *tfs) ? TString(tfs) : ((sample == "both") ? TString("both") : TString("qcd"));
     // With track_eff_unc the fit itself is redone on the 3%-track-drop templates
     // (template_fit.cpp(SAMPLE, GENERATOR, true)), so the signal fraction moves with the
     // tracking efficiency instead of being held at its nominal value. The data being
@@ -145,9 +209,12 @@ TString templateFitFile(const TString &sample, const TString &tfGenerator,
     // or the B unfolding would read the dR fit's h_sig_fraction_fit -- which has the right
     // NAME and the wrong binning, the quietest possible way to be wrong.
     const TString obs_tag = (observable == "dr") ? "" : ("_" + observable);
+    // TF_METHOD=chi2scan (2026-10-27): template_fit.cpp's chi2-scan fit, same file layout in
+    // "<dir>_chi2scan". Unset = the RooFit directory, as before. tfMethodTag() tags the result.
+    const TString method_dir = (tfMethodTag() == "_tfchi2scan") ? "_chi2scan" : "";
     return "/data_CMS/cms/zaidan/bJetAggRun3/PPRef2024/results/TemplateFit_Run3/TemplateFits_"
          + tf_sample + "_" + tfGenerator + trk_tag + svsfTag() + trackBdtSfTag()
-         + eecw_tag + obs_tag + eraTag() + "/"
+         + eecw_tag + obs_tag + eraTag() + method_dir + "/"
          + tfVariation + "_Run3_TemplateFits_histos_3d_80_inf.root";
 
     /* ---- disabled (kept for reference): Afnan's fits, Pythia8 only ----
@@ -220,6 +287,42 @@ std::vector<TString> aggChunkFiles(const TString &base, const TString &sample,
 }
 
 
+// The weighted qcd + bjet combination (see gMixWeight above), from the SAME numbers as
+// template_fit.cpp: the 2B MC templates (h3D_bb, all bins) of the per-block MCGEN files, whose
+// hadd the fit reads. S = sum of weights, Q = sum of squared weights, Neff = S^2 / Q.
+// Adds the two factors of this generator to gMixWeight; sample != "both" adds nothing.
+bool setMixWeights(const TString &base, const TString &sample, const TString &generator,
+                   const TString &btagTag, const TString &outSuffix, const ObsDef &obs)
+{
+    if (sample != "both") return true;
+    double S[2] = {0., 0.}, Q[2] = {0., 0.};
+    const TString smp[2] = {"qcd", "bjet"};
+    for (int s = 0; s < 2; ++s) {
+        for (int b = 0; b < 50; ++b) {
+            const TString f = aggChunkFile(base, sampleSubdir(smp[s], generator), b, "", smp[s], "MCGEN", btagTag, outSuffix);
+            if (gSystem->AccessPathName(f)) continue;
+            TFile *in = TFile::Open(f);
+            TH1 *h = in ? dynamic_cast<TH1 *>(in->Get(obs.n("h3D_bb"))) : nullptr;
+            if (!h) { std::cerr << "ERROR: no " << obs.n("h3D_bb") << " in " << f << std::endl; return false; }
+            // Cells are 0 .. GetNcells()-1; "<=" read the last one twice (ROOT clamps the index).
+            // for (int i = 0; i <= h->GetNcells(); ++i) { S[s] += h->GetBinContent(i); Q[s] += std::pow(h->GetBinError(i), 2); }   // until 2026-10-26
+            for (int i = 0; i < h->GetNcells(); ++i) { S[s] += h->GetBinContent(i); Q[s] += std::pow(h->GetBinError(i), 2); }
+            in->Close();
+        }
+    }
+    if (S[0] <= 0. || S[1] <= 0. || Q[0] <= 0. || Q[1] <= 0.) {
+        std::cerr << "ERROR: weighted combination: empty 2B templates (qcd " << S[0] << ", bjet " << S[1] << ")" << std::endl;
+        return false;
+    }
+    const double k = S[0] / S[1], nq = S[0] * S[0] / Q[0], nb = S[1] * S[1] / Q[1];
+    const double wb = nb / (nq + nb), wq = 1. - wb;
+    gMixWeight[sampleSubdir("qcd", generator)]  = wq;
+    gMixWeight[sampleSubdir("bjet", generator)] = wb * k;
+    printf("qcd+bjet weighted combination (%s): k = %.5f (bjet 2B / qcd 2B = %.2f), Neff qcd %.0f, bjet %.0f"
+           " -> w_qcd %.4f, w_bjet %.4f (bjet scaled by %.5f)\n", generator.Data(), k, 1. / k, nq, nb, wq, wb, wb * k);
+    return true;
+}
+
 struct RefoldGof {
     double chi2   = 0.;
     int    ndf    = 0;
@@ -229,9 +332,9 @@ struct RefoldGof {
 
 // h_mc_meas (optional, added 2026-10-01): the response's own measured MC distribution. When
 // given, the refolded prediction carries the MC's relative statistical error in each bin, added
-// in quadrature to the data error -- as in CMS-AN-2024-133 (Sec. 5.6/6.6), where the response
-// MC statistics are propagated. Without it (the default) only the data error enters, which is
-// far stricter here: per bin the MC error is 1-2.6x the data's.
+// in quadrature to the data error. Not in CMS-AN-2024-133 (chi2 of refolded vs input data),
+// and not used for the choice since 2026-10-19 (Zoe: wrong); kept as a printed reference.
+// Without it (the default) only the data error enters.
 RefoldGof refoldChi2(const TH2D *h_refolded, const TH2D *h_input,
                      int ix_min, int ix_max, int iy_min, int iy_max,
                      const TH2 *h_mc_meas = nullptr)
@@ -256,6 +359,114 @@ RefoldGof refoldChi2(const TH2D *h_refolded, const TH2D *h_input,
     }
     // ndf = number of bins compared. Refolding is not a fit to the input distribution,
     // so there are no fitted parameters to subtract.
+    if (g.ndf > 0) g.pvalue = TMath::Prob(g.chi2, g.ndf);
+    return g;
+}
+
+RefoldGof refoldChi2Toys(const RooUnfoldResponse *response, const TH2D *h_refolded,
+                         const TH2D *h_input, int niter,
+                         int ix_min, int ix_max, int iy_min, int iy_max,
+                         int n_toys = 1000, UInt_t seed = 20261019,
+                         RefoldGof *g_diag_r = nullptr, RefoldGof *g_cov_dr = nullptr)
+{
+    RefoldGof g;
+    if (!response || !h_refolded || !h_input) return g;
+    std::vector<std::pair<int, int>> bins;
+    for (int iy = iy_min; iy <= iy_max; ++iy)
+        for (int ix = ix_min; ix <= ix_max; ++ix)
+            if (h_input->GetBinContent(ix, iy) != 0. && h_input->GetBinError(ix, iy) > 0.)
+                bins.emplace_back(ix, iy);
+    const int n = (int) bins.size();
+    if (n == 0 || n_toys < n + 3) return g;
+
+    const Bool_t add_dir = TH1::AddDirectoryStatus();
+    TH1::AddDirectory(kFALSE);
+    TRandom3 rng(seed);
+    TH2D *h_toy = (TH2D *) h_input->Clone("h_refold_toy");
+    TVectorD sum(n);
+    TMatrixD sum2(n, n);
+    TVectorD sum_r(n), sum_r2(n);
+    TMatrixD sum_rr(n, n);
+    for (int t = 0; t < n_toys; ++t) {
+        for (const auto &b : bins)
+            h_toy->SetBinContent(b.first, b.second, h_input->GetBinContent(b.first, b.second)
+                                 + rng.Gaus(0., h_input->GetBinError(b.first, b.second)));
+        RooUnfoldBayes unf(response, h_toy, niter);
+        unf.SetVerbose(-1);
+        TH1 *u = unf.Hreco(RooUnfold::kNoError);
+        TH1 *r = response->ApplyToTruth(u, "h_refold_toy_r");
+        TVectorD res(n);
+        for (int k = 0; k < n; ++k) {
+            const double rk = r->GetBinContent(bins[k].first, bins[k].second);
+            res(k) = rk - h_toy->GetBinContent(bins[k].first, bins[k].second);
+            sum_r(k) += rk;
+            sum_r2(k) += rk * rk;
+        }
+        for (int a = 0; a < n; ++a) {
+            const double ra = r->GetBinContent(bins[a].first, bins[a].second);
+            for (int c = 0; c < n; ++c)
+                sum_rr(a, c) += ra * r->GetBinContent(bins[c].first, bins[c].second);
+        }
+        sum += res;
+        for (int a = 0; a < n; ++a)
+            for (int c = 0; c < n; ++c) sum2(a, c) += res(a) * res(c);
+        delete u;
+        delete r;
+    }
+    delete h_toy;
+    TH1::AddDirectory(add_dir);
+
+    if (g_diag_r) {
+        *g_diag_r = RefoldGof();
+        for (int k = 0; k < n; ++k) {
+            const double var_r = (sum_r2(k) - sum_r(k) * sum_r(k) / n_toys) / (n_toys - 1);
+            const double ed = h_input->GetBinError(bins[k].first, bins[k].second);
+            const double pull = (h_refolded->GetBinContent(bins[k].first, bins[k].second)
+                               - h_input->GetBinContent(bins[k].first, bins[k].second))
+                              / std::sqrt(ed * ed + std::max(var_r, 0.));
+            g_diag_r->chi2 += pull * pull;
+            ++g_diag_r->ndf;
+        }
+        g_diag_r->pvalue = TMath::Prob(g_diag_r->chi2, g_diag_r->ndf);
+    }
+    if (g_cov_dr) {
+        *g_cov_dr = RefoldGof();
+        TMatrixDSym W(n);
+        TVectorD delta(n);
+        for (int a = 0; a < n; ++a) {
+            delta(a) = h_refolded->GetBinContent(bins[a].first, bins[a].second)
+                     - h_input->GetBinContent(bins[a].first, bins[a].second);
+            for (int c = 0; c < n; ++c)
+                W(a, c) = (sum_rr(a, c) - sum_r(a) * sum_r(c) / n_toys) / (n_toys - 1);
+            W(a, a) += std::pow(h_input->GetBinError(bins[a].first, bins[a].second), 2);
+        }
+        double det = 0.;
+        W.Invert(&det);
+        if (det > 0.) {
+            g_cov_dr->chi2 = W.Similarity(delta);
+            g_cov_dr->ndf  = n;
+            g_cov_dr->pvalue = TMath::Prob(g_cov_dr->chi2, g_cov_dr->ndf);
+        }
+    }
+
+    TMatrixDSym V(n);
+    for (int a = 0; a < n; ++a)
+        for (int c = 0; c < n; ++c)
+            V(a, c) = (sum2(a, c) - sum(a) * sum(c) / n_toys) / (n_toys - 1);
+    TMatrixDSymEigen eig(V);
+    const TVectorD lam = eig.GetEigenValues();
+    const TMatrixD vec = eig.GetEigenVectors();
+    if (lam(0) <= 0.) return g;
+    for (int k = 0; k < n; ++k) {
+        if (lam(k) <= 1e-10 * lam(0)) continue;
+        double proj = 0.;
+        for (int a = 0; a < n; ++a)
+            proj += vec(a, k) * (h_refolded->GetBinContent(bins[a].first, bins[a].second)
+                               - h_input->GetBinContent(bins[a].first, bins[a].second));
+        g.chi2 += proj * proj / lam(k);
+        ++g.ndf;
+    }
+    g.chi2 *= double(n_toys - g.ndf - 2) / (n_toys - 1);
     if (g.ndf > 0) g.pvalue = TMath::Prob(g.chi2, g.ndf);
     return g;
 }
@@ -358,6 +569,9 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
     std::vector<TString> filenames_response =
         aggChunkFiles(mc_base, sample, generator, "RMatrix_", "", btag_tag, out_tag);
     if (filenames_response.empty()) return;
+    // The weighted qcd + bjet combination, for every sum below (2026-10-24).
+    gMixWeight.clear();
+    if (!setMixWeights(mc_base, sample, generator, btag_tag, out_tag, obs)) return;
 
     /* ---- disabled (kept for reference): response-matrix-only variation ----
     // Took ONLY the migration matrix from the other generator and left the corrections,
@@ -446,8 +660,15 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
     if(test_mode==1)  label += "_split_test";
     if(test_mode==2)  label += "_data";
     if(!apply_purity) label += "_nopurity";
+    // A scan writes its result at the LAST pass (niter_max), not at a chosen niter. Its result
+    // file and the per-pass correction-stage / debug plots carry "_iterative" (2026-10-26), so a
+    // scan can no longer overwrite the fixed-niter run's in the same folder. The scan-only
+    // outputs (iteration PDF/PNGs, refolding and convergence scans) keep `label`: they never
+    // clashed, and stage_final_svsf.sh reads them by that name.
+    const TString out_label = scan_niter ? label + "_iterative" : label;
     TString fout_name;
-    fout_name = folder + "histos_" + label + "_after_unfolding_2D.root";
+    // fout_name = folder + "histos_" + label + "_after_unfolding_2D.root";   // until 2026-10-26
+    fout_name = folder + "histos_" + out_label + "_after_unfolding_2D.root";
 
     // ---------------- Plotting setup ------------
     gSystem->Load("libRooUnfold.so");
@@ -512,13 +733,35 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
     //
     // A zero correction cannot be rescaled: the bin is emptied and counted, and the count is
     // reported. TH2::Divide would also produce 0 there, but silently.
-    auto applyCorrection = [](TH2D *h, const TH2D *corr, bool divide, const char *what) {
-        if (!h || !corr) return;
-        if (corr->GetNbinsX() != h->GetNbinsX() || corr->GetNbinsY() != h->GetNbinsY()) {
+    //
+    // Returns false when it could not apply the correction (missing histogram, other binning),
+    // and every caller then stops: until 2026-10-26 it printed an error and the run went on,
+    // writing a result without that correction.
+    //
+    // Same bin count AND same edges on both axes. dR (9 bins) and A (5) already differ in count,
+    // but two binnings with equal counts and different edges would pass a count-only check.
+    auto sameBinning = [](const TH2 *a, const TH2 *b) -> bool {
+        const TAxis *ax[2] = {a->GetXaxis(), a->GetYaxis()}, *bx[2] = {b->GetXaxis(), b->GetYaxis()};
+        for (int k = 0; k < 2; ++k) {
+            if (ax[k]->GetNbins() != bx[k]->GetNbins()) return false;
+            for (int i = 1; i <= ax[k]->GetNbins() + 1; ++i)   // nbins + 1 = the upper edge
+                if (std::fabs(ax[k]->GetBinLowEdge(i) - bx[k]->GetBinLowEdge(i)) > 1e-9) return false;
+        }
+        return true;
+    };
+    // auto applyCorrection = [](TH2D *h, const TH2D *corr, bool divide, const char *what) {   // until 2026-10-26
+    auto applyCorrection = [&](TH2D *h, const TH2D *corr, bool divide, const char *what) -> bool {
+        if (!h || !corr) {
+            std::cerr << "ERROR: " << what << " is missing -- NOT applied, stopping" << std::endl;
+            return false;
+        }
+        // if (corr->GetNbinsX() != h->GetNbinsX() || corr->GetNbinsY() != h->GetNbinsY()) {   // until 2026-10-26
+        if (!sameBinning(h, corr)) {
             std::cerr << "ERROR: " << what << " has " << corr->GetNbinsX() << "x"
                       << corr->GetNbinsY() << " bins but the data has " << h->GetNbinsX()
-                      << "x" << h->GetNbinsY() << " -- NOT applied" << std::endl;
-            return;
+                      << "x" << h->GetNbinsY() << " (or the edges differ) -- NOT applied, stopping"
+                      << std::endl;
+            return false;
         }
         int n_zero = 0;
         for (int ix = 0; ix <= h->GetNbinsX() + 1; ++ix) {
@@ -540,6 +783,7 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
         if (n_zero) std::cout << " -- WARNING: " << n_zero
                               << " non-empty bin(s) had a zero correction and were emptied";
         std::cout << std::endl;
+        return true;
     };
 
     // ----------- Grab data -----------
@@ -571,7 +815,20 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
         if (!fin_fit) return;
         TH2D *h_sig_fraction = getOrWarn<TH2D>(fin_fit, "h_sig_fraction_fit");
         if (!h_sig_fraction) return;
-        h_data_after_fit->Multiply(h_sig_fraction);
+        // A fit of another observable has the right name and the wrong binning; TH2::Multiply
+        // would print an error and leave the data unscaled. Refuse instead (2026-10-26).
+        if (!sameBinning(h_data_after_fit, h_sig_fraction)) {
+            std::cerr << "ERROR: h_sig_fraction_fit (" << h_sig_fraction->GetNbinsX() << "x"
+                      << h_sig_fraction->GetNbinsY() << ") does not have the data's binning ("
+                      << h_data_after_fit->GetNbinsX() << "x" << h_data_after_fit->GetNbinsY()
+                      << ") in " << fname_fit << std::endl;
+            return;
+        }
+        // h_data_after_fit->Multiply(h_sig_fraction);   // until 2026-10-26: return value unchecked
+        if (!h_data_after_fit->Multiply(h_sig_fraction)) {
+            std::cerr << "ERROR: multiplying by the signal fraction failed" << std::endl;
+            return;
+        }
 
     }
     else {
@@ -594,10 +851,10 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
                   << "result, for comparison only" << std::endl;
     }
     else if (is_data) {
-        const TString sf_hist = sfupartHist(sfupartVariation);
+        const TString sf_hist = sfupartHist(sfupartVariation, observable);
         std::cout << "\t---->Dividing reco data by the UParT SF (" << sfupartVariation
                   << " -> " << sf_hist << ")" << std::endl;
-        TFile *fin_sf = openOrWarn(sfupartFile());
+        TFile *fin_sf = openOrWarn(sfupartFile(observable));
         if (!fin_sf) return;
         TH1D *h_sf = getOrWarn<TH1D>(fin_sf, sf_hist);
         if (!h_sf) return;
@@ -607,7 +864,7 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
         // histogram in the same file. Null for every other variation, and the arithmetic
         // below then reduces to exactly what it was.
         TH1D *h_sf_syst = nullptr;
-        const TString sf_syst_hist = sfupartSystHist(sfupartVariation);
+        const TString sf_syst_hist = sfupartSystHist(sfupartVariation, observable);
         if (sf_syst_hist.Length()) {
             h_sf_syst = getOrWarn<TH1D>(fin_sf, sf_syst_hist);
             if (!h_sf_syst) return;
@@ -671,6 +928,59 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
         // why applying the alternative curve (jpcalib_hf) is not the same thing.
         const double syst_shift = sfupartSystShift(sfupartVariation);
 
+        // The SF of one SF bin, with the stat / JP HF shifts of this variation.
+        auto sfValue = [&](int isf) -> double {
+            return h_sf->GetBinContent(isf) + stat_shift * h_sf->GetBinError(isf)
+                 + (h_sf_syst ? syst_shift * h_sf_syst->GetBinContent(isf) : 0.);
+        };
+        // The SF for analysis bin ix (added 2026-10-21, with the 4-bin A): the average of the SF
+        // bins it overlaps, weighted by the overlap width. An analysis bin inside ONE SF bin (every
+        // dr bin, and the old 5-bin A, which IS the SF binning) gets exactly that bin's SF, as
+        // sfBinFor() gave. A bin straddling two SF bins (4-bin A: 0.625-0.75 spans SF 0.6-0.7 and
+        // 0.7-0.8) gets their mean instead of the one its centre falls in -- by centre, SF bin
+        // 0.7-0.8 was used by no A bin at all. Under/overflow keep the clamped sfBinFor().
+        // SFUPART_SMOOTH=line (2026-10-30, A only, result_paths.h): the per-bin values of THIS
+        // variation fitted by a straight line in A (weights 1/stat error^2 of the SF bins), and every
+        // analysis bin gets the line at its centre (= the line's average over the bin).
+        const bool smoothLine = (sfupartSmoothTag(observable) != "");
+        double lineA = 0., lineB = 0.;
+        if (smoothLine) {
+            double S = 0., Sx = 0., Sy = 0., Sxx = 0., Sxy = 0.;
+            for (int k = 1; k <= h_sf->GetNbinsX(); ++k) {
+                const double e = h_sf->GetBinError(k), w = e > 0. ? 1. / (e * e) : 1.;
+                const double x = h_sf->GetXaxis()->GetBinCenter(k), y = sfValue(k);
+                S += w; Sx += w * x; Sy += w * y; Sxx += w * x * x; Sxy += w * x * y;
+            }
+            lineB = (S * Sxy - Sx * Sy) / (S * Sxx - Sx * Sx);
+            lineA = (Sy - lineB * Sx) / S;
+            printf("\n  UParT SF SMOOTHED (SFUPART_SMOOTH=line): SF(A) = %.5f + %.5f * A; per bin:", lineA, lineB);
+            for (int k = 1; k <= h_sf->GetNbinsX(); ++k)
+                printf("  %.4f->%.4f", sfValue(k), lineA + lineB * h_sf->GetXaxis()->GetBinCenter(k));
+            printf("\n");
+        }
+        auto sfFor = [&](int ix) -> double {
+            if (smoothLine) {
+                const double c = (ix < 1 || ix > nx) ? h_sf->GetXaxis()->GetBinCenter(sfBinFor(ix))
+                                                     : h_data_after_fit->GetXaxis()->GetBinCenter(ix);
+                return lineA + lineB * c;
+            }
+            if (ix < 1 || ix > nx) return sfValue(sfBinFor(ix));
+            const double lo = h_data_after_fit->GetXaxis()->GetBinLowEdge(ix);
+            const double hi = h_data_after_fit->GetXaxis()->GetBinUpEdge(ix);
+            double sum = 0., wsum = 0.;
+            int nover = 0, kover = -1;
+            for (int k = 1; k <= h_sf->GetNbinsX(); ++k) {
+                const double o = std::min(hi, h_sf->GetXaxis()->GetBinUpEdge(k))
+                               - std::max(lo, h_sf->GetXaxis()->GetBinLowEdge(k));
+                if (o <= 0.) continue;
+                sum += o * sfValue(k); wsum += o; ++nover; kover = k;
+            }
+            // Inside ONE SF bin: that bin's SF exactly. (o * SF) / o is not always SF to the last
+            // bit, which moved the dR MI band by 3e-13 relative (2026-10-22 restore check).
+            if (nover == 1) return sfValue(kover);
+            return wsum > 0. ? sum / wsum : sfValue(sfBinFor(ix));
+        };
+
         printf("\n  UParT SF applied bin by bin (reco level, pT bin %d, %s%s%s)\n",
                ibin_pt, kDivideBySF ? "data / SF" : "data * SF",
                stat_shift > 0 ? ", SF shifted UP by its stat error"
@@ -682,10 +992,11 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
         printf("  -------------------------------------------------------------------------------------\n");
 
         for (int ix = 0; ix <= nx + 1; ++ix) {
-            const int  isf = sfBinFor(ix);
-            const double sf = h_sf->GetBinContent(isf)
-                            + stat_shift * h_sf->GetBinError(isf)
-                            + (h_sf_syst ? syst_shift * h_sf_syst->GetBinContent(isf) : 0.);
+            const int  isf = sfBinFor(ix);   // the centre's SF bin, for the printout only
+            // const double sf = h_sf->GetBinContent(isf)
+            //                 + stat_shift * h_sf->GetBinError(isf)
+            //                 + (h_sf_syst ? syst_shift * h_sf_syst->GetBinContent(isf) : 0.);
+            const double sf = sfFor(ix);
             if (sf == 0.) {
                 std::cerr << "ERROR: UParT SF is zero in its bin " << isf << std::endl;
                 return;
@@ -722,13 +1033,20 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
 
 
      //Dimension of the response matrix
-    int dim = bins_pt*bins_dr;
+    // The OBSERVABLE's bin count, not the global dr one (fixed 2026-10-21): bins_dr is dr's 9,
+    // so for A (5 bins) every ibin_dr_max loop ran to 9. The chi2 / bias numbers were unharmed
+    // (ROOT clamps bins 6-9 to the empty overflow), but GetBinUpEdge(9) = 1.4 on the A axis, so
+    // the bottomline ratio pad's unity line and grey band ran past A = 1.
+    // int dim = bins_pt*bins_dr;
+    // int ibin_dr_max = bins_dr;
+    const int bins_obs = obs.nbins;
+    int dim = bins_pt*bins_obs;
     int ibin_dr_min = 1;
-    int ibin_dr_max = bins_dr;
+    int ibin_dr_max = bins_obs;
 
     std::cout << "dim = " << dim << std::endl;
     std::cout << "bins_pt = " << bins_pt << std::endl;
-    std::cout << "bins_dr = " << bins_dr << std::endl;
+    std::cout << "bins (" << obs.name << ") = " << bins_obs << std::endl;
 
     // Note: Result = unfold(raw * purity) * 1 / (efficiency)
     //       fakes are negligible
@@ -757,8 +1075,14 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
         // h_full_efficiency = getOrWarn<TH2D>(fin_unfolding, obs.n("h_full_pseudo_efficiency_tf")); // wrong ratio due to merged files 
         // --- 
 
-        h_full_purity = ratioFromCounts(obs.n("h_full_pseudo_purity_numerator_tf"), obs.n("h_full_pseudo_purity_denominator_tf"), "h_pseudo_purity");
-        h_full_efficiency = ratioFromCounts(obs.n("h_full_pseudo_efficiency_numerator_tf"), obs.n("h_full_pseudo_efficiency_denominator_tf"), "h_pseudo_efficiency");
+        // The third argument is the Divide() OPTION, not a name: "h_pseudo_purity" has no "b", so
+        // these got normal instead of binomial errors (until 2026-10-26). Numerator is a subset of
+        // the denominator, same per-jet weight -> "b". The errors are not used downstream
+        // (applyCorrection treats corrections as exact), so the result does not change.
+        // h_full_purity = ratioFromCounts(obs.n("h_full_pseudo_purity_numerator_tf"), obs.n("h_full_pseudo_purity_denominator_tf"), "h_pseudo_purity");
+        // h_full_efficiency = ratioFromCounts(obs.n("h_full_pseudo_efficiency_numerator_tf"), obs.n("h_full_pseudo_efficiency_denominator_tf"), "h_pseudo_efficiency");
+        h_full_purity = ratioFromCounts(obs.n("h_full_pseudo_purity_numerator_tf"), obs.n("h_full_pseudo_purity_denominator_tf"), "b");
+        h_full_efficiency = ratioFromCounts(obs.n("h_full_pseudo_efficiency_numerator_tf"), obs.n("h_full_pseudo_efficiency_denominator_tf"), "b");
         
         h_mc_reco = sumOverFiles<TH2D>(fin_unfolding, apply_purity ? obs.n("h_full_pseudo_purity_numerator_tf")
                                                                   : obs.n("h_full_pseudo_purity_denominator_tf"));
@@ -771,8 +1095,12 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
         // h_full_efficiency = getOrWarn<TH2D>(fin_unfolding, obs.n("h_full_efficiency_tf")); // wrong ratio due to merged files 
         // --- 
 
-        h_full_purity     = ratioFromCounts(obs.n("h_full_purity_numerator_tf"), obs.n("h_full_purity_denominator_tf"), "h_purity");
-        h_full_efficiency = ratioFromCounts(obs.n("h_full_efficiency_numerator_tf"), obs.n("h_full_efficiency_denominator_tf"), "h_efficiency");
+        // Binomial, as in the split test above (until 2026-10-26 the option was "h_purity" /
+        // "h_efficiency", i.e. normal errors).
+        // h_full_purity     = ratioFromCounts(obs.n("h_full_purity_numerator_tf"), obs.n("h_full_purity_denominator_tf"), "h_purity");
+        // h_full_efficiency = ratioFromCounts(obs.n("h_full_efficiency_numerator_tf"), obs.n("h_full_efficiency_denominator_tf"), "h_efficiency");
+        h_full_purity     = ratioFromCounts(obs.n("h_full_purity_numerator_tf"), obs.n("h_full_purity_denominator_tf"), "b");
+        h_full_efficiency = ratioFromCounts(obs.n("h_full_efficiency_numerator_tf"), obs.n("h_full_efficiency_denominator_tf"), "b");
 
         h_mc_reco = sumOverFiles<TH2D>(fin_unfolding, apply_purity ? obs.n("h_full_purity_numerator_tf")
                                                                   : obs.n("h_full_purity_denominator_tf"));
@@ -781,13 +1109,66 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
     }
     if (!h_full_purity || !h_full_efficiency || !h_mc_reco || !response) return;
 
+    // ---- Unfolding prior from another generator (UNFOLD_PRIOR, priorTag() in result_paths.h) ----
+    // Everything above -- the migrations, purity, efficiency and the corrections after the
+    // unfolding -- stays the unfolding generator's (the detector response). Only the truth the
+    // Bayesian iterations start from is taken from the prior generator's response truth.
+    {
+        const char *pe = std::getenv("UNFOLD_PRIOR");
+        const TString prior_gen = (pe && *pe) ? TString(pe) : TString("");
+        if (prior_gen.Length()) {
+            std::vector<TString> filenames_prior =
+                aggChunkFiles(mc_base, sample, prior_gen, "RMatrix_", "", btag_tag, out_tag);
+            if (!setMixWeights(mc_base, sample, prior_gen, btag_tag, out_tag, obs)) return;   // the prior generator's own mix
+            std::vector<TFile *> fin_prior = openAllOrWarn(filenames_prior);
+            if (fin_prior.empty()) return;
+            RooUnfoldResponse *r_prior = sumResponseOverFiles(fin_prior,
+                obs.n(split_test ? "response_tf_pseudo_full" : "response_tf_full"));
+            if (!r_prior) return;
+            if (r_prior->GetNbinsTruth() != response->GetNbinsTruth()) {
+                std::cerr << "ERROR: prior and response truth binnings differ" << std::endl; return; }
+            std::cout << "\t---->Unfolding prior: the " << prior_gen << " truth (" << filenames_prior.size()
+                      << " files), detector response: " << generator << std::endl;
+            response = reweightPrior(response, r_prior->Htruth());
+        }
+    }
+
 
 
     // ---- Print condition number
-    TDecompSVD *svd= new TDecompSVD(response->Mresponse());  // response is a RooUnfold response object, svd is the singular value decomposition (SVD) matrix. the response->Mresponse() returns the normalized migration matrix
+    // TDecompSVD *svd= new TDecompSVD(response->Mresponse());  // response is a RooUnfold response object, svd is the singular value decomposition (SVD) matrix. the response->Mresponse() returns the normalized migration matrix
+    // 2026-10-29: the response can be non-square (JET_PT_MAX: a gen overflow bin, more truth than reco
+    // bins); TDecompSVD needs rows >= columns, and the transpose has the same singular values.
+    const TMatrixD &m_resp = response->Mresponse();
+    const bool resp_square = (m_resp.GetNrows() == m_resp.GetNcols());
+    TDecompSVD *svd = (m_resp.GetNrows() >= m_resp.GetNcols()) ? new TDecompSVD(m_resp)
+                                                               : new TDecompSVD(TMatrixD(TMatrixD::kTransposed, m_resp));
     auto singular_values = svd->GetSig(); //this is a vector with the singular values, i.e., the diagonal elements of S. They are ordered from largest to smallest.
-    double cond_number = singular_values.Max() / singular_values.Min();
+    // double cond_number = singular_values.Max() / singular_values.Min();   // until 2026-10-26
+    // CMS-SMP-22-007 Sec. 5 (2026-10-26): largest over smallest NONZERO value of the probability
+    // matrix -- Mresponse(), whose columns (truth bins) sum to 1 over the detector bins here, since
+    // the response has no misses. An empty truth bin gives a zero, which is now skipped instead of
+    // making the number infinite. The paper says "eigenvalues"; the matrix is not symmetric, so the
+    // eigenvalue version (moduli of the complex eigenvalues) is printed next to the singular-value
+    // one, which stays on the plots until the authors say which they meant.
+    double sv_max = singular_values.Max(), sv_min = 0.;
+    for (int k = 0; k < singular_values.GetNrows(); ++k) {
+        const double s = singular_values(k);
+        if (s > 1e-12 * sv_max && (sv_min == 0. || s < sv_min)) sv_min = s;
+    }
+    const double cond_number = sv_min > 0. ? sv_max / sv_min : -1.;
+    double ev_max = 0., ev_min = 0.;
+    if (resp_square) {   // eigenvalues exist only for a square matrix (2026-10-29)
+        TMatrixDEigen eig(response->Mresponse());
+        const TVectorD re = eig.GetEigenValuesRe(), im = eig.GetEigenValuesIm();
+        for (int k = 0; k < re.GetNrows(); ++k) ev_max = std::max(ev_max, std::hypot(re(k), im(k)));
+        for (int k = 0; k < re.GetNrows(); ++k) {
+            const double m = std::hypot(re(k), im(k));
+            if (m > 1e-12 * ev_max && (ev_min == 0. || m < ev_min)) ev_min = m;
+        }
+    }
     std::cout << "\t---->Condition number nominal = " << cond_number
+              << "  (singular values; eigenvalue moduli: " << (ev_min > 0. ? ev_max / ev_min : -1.) << ")"
               << std::endl;
 
     // ---- Grab the truth level MC ----
@@ -827,7 +1208,8 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
     //------- Apply purity correction
     TH2D *h_data_purity_corrected = (TH2D *) h_data_after_fit->Clone("h_data_purity_corrected");
     if (apply_purity) {
-        applyCorrection(h_data_purity_corrected, h_full_purity, /*divide=*/false, "purity");
+        // applyCorrection(h_data_purity_corrected, h_full_purity, /*divide=*/false, "purity");   // until 2026-10-26
+        if (!applyCorrection(h_data_purity_corrected, h_full_purity, /*divide=*/false, "purity")) return;
     } else {
         std::cout << "\t---->NOT multiplying data by purity" << std::endl;
     }
@@ -845,9 +1227,20 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
     TString iter_pdf = folder + "bayesian_unfolding_iterations_" + label + ".pdf";  // multi-page PDF of all iterations
     TString png_dir  = folder + "bayesian_unfolding_iterations_" + label + "_png/"; // one PNG per iteration lands here
     if (scan_niter) gSystem->mkdir(png_dir, kTRUE);                     // create the PNG folder if it does not exist
+    // 2026-11-04: a shorter scan left the pages of a longer one behind (dR 51..200 of 10-28 next to 1..50), and they were staged
+    if (scan_niter) gSystem->Exec("rm -f " + png_dir + "iteration_*.png");
     const int niter_min = 0;
     // 1..100 since 2026-10-01 (was 1..50): B does not reach a refolding p of 0.95 by 50.
-    const int niter_max = scan_niter ? 99 : 0;   // scan niter = 1..niter_max+1; one pass when not scanning
+    // const int niter_max = scan_niter ? 99 : 0;   // scan niter = 1..niter_max+1; one pass when not scanning
+    // const int niter_max = scan_niter ? 199 : 0;   // 1..200 since 2026-10-19 (Zoe)
+    // SCAN_NITER_MAX=N (env, 2026-10-22) scans 1..N instead, e.g. 150 for the talk plots.
+    // Unset = 200, as before. Only the range changes: the choice is the FIRST p > 0.05
+    // (CMS-SMP-22-007, since 2026-10-26; the first p >= 0.95 before).
+    const char *scan_max_env = std::getenv("SCAN_NITER_MAX");
+    // const int niter_max = scan_niter ? ((scan_max_env && std::atoi(scan_max_env) > 0) ? std::atoi(scan_max_env) - 1 : 199) : 0;
+    // 2026-10-28 (Zoe): dR scans 1..50 by default (its niter is 16), A keeps 1..200 (126); env still wins.
+    const int scan_default = (obs.name == "dr") ? 50 : 200;
+    const int niter_max = scan_niter ? ((scan_max_env && std::atoi(scan_max_env) > 0) ? std::atoi(scan_max_env) - 1 : scan_default - 1) : 0;
     const Int_t prev_ignore = gErrorIgnoreLevel;
     if (scan_niter) gErrorIgnoreLevel = kError;  // silence "Replacing existing histogram" spam from re-cloning each pass
 
@@ -859,10 +1252,17 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
     std::vector<double> v_niter, v_pvalue_all, v_pvalue_pt, v_chi2ndf_all, v_chi2ndf_pt;
     // The same test with the response MC statistics included (see refoldChi2).
     std::vector<double> v_pvalue_all_mc, v_chi2ndf_all_mc;
+    std::vector<double> v_pvalue_all_cov, v_chi2ndf_all_cov;
+    std::vector<double> v_pvalue_all_r, v_chi2ndf_all_r;
+    std::vector<double> v_pvalue_all_rcov, v_chi2ndf_all_rcov;
     const TH2 *h_mc_meas_gof = dynamic_cast<const TH2 *>(response->Hmeasured());
     // The unfolded result in the measured pT bin at every iteration (scan only), for the
     // bias-vs-variance choice of niter after the loop (see "Bias vs statistical error" below).
     std::vector<TH1D *> v_unf_pt;
+    std::vector<TH1D *> v_fc_pt;   // the fully corrected result (SFs, efficiencies) per iteration, for the iteration test
+    // chi2 bottom-line test per iteration (2026-10-29, Zoe, AN Fig. 68): unfolded data vs gen MC, reco data vs reco MC
+    std::vector<double> v_bl_unf, v_bl_reco;
+    TMatrixD cov_unf_now;   // covariance of the unfolded result at the current iteration (scan only)
 
     for (int iter = niter_min; iter <= niter_max; ++iter) {
 
@@ -872,7 +1272,8 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
     // found with scan_niter=true first. For the balance the scan says 21-26; 7 refolds at
     // chi2/ndf = 16 (p = 2e-29), i.e. badly under-iterated and still close to the prior.
     //
-    // ⚠️ A scan_niter run WRITES THE LAST PASS (niter = 100), not the optimum it reports. Use
+    // ⚠️ A scan_niter run WRITES THE LAST PASS (niter_max + 1, 200 unless SCAN_NITER_MAX), not
+    // the optimum it reports -- to the "_iterative" file (out_label), never the fixed run's. Use
     // the scan to find the number, then re-run with scan_niter=false and niter_fixed set.
     const Int_t niter_now = scan_niter ? iter + 1 : niter_fixed;
 
@@ -899,14 +1300,24 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
         // Clone before `unfold` leaves scope: some RooUnfold versions hand back a cached
         // histogram that the unfolder owns and deletes with itself.
         h_data_unfolded = (TH2D *) unfold.Hreco(errorTreatment)->Clone("h_data_unfolded");
+        if (scan_niter) {   // for the chi2 bottom-line test (resize first: TMatrixD::operator= needs equal shapes)
+            const TMatrixD e = unfold.Ereco(RooUnfold::kCovariance);
+            cov_unf_now.ResizeTo(e); cov_unf_now = e;
+        }
         // covariance_matrix_before_unfolding = unfold.GetMeasuredCov();
         // covariance_matrix_after_unfolding = unfold.Ereco();
-    } else {
+    }
+    /* ---- disabled 2026-10-27 (kept for reference): matrix inversion ----
+    // Moving to a 3D (jet pT, dR, A) Bayesian unfolding with a NON-SQUARE response that keeps
+    // the under/overflow bins. RooUnfoldInvert needs a square, invertible matrix, so it has no
+    // place there; unfoldBayes = false is refused in apply_unfolding_2d() instead.
+    else {
         RooUnfoldInvert unfold(response, h_data_purity_corrected);
         h_data_unfolded = (TH2D *) unfold.Hreco(errorTreatment)->Clone("h_data_unfolded");
         // covariance_matrix_before_unfolding = unfold.GetMeasuredCov();
         // covariance_matrix_after_unfolding = unfold.Ereco();
     }
+    ---- end disabled ---- */
 
     // ---- Fold back
     std::cout << "\t---->Refolding" << std::endl;
@@ -945,6 +1356,24 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
         std::cout << Form("\t---->Refolding GoF, data (+) MC stat | 2D: chi2/ndf = %8.2f/%3d = %6.3f, p = %8.3e",
                           gof_mc.chi2, gof_mc.ndf, gof_mc.chi2ndf(), gof_mc.pvalue) << std::endl;
     }
+    if (unfoldBayes) {
+        RefoldGof gof_r, gof_rcov;
+        const RefoldGof gof_cov = refoldChi2Toys(response, h_data_refolded, h_data_purity_corrected,
+                                                 niter_now, ibin_dr_min, ibin_dr_max, 1, bins_pt,
+                                                 1000, 20261019, &gof_r, &gof_rcov);
+        v_pvalue_all_rcov.push_back(gof_rcov.pvalue);
+        v_chi2ndf_all_rcov.push_back(gof_rcov.chi2ndf());
+        std::cout << Form("\t---->Refolding GoF, data (+) refolded stat, full cov | 2D: chi2/ndf = %8.2f/%3d = %6.3f, p = %8.3e",
+                          gof_rcov.chi2, gof_rcov.ndf, gof_rcov.chi2ndf(), gof_rcov.pvalue) << std::endl;
+        v_pvalue_all_cov.push_back(gof_cov.pvalue);
+        v_chi2ndf_all_cov.push_back(gof_cov.chi2ndf());
+        v_pvalue_all_r.push_back(gof_r.pvalue);
+        v_chi2ndf_all_r.push_back(gof_r.chi2ndf());
+        std::cout << Form("\t---->Refolding GoF, data (+) refolded stat | 2D: chi2/ndf = %8.2f/%3d = %6.3f, p = %8.3e",
+                          gof_r.chi2, gof_r.ndf, gof_r.chi2ndf(), gof_r.pvalue) << std::endl;
+        std::cout << Form("\t---->Refolding GoF, cov(r - d) toys, data stat | 2D: chi2/ndf = %8.2f/%3d = %6.3f, p = %8.3e",
+                          gof_cov.chi2, gof_cov.ndf, gof_cov.chi2ndf(), gof_cov.pvalue) << std::endl;
+    }
     if (scan_niter) {
         // x is dr, y is pt: the measured pT bin, with the covariance-based errors of Hreco.
         TH1D *u = h_data_unfolded->ProjectionX(Form("h_unf_pt_it%d", (int) niter_now),
@@ -955,8 +1384,10 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
 
     // ---- Apply efficiency correction
     TH2D *h_data_efficiency_corrected = (TH2D *) h_data_unfolded->Clone("h_data_efficiency_corrected");
-    applyCorrection(h_data_efficiency_corrected, h_full_efficiency, /*divide=*/true,
-                    "reconstruction efficiency");
+    // applyCorrection(h_data_efficiency_corrected, h_full_efficiency, /*divide=*/true,
+    //                 "reconstruction efficiency");   // until 2026-10-26: result written anyway on failure
+    if (!applyCorrection(h_data_efficiency_corrected, h_full_efficiency, /*divide=*/true,
+                         "reconstruction efficiency")) { gErrorIgnoreLevel = prev_ignore; return; }
 
     // ---- Final corrections
     TH2D *h_data_fully_corrected = (TH2D *) h_data_efficiency_corrected->Clone("h_data_fully_corrected");
@@ -968,11 +1399,13 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
     // Skipped in closure modes (0/1), whose truth targets live at the 2SV+btag level.
     if (test_mode == 2) {
         TH2D *h_svbtag_eff = ratioFromCounts(obs.n("hgenjet_2b_reco_btag"), obs.n("hgenjet_2b_all"), "b");
-        if (h_svbtag_eff) {
-            // systematic hook: scale h_svbtag_eff by the CMS b-tag SF map here, then vary SF +/-.
-            applyCorrection(h_data_fully_corrected, h_svbtag_eff, /*divide=*/true,
-                            "combined SV-reco + b-tag efficiency");
-        }
+        // if (h_svbtag_eff) {   // until 2026-10-26: a missing correction was skipped and the result written
+        //     applyCorrection(h_data_fully_corrected, h_svbtag_eff, /*divide=*/true,
+        //                     "combined SV-reco + b-tag efficiency");
+        // }
+        // systematic hook: scale h_svbtag_eff by the CMS b-tag SF map here, then vary SF +/-.
+        if (!applyCorrection(h_data_fully_corrected, h_svbtag_eff, /*divide=*/true,
+                             "combined SV-reco + b-tag efficiency")) { gErrorIgnoreLevel = prev_ignore; return; }
         // EEC-weight correction: convert the reco-EEC-weighted result to gen-EEC-weighted.
         // r_eec = sum(eec_gen)/sum(eec_reco) over reconstructed 2b jets -> MULTIPLY.
         //
@@ -988,13 +1421,65 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
                                ? nullptr
                                : ratioFromCounts(obs.n("hgenjet_2b_reco_btag"),
                                                  obs.n("hgenjet_2b_passbtag"), "");
-        if (h_eec_weight_eff) {
-            applyCorrection(h_data_fully_corrected, h_eec_weight_eff, /*divide=*/false,
-                            "EEC-weight (reco->gen) correction");
-        } else if (eec_weight_off) {
+        // if (h_eec_weight_eff) {   // until 2026-10-26: a missing EEC-weight correction was skipped silently
+        //     applyCorrection(h_data_fully_corrected, h_eec_weight_eff, /*divide=*/false,
+        //                     "EEC-weight (reco->gen) correction");
+        // } else if (eec_weight_off) {
+        if (!eec_weight_off) {
+            if (!applyCorrection(h_data_fully_corrected, h_eec_weight_eff, /*divide=*/false,
+                                 "EEC-weight (reco->gen) correction")) { gErrorIgnoreLevel = prev_ignore; return; }
+        } else {
             std::cout << "\t---->No EEC-weight correction: the weight is off, this is a yield"
                       << std::endl;
         }
+    }
+    // ---- chi2 bottom-line test (2026-10-29, Zoe; AN Fig. 68) in the measured pT bin ----
+    // chi2_unf  = (u - s g)^T V^-1 (u - s g): u = fully corrected data, V = the unfolding covariance
+    //             propagated through the per-bin corrections (c_i c_j V_ij, c = corrected / unfolded)
+    //             + the gen-MC stat on the diagonal; g = gen MC scaled to the data integral (s).
+    // chi2_reco = sum (r - s' m)^2 / (sr^2 + s'^2 sm^2): r = reco data (purity-corrected, the unfolding
+    //             input), m = matched reco MC scaled to r. Shapes only: both MC are scaled to the data.
+    // The test passes when chi2_unf <= chi2_reco (the unfolding does not create (dis)agreement).
+    if (scan_niter && h_mc_true && h_mc_reco && cov_unf_now.GetNrows() > 0) {
+        const int nb = ibin_dr_max - ibin_dr_min + 1, nxu = h_data_unfolded->GetNbinsX();
+        double su = 0., sg = 0., sr = 0., sm = 0.;
+        for (int i = ibin_dr_min; i <= ibin_dr_max; ++i) {
+            su += h_data_fully_corrected->GetBinContent(i, ibin_pt); sg += h_mc_true->GetBinContent(i, ibin_pt);
+            sr += h_data_purity_corrected->GetBinContent(i, ibin_pt); sm += h_mc_reco->GetBinContent(i, ibin_pt);
+        }
+        const double s_g = sg > 0. ? su / sg : 0., s_m = sm > 0. ? sr / sm : 0.;
+        TMatrixD V(nb, nb); TVectorD d(nb);
+        for (int a = 0; a < nb; ++a) {
+            const int i = ibin_dr_min + a;
+            const double ua = h_data_unfolded->GetBinContent(i, ibin_pt);
+            const double ca = ua != 0. ? h_data_fully_corrected->GetBinContent(i, ibin_pt) / ua : 0.;
+            d[a] = h_data_fully_corrected->GetBinContent(i, ibin_pt) - s_g * h_mc_true->GetBinContent(i, ibin_pt);
+            for (int b = 0; b < nb; ++b) {
+                const int j = ibin_dr_min + b;
+                const double ub = h_data_unfolded->GetBinContent(j, ibin_pt);
+                const double cb = ub != 0. ? h_data_fully_corrected->GetBinContent(j, ibin_pt) / ub : 0.;
+                V(a, b) = ca * cb * cov_unf_now((i - 1) + nxu * (ibin_pt - 1), (j - 1) + nxu * (ibin_pt - 1));
+            }
+            V(a, a) += std::pow(s_g * h_mc_true->GetBinError(i, ibin_pt), 2);
+        }
+        double chi2_unf = -1.;
+        TDecompSVD svd(V);
+        if (svd.Decompose()) { TVectorD x = d; Bool_t ok = kFALSE; x = svd.Solve(x, ok); if (ok) chi2_unf = d * x; }
+        double chi2_reco = 0.;
+        for (int i = ibin_dr_min; i <= ibin_dr_max; ++i) {
+            const double r = h_data_purity_corrected->GetBinContent(i, ibin_pt), m = h_mc_reco->GetBinContent(i, ibin_pt);
+            const double v = std::pow(h_data_purity_corrected->GetBinError(i, ibin_pt), 2) + std::pow(s_m * h_mc_reco->GetBinError(i, ibin_pt), 2);
+            if (v > 0.) chi2_reco += std::pow(r - s_m * m, 2) / v;
+        }
+        v_bl_unf.push_back(chi2_unf); v_bl_reco.push_back(chi2_reco);
+        std::cout << Form("\t---->Bottom-line chi2 (pT bin %d, %d bins): unfolded vs gen %.2f, reco vs reco MC %.2f, ratio %.3f",
+                          ibin_pt, nb, chi2_unf, chi2_reco, chi2_reco > 0. ? chi2_unf / chi2_reco : -1.) << std::endl;
+    }
+
+    if (scan_niter) {   // 2026-10-28 (Zoe): the iteration test on the nominal result, SFs applied
+        TH1D *u = h_data_fully_corrected->ProjectionX(Form("h_fc_pt_it%d", (int) niter_now), ibin_pt, ibin_pt, "e");
+        u->SetDirectory(nullptr);
+        v_fc_pt.push_back(u);
     }
 
 
@@ -1145,8 +1630,9 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
         TLegend *lg = new TLegend(0.17, 0.60, 0.60, 0.85);
         lg->SetFillStyle(0); lg->SetBorderSize(0); lg->SetMargin(0.15);
         lg->SetTextFont(font_code); lg->SetTextSize(legend_size * 0.8);
-        lg->SetHeader(pthi == jtpt_max ? Form("p_{T}^{jet} > %.0f GeV", ptlo)
-                                       : Form("%.0f < p_{T}^{jet} < %.0f GeV", ptlo, pthi));
+        // lg->SetHeader(pthi == jtpt_max ? Form("p_{T}^{jet} > %.0f GeV", ptlo)
+        //                                : Form("%.0f < p_{T}^{jet} < %.0f GeV", ptlo, pthi));
+        lg->SetHeader(jetPtRangeLabel(ptlo, pthi));
         lg->AddEntry(p_base,   "after unfolding",            "pe1");
         lg->AddEntry(p_2sv,    "+ 2SV eff.",                 "pe1");
         lg->AddEntry(p_svbtag, "+ 2SV + b-tag eff.",         "pe1");
@@ -1203,7 +1689,8 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
         pad_ratio->RedrawAxis();
 
         // Suffix so the normalised and absolute versions do not overwrite each other.
-        TString cmp_stem = folder + "correction_stages_" + label + Form("_pt%d", ibin_pt)
+        // TString cmp_stem = folder + "correction_stages_" + label + Form("_pt%d", ibin_pt)   // until 2026-10-26
+        TString cmp_stem = folder + "correction_stages_" + out_label + Form("_pt%d", ibin_pt)
                          + (normalise_corr_stages ? "_norm" : "");
         c_cmp->Print(cmp_stem + ".pdf");
         c_cmp->Print(cmp_stem + ".png");
@@ -1240,8 +1727,10 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
             TLatex cmsd; cmsd.SetNDC();
             cmsd.SetTextFont(62); cmsd.SetTextSize(0.042); cmsd.DrawLatex(0.13, 0.945, "CMS");
             cmsd.SetTextFont(52); cmsd.SetTextSize(0.034); cmsd.DrawLatex(0.235, 0.945, "Work In Progress");
-            c_dbg->Print(folder + "debug_svpt_vs_bpt_" + label + ".pdf");
-            c_dbg->Print(folder + "debug_svpt_vs_bpt_" + label + ".png");
+            // c_dbg->Print(folder + "debug_svpt_vs_bpt_" + label + ".pdf");   // until 2026-10-26
+            // c_dbg->Print(folder + "debug_svpt_vs_bpt_" + label + ".png");
+            c_dbg->Print(folder + "debug_svpt_vs_bpt_" + out_label + ".pdf");
+            c_dbg->Print(folder + "debug_svpt_vs_bpt_" + out_label + ".png");
         }
     }
 
@@ -1298,9 +1787,10 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
         leg->SetTextSize(legend_size);
         // The last pT bin is open-ended (jets above jtpt_max are folded into it by
         // jtpt_fill()), so quote it as a threshold rather than a closed range.
-        leg->SetHeader(pt_max_plot == jtpt_max
-                       ? Form("p_{T}^{jet} > %.0f GeV", pt_min_plot)
-                       : Form("%.0f < p_{T}^{jet} < %.0f GeV", pt_min_plot, pt_max_plot));
+        // leg->SetHeader(pt_max_plot == jtpt_max
+        //                ? Form("p_{T}^{jet} > %.0f GeV", pt_min_plot)
+        //                : Form("%.0f < p_{T}^{jet} < %.0f GeV", pt_min_plot, pt_max_plot));
+        leg->SetHeader(jetPtRangeLabel(pt_min_plot, pt_max_plot));
 
         // Name every curve by what it is and, in the split test, WHICH HALF it came from.
         // The halves are not interchangeable and the plot has to say which is which:
@@ -1741,27 +2231,72 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
                   << "  input   : h_data_purity_corrected (reconstructed level)\n"
                   << "  refolded: response->ApplyToTruth(unfolded)\n"
                   << Form("  criterion: smallest niter with p >= %.3f\n", pvalue_threshold);
-        std::cout << Form("  %6s  %12s %10s   %12s %10s   %14s %10s\n",
+        std::cout << Form("  %6s  %12s %10s   %12s %10s   %14s %10s   %14s %10s   %14s %10s   %14s %10s\n",
                           "niter", "chi2/ndf 2D", "p 2D", "chi2/ndf pT", "p pT",
-                          "chi2/ndf 2D+MC", "p 2D+MC");
+                          "chi2/ndf 2D+MC", "p 2D+MC", "chi2/ndf cov", "p cov",
+                          "chi2/ndf 2D+r", "p 2D+r", "chi2/ndf 2D+Vr", "p 2D+Vr");
         for (size_t i = 0; i < v_niter.size(); ++i)
-            std::cout << Form("  %6.0f  %12.3f %10.3e   %12.3f %10.3e   %14.3f %10.3e\n",
+            std::cout << Form("  %6.0f  %12.3f %10.3e   %12.3f %10.3e   %14.3f %10.3e   %14.3f %10.3e   %14.3f %10.3e   %14.3f %10.3e\n",
                               v_niter[i], v_chi2ndf_all[i], v_pvalue_all[i],
                               v_chi2ndf_pt[i], v_pvalue_pt[i],
-                              v_chi2ndf_all_mc[i], v_pvalue_all_mc[i]);
-        // CMS-AN-2024-133 rule: first iteration with p >= 0.95, with the MC statistics included.
+                              v_chi2ndf_all_mc[i], v_pvalue_all_mc[i],
+                              v_chi2ndf_all_cov[i], v_pvalue_all_cov[i],
+                              v_chi2ndf_all_r[i], v_pvalue_all_r[i],
+                              v_chi2ndf_all_rcov[i], v_pvalue_all_rcov[i]);
+        // CMS-AN-2024-133 rule: first iteration with p >= 0.95, data (+) refolded stat, uncorrelated.
         auto firstAboveT = [&](const std::vector<double> &p, double t) -> int {
             for (size_t i = 0; i < p.size(); ++i) if (p[i] >= t) return (int) v_niter[i];
             return -1;
         };
-        // THE CHOICE (Zoe, 2026-10-02), as in CMS-AN-2024-133 Sec. 5.6/6: the first iteration whose
-        // refolded distribution reaches p >= 0.95 against the input, with the data and the response
-        // MC statistical errors combined. The analysis driver reads the OPTIMAL line below.
+        // SUPERSEDED 2026-10-26 by CMS-SMP-22-007 (below). Was THE CHOICE (Zoe, 2026-10-19),
+        // CMS-AN-2024-133 Sec. 5.6/6: the first iteration whose
+        // refolded distribution reaches p >= 0.95 against the input, per-bin error
+        // sigma_d (+) sigma_r -- sigma_r the spread of the refolded result in data-only toys
+        // (refoldChi2Toys), taken as uncorrelated with d. No response MC stat (until 10-19 it was
+        // added -- Zoe: wrong). The analysis driver reads the OPTIMAL line below.
+        // const double an_threshold = 0.95;
+        // const int best_an = firstAboveT(v_pvalue_all_mc, an_threshold);
+        // const int best_an = firstAboveT(v_pvalue_all, an_threshold);
+        // const int best_an = firstAboveT(v_pvalue_all_r, an_threshold);   // 10-19 .. 10-26
+        //
+        // THE CHOICE since 2026-10-26 (Zoe): CMS-SMP-22-007 (JHEP 05 (2024) 116), Sec. 5 -- stop at
+        // the first iteration whose forward-folded distribution has p ABOVE 0.05 against the
+        // measured one, using the detector-level DATA statistical covariance only. Ours is
+        // diagonal: one entry per jet per observable, and every correction before the unfolding
+        // acts per bin, so the data bins are uncorrelated -- that is v_pvalue_all (refoldChi2
+        // without the MC term), over the full 2D (observable x jet pT) space that is unfolded.
+        // The AN-2024-133 rule is still printed below as a cross-check.
+        // const double an_threshold = 0.05;
+        // int best_an = -1;
+        // for (size_t i = 0; i < v_pvalue_all.size(); ++i)
+        //     if (v_pvalue_all[i] > an_threshold) { best_an = (int) v_niter[i]; break; }   // CMS-SMP-22-007, 10-26 only
+        //
+        // THE CHOICE since 2026-10-26 evening (Zoe): CMS-AN-2024-133 (v8, Baldenegro, Cunqueiro,
+        // Mijuskovic, Vladimirov) Sec. 5.6 / 6 -- the first iteration whose refolded distribution
+        // reaches p >= 0.95 against the input. The AN does not say which errors enter the chi2;
+        // data statistics only (v_pvalue_all), as in CMS-SMP-22-007 from the same group. One niter
+        // for every variation for now (the AN re-chooses it per systematic, Table 3 -- not done).
+        // The CMS-SMP-22-007 rule (first p > 0.05) is printed below as a cross-check.
         const double an_threshold = 0.95;
-        const int best_an = firstAboveT(v_pvalue_all_mc, an_threshold);
-        std::cout << Form("  ----> first p >= 0.95, data stat only       = %d\n", firstAboveT(v_pvalue_all, 0.95))
+        const int best_an = firstAboveT(v_pvalue_all, an_threshold);
+        int best_smp = -1;
+        for (size_t i = 0; i < v_pvalue_all.size(); ++i)
+            if (v_pvalue_all[i] > 0.05) { best_smp = (int) v_niter[i]; break; }
+        std::cout << Form("  ----> first p >= 0.95, data (+) refolded stat, full cov = %d\n", firstAboveT(v_pvalue_all_rcov, 0.95))
+                  << Form("  ----> first p >= 0.95, data (+) refolded stat = %d\n", firstAboveT(v_pvalue_all_r, 0.95))
+                  << Form("  ----> first p >= 0.95, cov(r - d) toys, data stat = %d\n", firstAboveT(v_pvalue_all_cov, 0.95))
+                  << Form("  ----> first p >= 0.05, cov(r - d) toys, data stat = %d\n", firstAboveT(v_pvalue_all_cov, 0.05))
+                  << Form("  ----> first p >= 0.95, data stat only       = %d\n", firstAboveT(v_pvalue_all, 0.95))
                   << Form("  ----> first p >= 0.05, data (+) MC stat     = %d\n", firstAboveT(v_pvalue_all_mc, 0.05))
-                  << Form("  ----> OPTIMAL niter (AN-2024-133: first p >= %.2f, data (+) MC stat) = %d\n",
+                  << Form("  ----> first p >= 0.95, data (+) MC stat     = %d\n", firstAboveT(v_pvalue_all_mc, 0.95))
+                  // << Form("  ----> OPTIMAL niter (AN-2024-133: first p >= %.2f, data (+) refolded stat) = %d\n",
+                  //         an_threshold, best_an);   // until 2026-10-26
+                  // << Form("  ----> cross-check, AN-2024-133 (first p >= 0.95, data (+) refolded stat) = %d\n",
+                  //         firstAboveT(v_pvalue_all_r, 0.95))
+                  // << Form("  ----> OPTIMAL niter (CMS-SMP-22-007: first p > %.2f, data stat) = %d\n",
+                  //         an_threshold, best_an);   // 10-26 afternoon only
+                  << Form("  ----> cross-check, CMS-SMP-22-007 (first p > 0.05, data stat) = %d\n", best_smp)
+                  << Form("  ----> OPTIMAL niter (AN-2024-133: first p >= %.2f, data stat) = %d\n",
                           an_threshold, best_an);
         std::cout << Form("  ----> optimal niter (full 2D reco space) = %d\n", best_all)
                   << Form("  ----> optimal niter (pT bin %d only)      = %d\n", ibin_pt, best_pt)
@@ -1782,10 +2317,203 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
         // sqrt(bias^2 + stat^2). Cross-check: dchange = rms of (u_n - u_{n-1}) / sigma_n, how
         // much one more iteration moves the result in units of its own stat error.
         // Kept outside the block below so the convergence plot further down can draw them.
+        // ---- chi2 bottom-line test vs iteration (2026-10-29, Zoe; AN Fig. 68) ----
+        if (scan_niter && v_bl_unf.size() == v_niter.size() && !v_bl_unf.empty()) {
+            const int nn = (int) v_niter.size();
+            TGraph *g_unf = new TGraph(nn), *g_reco = new TGraph(nn), *g_rat = new TGraph(nn);
+            double ymx = 0., rmx = 0., ymn = 1e30, rmn = 1e30;
+            for (int k = 0; k < nn; ++k) {
+                for (double v : {v_bl_unf[k], v_bl_reco[k]}) if (v > 0.) ymn = std::min(ymn, v);
+                g_unf->SetPoint(k, v_niter[k], v_bl_unf[k]); g_reco->SetPoint(k, v_niter[k], v_bl_reco[k]);
+                const double rr = v_bl_reco[k] > 0. ? v_bl_unf[k] / v_bl_reco[k] : 0.;
+                g_rat->SetPoint(k, v_niter[k], rr);
+                if (rr > 0.) rmn = std::min(rmn, rr);
+                ymx = std::max(ymx, std::max(v_bl_unf[k], v_bl_reco[k])); rmx = std::max(rmx, rr);
+            }
+            const char *ref_env_bl = std::getenv("NITER_REF");
+            const int n_ref_bl = (ref_env_bl && std::atoi(ref_env_bl) > 0) ? std::atoi(ref_env_bl) : ((obs.name == "dr") ? 16 : 126);
+            // const double xmax_bl = v_niter.back() + 0.5, ytop = 1.45 * ymx, rtop = std::max(1.5, 1.15 * rmx);
+            // 2026-10-29 (Zoe): log y on the chi2 panel; a decade of room above for the legend
+            // const double xmax_bl = v_niter.back() + 0.5, ytop = 4. * ymx, rtop = std::max(1.5, 1.15 * rmx);
+            // const double ybot = (ymn < 1e30) ? 0.2 * ymn : 0.1;
+            // Then (Zoe): whole decades, labelled 10^n -- from the decade below the smallest chi2 to one
+            // decade above the largest (room for the legend).
+            const double xmax_bl = v_niter.back() + 0.5, rtop = std::max(1.5, 1.15 * rmx);
+            const double ybot = (ymn < 1e30) ? std::pow(10., std::floor(std::log10(ymn))) : 0.1;
+            const double ytop = std::pow(10., std::ceil(std::log10(3. * ymx)));   // the decade above 3x the largest
+            // the ratio panel in log y too (Zoe), whole decades around 1
+            const double rbot = (rmn < 1e30) ? std::min(0.1, std::pow(10., std::floor(std::log10(rmn)))) : 0.1;
+            const double rtop_log = std::max(10., std::pow(10., std::ceil(std::log10(3. * rmx))));
+            TCanvas *c_bl = new TCanvas("c_bottomline_chi2", "", 900, 900);
+            TPad *ptb = new TPad("pbl_top", "", 0., 0.35, 1., 1.), *pbb = new TPad("pbl_bot", "", 0., 0., 1., 0.35);
+            ptb->SetBottomMargin(0.02); ptb->SetLeftMargin(0.14); ptb->SetRightMargin(0.04); ptb->SetTopMargin(0.10);
+            pbb->SetTopMargin(0.02);    pbb->SetBottomMargin(0.30); pbb->SetLeftMargin(0.14); pbb->SetRightMargin(0.04);
+            pbb->SetLogy();
+            ptb->SetLogy();
+            c_bl->cd(); ptb->Draw(); pbb->Draw(); ptb->cd();
+            // TH1F *fr = ptb->DrawFrame(0.5, 0., xmax_bl, ytop);
+            TH1F *fr = ptb->DrawFrame(0.5, ybot, xmax_bl, ytop);
+            fr->GetYaxis()->SetTitle("#chi^{2}"); fr->GetYaxis()->SetTitleSize(0.055); fr->GetYaxis()->SetLabelSize(0.045);
+            fr->GetYaxis()->SetTitleOffset(1.1); fr->GetXaxis()->SetLabelSize(0);
+            // fr->GetYaxis()->SetMoreLogLabels(); fr->GetYaxis()->SetNoExponent();   // 20, 30, ... 500: Zoe wants 10^n
+            g_unf->SetMarkerStyle(20); g_unf->SetMarkerColor(ROCColor::red()); g_unf->SetLineColor(ROCColor::red()); g_unf->SetLineWidth(2);
+            g_reco->SetMarkerStyle(21); g_reco->SetMarkerColor(ROCColor::blue()); g_reco->SetLineColor(ROCColor::blue()); g_reco->SetLineWidth(2);
+            g_unf->Draw("PL same"); g_reco->Draw("PL same");
+            // TLine *lref = new TLine(n_ref_bl, ybot, n_ref_bl, ytop);
+            // stops just under the legend (NDC 0.62 of a frame spanning 0.02-0.90; log y)
+            const double yline = std::pow(10., std::log10(ybot) + (0.62 - 0.02) / 0.88 * (std::log10(ytop) - std::log10(ybot)));
+            TLine *lref = new TLine(n_ref_bl, ybot, n_ref_bl, yline);
+            lref->SetLineStyle(2); lref->SetLineColor(TColor::GetColor("#f29fc5")); lref->SetLineWidth(2); lref->Draw();
+            // white legend box: the chosen-niter line runs under it (A, N = 126)
+            TLegend *lg = new TLegend(0.45, 0.64, 0.94, 0.86); lg->SetBorderSize(0); lg->SetFillStyle(1001); lg->SetFillColor(kWhite); lg->SetTextSize(0.042);
+            lg->AddEntry(g_unf, "#chi^{2}(unfolded data, gen MC)", "pl");
+            lg->AddEntry(g_reco, "#chi^{2}(reco data, reco MC)", "pl");
+            lg->AddEntry(lref, Form("chosen N_{iter} = %d", n_ref_bl), "l");
+            lg->Draw();
+            TLatex tl; tl.SetNDC(); tl.SetTextFont(42); tl.SetTextSize(0.042);
+            // below the curves (the legend owns the top right)
+            tl.DrawLatex(0.18, 0.14, test_mode == 2 ? "Data" : (split_test ? "Split test" : "Full-MC closure"));
+            tl.DrawLatex(0.18, 0.08, Form("%d %s bins, %s, MC scaled to data", ibin_dr_max - ibin_dr_min + 1,
+                                          obs.name == "dr" ? "#DeltaR" : "A",
+                                          jetPtRangeLabel(jtpt_binsVector[ibin_pt - 1], jtpt_binsVector[ibin_pt]).Data()));
+            TLatex cmsl; cmsl.SetNDC();
+            cmsl.SetTextFont(62); cmsl.SetTextSize(0.055); cmsl.DrawLatex(0.14, 0.92, "CMS");
+            cmsl.SetTextFont(52); cmsl.SetTextSize(0.045); cmsl.DrawLatex(0.25, 0.92, "Work In Progress");
+            cmsl.SetTextFont(42); cmsl.SetTextSize(0.045); cmsl.DrawLatex(0.64, 0.92, "pp #sqrt{s} = 5.36 TeV");
+            pbb->cd();
+            // TH1F *fb = pbb->DrawFrame(0.5, 0., xmax_bl, rtop);
+            TH1F *fb = pbb->DrawFrame(0.5, rbot, xmax_bl, rtop_log);
+            fb->GetYaxis()->SetTitle("#chi^{2}_{unf} / #chi^{2}_{reco}"); fb->GetYaxis()->CenterTitle(true);
+            fb->GetYaxis()->SetTitleSize(0.09); fb->GetYaxis()->SetTitleOffset(0.65); fb->GetYaxis()->SetLabelSize(0.08); fb->GetYaxis()->SetNdivisions(505);
+            fb->GetXaxis()->SetTitle("number of iterations"); fb->GetXaxis()->SetTitleSize(0.10); fb->GetXaxis()->SetLabelSize(0.085);
+            g_rat->SetMarkerStyle(20); g_rat->SetMarkerColor(kBlack); g_rat->SetLineWidth(2); g_rat->Draw("PL same");
+            TLine *l1b = new TLine(0.5, 1., xmax_bl, 1.); l1b->SetLineStyle(2); l1b->Draw();
+            TLine *lrefb = new TLine(n_ref_bl, rbot, n_ref_bl, rtop_log);
+            lrefb->SetLineStyle(2); lrefb->SetLineColor(TColor::GetColor("#f29fc5")); lrefb->SetLineWidth(2); lrefb->Draw();
+            const TString bl_stem = folder + "bottomline_chi2_vs_iteration_" + out_label;
+            c_bl->Print(bl_stem + ".pdf"); c_bl->Print(bl_stem + ".png");
+            std::cout << "\t---->chi2 bottom-line test vs iteration: " << bl_stem << ".png" << std::endl;
+        }
+
+        // ---- Iteration bottom-line test (2026-10-28, Zoe): the unfolded distribution in the measured
+        // pT bin at every iteration 1..N_ref, and its ratio to iteration N_ref (the chosen niter).
+        // N_ref = NITER_REF (env), default 16 for dR and 126 for A (the AN-2024-133 rule on 10-28).
+        // // After the unfolding, before the efficiency corrections: those are the same factors for every
+        // // iteration, so the ratios are the ones of the final result.
+        // Since the same evening: the nominal result of each iteration, every correction and SF applied
+        // (h_data_fully_corrected). A shows at most ~16 curves.
+        // if (scan_niter && v_unf_pt.size() == v_niter.size()) {   // first version: before the corrections
+        // Then (Zoe, "with the nominal result (SF applied)"): the fully corrected result of each iteration.
+        if (scan_niter && v_fc_pt.size() == v_niter.size()) {
+            const std::vector<TH1D *> &v_it = v_fc_pt;
+            const char *ref_env = std::getenv("NITER_REF");
+            const int n_ref = (ref_env && std::atoi(ref_env) > 0) ? std::atoi(ref_env) : ((obs.name == "dr") ? 16 : 126);
+            int k_ref = -1;
+            for (size_t k = 0; k < v_niter.size(); ++k) if ((int) v_niter[k] == n_ref) k_ref = (int) k;
+            if (k_ref < 0) {
+                std::cout << "\t---->iteration test: niter " << n_ref << " not in the scan, skipped" << std::endl;
+            } else {
+                const int step = std::max(1, (int) std::ceil(n_ref / 16.));
+                TCanvas *c_it = new TCanvas("c_iter_test", "", 900, 1000);
+                TPad *pt = new TPad("pit_top", "", 0., 0.35, 1., 1.), *pb = new TPad("pit_bot", "", 0., 0., 1., 0.35);
+                pt->SetBottomMargin(0.02); pt->SetLeftMargin(0.14); pt->SetRightMargin(0.04); pt->SetTopMargin(0.13);
+                pb->SetTopMargin(0.02);    pb->SetBottomMargin(0.30); pb->SetLeftMargin(0.14); pb->SetRightMargin(0.04);
+                c_it->cd(); pt->Draw(); pb->Draw();
+                TH1D *ref = (TH1D *) v_it[k_ref]->Clone("h_iter_ref"); ref->SetDirectory(nullptr);
+                ref->Scale(1., "width");
+                std::vector<int> ks;
+                for (int k = 0; k <= k_ref; ++k) if (((int) v_niter[k] - 1) % step == 0 || k == k_ref) ks.push_back(k);
+                gStyle->SetPalette(kViridis);   // the palette this function already sets for its 2D plots
+                TLegend *lg = new TLegend(0.55, 0.60, 0.95, 0.86); lg->SetBorderSize(0); lg->SetFillStyle(0); lg->SetTextSize(0.026);
+                lg->SetNColumns(2);
+                double ymax = 0., rlo = 1., rhi = 1.;
+                std::vector<TH1D *> hs, rs;
+                for (int k : ks) {
+                    TH1D *h = (TH1D *) v_it[k]->Clone(Form("h_iter_%d", (int) v_niter[k])); h->SetDirectory(nullptr);
+                    h->Scale(1., "width");
+                    TH1D *r = (TH1D *) h->Clone(Form("r_iter_%d", (int) v_niter[k])); r->SetDirectory(nullptr);
+                    r->Divide(ref);
+                    // the ratio's error is the iteration's own relative error (the two are strongly correlated)
+                    for (int i = 1; i <= r->GetNbinsX(); ++i)
+                        r->SetBinError(i, h->GetBinContent(i) > 0. ? r->GetBinContent(i) * h->GetBinError(i) / h->GetBinContent(i) : 0.);
+                    // the chosen niter in pastel pink (Zoe), the others along the palette
+                    // const int col = (k == k_ref) ? kBlack : TColor::GetColorPalette((int) (254. * k / std::max(1, k_ref)));
+                    const int col = (k == k_ref) ? TColor::GetColor("#f29fc5") : TColor::GetColorPalette((int) (254. * k / std::max(1, k_ref)));
+                    for (TH1D *x : {h, r}) { x->SetLineColor(col); x->SetMarkerColor(col); x->SetLineWidth(k == k_ref ? 3 : 2); x->SetMarkerStyle(k == k_ref ? 20 : 1); }
+                    for (int i = ibin_dr_min; i <= ibin_dr_max; ++i) {
+                        ymax = std::max(ymax, h->GetBinContent(i));
+                        if (r->GetBinContent(i) > 0.) { rlo = std::min(rlo, r->GetBinContent(i)); rhi = std::max(rhi, r->GetBinContent(i)); }
+                    }
+                    hs.push_back(h); rs.push_back(r);
+                    lg->AddEntry(h, Form("N_{iter} = %d%s", (int) v_niter[k], k == k_ref ? " (chosen)" : ""), "l");
+                }
+                // closures (2026-10-28, Zoe): the truth too, dashed, and its ratio to N_ref below
+                TH1D *ht = nullptr, *rt = nullptr;
+                if (test_mode != 2 && h_mc_true) {
+                    ht = h_mc_true->ProjectionX("h_iter_truth", ibin_pt, ibin_pt, "e"); ht->SetDirectory(nullptr);
+                    ht->Scale(1., "width");
+                    rt = (TH1D *) ht->Clone("r_iter_truth"); rt->SetDirectory(nullptr); rt->Divide(ref);
+                    for (TH1D *x : {ht, rt}) { x->SetLineColor(kBlack); x->SetLineStyle(2); x->SetLineWidth(3); x->SetMarkerSize(0); }
+                    for (int i = ibin_dr_min; i <= ibin_dr_max; ++i) {
+                        ymax = std::max(ymax, ht->GetBinContent(i));
+                        if (rt->GetBinContent(i) > 0.) { rlo = std::min(rlo, rt->GetBinContent(i)); rhi = std::max(rhi, rt->GetBinContent(i)); }
+                    }
+                    lg->AddEntry(ht, split_test ? "truth (even half)" : "truth (gen MC)", "l");
+                }
+                pt->cd();
+                hs.front()->SetMaximum(1.6 * ymax); hs.front()->SetMinimum(0.);   // room for the legend
+                hs.front()->GetXaxis()->SetRange(ibin_dr_min, ibin_dr_max);
+                // hs.front()->GetYaxis()->SetTitle(Form("fully corrected dN/d%s (nominal, SFs applied)", obs.axis.Data()));
+                hs.front()->GetYaxis()->SetTitle(test_mode == 2 ? Form("fully corrected dN/d%s (nominal, SFs applied)", obs.axis.Data())
+                                                                : Form("unfolded + corrected dN/d%s (MC)", obs.axis.Data()));
+                hs.front()->GetYaxis()->SetTitleSize(0.040); hs.front()->GetXaxis()->SetLabelSize(0);
+                hs.front()->Draw("hist");
+                for (TH1D *h : hs) h->Draw("hist same");
+                hs.back()->Draw("PE same");
+                if (ht) ht->Draw("hist same");
+                lg->Draw();
+                TLatex tl; tl.SetNDC(); tl.SetTextFont(42); tl.SetTextSize(0.035);
+                TString pt_txt = jetPtRangeLabel(jtpt_binsVector[ibin_pt - 1], jtpt_binsVector[ibin_pt]);
+                // tl.DrawLatex(0.17, 0.81, "Data, Bayesian unfolding");
+                tl.DrawLatex(0.17, 0.81, test_mode == 2 ? TString("Data, Bayesian unfolding")
+                                         : split_test   ? TString("Split test, Bayesian unfolding")
+                                                        : TString::Format("Full-MC closure (%s), Bayesian", generator.Data()));
+                tl.DrawLatex(0.17, 0.76, pt_txt);
+                if (step > 1) tl.DrawLatex(0.17, 0.71, Form("every %d iterations shown", step));
+                TLatex cmsl; cmsl.SetNDC();
+                cmsl.SetTextFont(62); cmsl.SetTextSize(0.050); cmsl.DrawLatex(0.14, 0.94, "CMS");
+                cmsl.SetTextFont(52); cmsl.SetTextSize(0.040); cmsl.DrawLatex(0.25, 0.94, "Work In Progress");
+                cmsl.SetTextFont(42); cmsl.SetTextSize(0.040); cmsl.DrawLatex(0.66, 0.94, "pp #sqrt{s} = 5.36 TeV");
+                pb->cd();
+                TH1D *rf = rs.front();
+                const double pad = 0.1 * std::max(rhi - 1., 1. - rlo) + 0.01;
+                rf->SetMinimum(std::max(0., rlo - pad)); rf->SetMaximum(rhi + pad);
+                rf->GetXaxis()->SetRange(ibin_dr_min, ibin_dr_max);
+                rf->GetYaxis()->SetTitle(Form("N_{iter} / N_{iter} = %d", n_ref)); rf->GetYaxis()->CenterTitle(true);
+                rf->GetYaxis()->SetTitleSize(0.075); rf->GetYaxis()->SetTitleOffset(0.8); rf->GetYaxis()->SetLabelSize(0.065);
+                rf->GetYaxis()->SetNdivisions(505);
+                rf->GetXaxis()->SetTitle(obs.axis); rf->GetXaxis()->SetTitleSize(0.09); rf->GetXaxis()->SetLabelSize(0.075);
+                rf->Draw("hist");
+                for (TH1D *r : rs) r->Draw("hist same");
+                rs.back()->Draw("E1 same");
+                if (rt) rt->Draw("hist same");
+                TLine *l1 = new TLine(rf->GetXaxis()->GetBinLowEdge(ibin_dr_min), 1., rf->GetXaxis()->GetBinUpEdge(ibin_dr_max), 1.);
+                l1->SetLineStyle(2); l1->Draw();
+                const TString it_stem = folder + "iteration_test_1_to_" + Form("%d", n_ref) + "_" + out_label;
+                c_it->Print(it_stem + ".pdf"); c_it->Print(it_stem + ".png");
+                std::cout << "\t---->iteration test (1.." << n_ref << ", ratio to " << n_ref << "): " << it_stem << ".png" << std::endl;
+            }
+        }
+
         std::vector<double> v_cv_n, v_cv_bias, v_cv_stat, v_cv_dn, v_cv_dch;
         const double dchange_threshold = 0.5;
         int best_conv = -1, best_tot = -1;
         double mi_stat_pct = 0.;
+        // ---- disabled 2026-10-27 (kept for reference): bias vs MI needs the matrix inversion ----
+        // Every quantity here is measured against u_mi = RooUnfoldInvert, which is gone (see the
+        // Unfold step). With this block off v_cv_* stay empty and the convergence plot below
+        // is skipped by its own !v_cv_dch.empty() guard.
+        /*
         if (v_unf_pt.size() == v_niter.size()) {
             RooUnfoldInvert inv(response, h_data_purity_corrected);
             TH2D *h_mi = (TH2D *) inv.Hreco(RooUnfold::kCovariance)->Clone("h_unf_mi_scan");
@@ -1798,7 +2526,8 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
             unitArea(u_mi);
             for (TH1D *u : v_unf_pt) unitArea(u);
 
-            // THE CHOICE (Zoe, 2026-10-01): the first niter at which one more iteration moves
+            // SUPERSEDED (10-19 by AN-2024-133, 10-26 by CMS-SMP-22-007), kept as a cross-check.
+            // Was THE CHOICE (Zoe, 2026-10-01): the first niter at which one more iteration moves
             // the result by less than half its statistical error (dchange < 0.5) -- converged
             // at the level of the measurement's precision. Gives 8 for dr, 11 for B on the
             // _rho inputs; 7 for dr, 11 for B with the JEC (_rhojec). The analysis driver reads
@@ -1852,16 +2581,35 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
                       << "================================================================\n"
                       << std::endl;
         }
+        ---- end disabled ---- */
 
         const int np = (int) v_niter.size();
         TGraph *g_p_all    = new TGraph(np, v_niter.data(), v_pvalue_all.data());
         TGraph *g_p_pt     = new TGraph(np, v_niter.data(), v_pvalue_pt.data());
         TGraph *g_c2_all   = new TGraph(np, v_niter.data(), v_chi2ndf_all.data());
         TGraph *g_c2_pt    = new TGraph(np, v_niter.data(), v_chi2ndf_pt.data());
-        // The test that picks the iteration (data (+) MC stat); the data-only one is drawn too,
-        // in grey, for reference.
+        // The test that picks the iteration is data (+) refolded stat (purple); data only (blue)
+        // and data (+) MC stat (grey) are drawn for reference.
         TGraph *g_p_mc     = new TGraph(np, v_niter.data(), v_pvalue_all_mc.data());
         TGraph *g_c2_mc    = new TGraph(np, v_niter.data(), v_chi2ndf_all_mc.data());
+        TGraph *g_p_cov    = new TGraph(np, v_niter.data(), v_pvalue_all_cov.data());
+        TGraph *g_c2_cov   = new TGraph(np, v_niter.data(), v_chi2ndf_all_cov.data());
+        for (TGraph *g : {g_p_cov, g_c2_cov}) {
+            g->SetLineColor(green); g->SetMarkerColor(green); g->SetMarkerStyle(kFullSquare);
+            g->SetLineWidth(2); g->SetMarkerSize(0.9);
+        }
+        TGraph *g_p_r      = new TGraph(np, v_niter.data(), v_pvalue_all_r.data());
+        TGraph *g_c2_r     = new TGraph(np, v_niter.data(), v_chi2ndf_all_r.data());
+        for (TGraph *g : {g_p_r, g_c2_r}) {
+            g->SetLineColor(purple); g->SetMarkerColor(purple); g->SetMarkerStyle(kFullTriangleUp);
+            g->SetLineWidth(2); g->SetMarkerSize(0.9);
+        }
+        TGraph *g_p_rcov   = new TGraph(np, v_niter.data(), v_pvalue_all_rcov.data());
+        TGraph *g_c2_rcov  = new TGraph(np, v_niter.data(), v_chi2ndf_all_rcov.data());
+        for (TGraph *g : {g_p_rcov, g_c2_rcov}) {
+            g->SetLineColor(orange); g->SetMarkerColor(orange); g->SetMarkerStyle(kOpenTriangleUp);
+            g->SetLineWidth(2); g->SetMarkerSize(0.9);
+        }
         g_p_all ->SetLineColor(blue);   g_p_all ->SetMarkerColor(blue);   g_p_all ->SetMarkerStyle(kFullCircle);
         g_p_pt  ->SetLineColor(orange); g_p_pt  ->SetMarkerColor(orange); g_p_pt  ->SetMarkerStyle(kOpenSquare);
         g_c2_all->SetLineColor(blue);   g_c2_all->SetMarkerColor(blue);   g_c2_all->SetMarkerStyle(kFullCircle);
@@ -1871,7 +2619,8 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
             g->SetLineColor(blue); g->SetMarkerColor(blue); g->SetMarkerStyle(kFullCircle);
             g->SetLineWidth(2); g->SetMarkerSize(0.9);
         }
-        for (TGraph *g : {g_p_all, g_c2_all}) {
+        // for (TGraph *g : {g_p_all, g_c2_all}) {
+        for (TGraph *g : {g_p_mc, g_c2_mc}) {
             g->SetLineColor(kGray + 1); g->SetMarkerColor(kGray + 1); g->SetMarkerStyle(kOpenCircle);
         }
 
@@ -1913,8 +2662,13 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
         // Hide it: size 0. labNum = 1 is the first (lowest) label.
         fr_p->GetYaxis()->ChangeLabel(1, -1, 0.);
         fr_p->GetXaxis()->SetLabelSize(0); fr_p->GetXaxis()->SetTitleSize(0);  // x belongs to the bottom pad
+        // data (+) MC stat (grey) and cov(r - d) (green) off the plot since 2026-10-21 (Zoe);
+        // still computed, printed in the log table and written to the .root below.
         g_p_all->Draw("PL SAME");
-        g_p_mc ->Draw("PL SAME");
+        // g_p_mc ->Draw("PL SAME");
+        // g_p_cov->Draw("PL SAME");
+        g_p_r  ->Draw("PL SAME");
+        // g_p_rcov->Draw("PL SAME");   // V_d + V_r full cov.: not drawn since 2026-10-22 (Zoe); still printed + in the .root
 
         TLine *l_thr = new TLine(x_lo_it, an_threshold, x_hi_it, an_threshold);
         l_thr->SetLineColor(kGray + 2); l_thr->SetLineStyle(2); l_thr->Draw("same");
@@ -1930,8 +2684,16 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
         TLatex tx_thr;
         tx_thr.SetTextFont(font_code); tx_thr.SetTextSize(label_size); tx_thr.SetTextColor(kGray + 2);
         // Mid-axis, just under the line: clear of both rises in the dr and the B scans.
+        // tx_thr.DrawLatex(x_lo_it + 0.50 * (x_hi_it - x_lo_it),
+        //                  an_threshold - 0.08 * (y_hi_p - y_lo_p),
+        //                  Form("p = %.2f", an_threshold));   // until 2026-10-26 (line at 0.95)
+        // Just ABOVE the line for a low threshold (the p = 0.05 rule, under it is outside the frame),
+        // just under it for a high one (p = 0.95, the AN rule).
+        // tx_thr.DrawLatex(x_lo_it + 0.50 * (x_hi_it - x_lo_it),
+        //                  an_threshold + 0.03 * (y_hi_p - y_lo_p),
+        //                  Form("p = %.2f", an_threshold));
         tx_thr.DrawLatex(x_lo_it + 0.50 * (x_hi_it - x_lo_it),
-                         an_threshold - 0.08 * (y_hi_p - y_lo_p),
+                         an_threshold + (an_threshold < 0.5 ? 0.03 : -0.08) * (y_hi_p - y_lo_p),
                          Form("p = %.2f", an_threshold));
 
         TLatex tx_reg; tx_reg.SetNDC();
@@ -1943,13 +2705,24 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
             test_mode == 0 ? "MC full-sample closure" :
             test_mode == 1 ? "MC split closure test"  : "Data Run 3");
         tx_reg.DrawLatex(0.17, 0.80, "D'Agostini, early stopping");
+        // tx_reg.DrawLatex(0.17, 0.74, best_an > 0 ? Form("chosen N iter = %d (first p #geq %.2f)", best_an, an_threshold)
+        // tx_reg.DrawLatex(0.17, 0.74, best_an > 0 ? Form("chosen N iter = %d (first p > %.2f)", best_an, an_threshold)   // 10-26 afternoon
         tx_reg.DrawLatex(0.17, 0.74, best_an > 0 ? Form("chosen N iter = %d (first p #geq %.2f)", best_an, an_threshold)
                                                  : "no iteration reaches the threshold");
-        TLegend *lg_reg = new TLegend(0.54, 0.73, 0.90, 0.89);
+        // TLegend *lg_reg = new TLegend(0.54, 0.58, 0.90, 0.89);   // five curves, until 2026-10-21
+        // TLegend *lg_reg = new TLegend(0.54, 0.70, 0.90, 0.89);   // three curves, until 2026-10-22
+        TLegend *lg_reg = new TLegend(0.54, 0.76, 0.90, 0.89);
         lg_reg->SetBorderSize(0); lg_reg->SetFillStyle(0);
         lg_reg->SetTextFont(font_code); lg_reg->SetTextSize(label_size);
-        lg_reg->AddEntry(g_p_mc,  "data #oplus MC stat. (used)", "pl");
-        lg_reg->AddEntry(g_p_all, "data stat. only", "pl");
+        // lg_reg->AddEntry(g_p_mc,  "data #oplus MC stat. (used)", "pl");
+        // lg_reg->AddEntry(g_p_all, "data stat. only", "pl");
+        // lg_reg->AddEntry(g_p_all, "data stat.", "pl");   // until 2026-10-26
+        lg_reg->AddEntry(g_p_all, "data stat. (used)", "pl");
+        // lg_reg->AddEntry(g_p_mc,  "data #oplus MC stat.", "pl");
+        // lg_reg->AddEntry(g_p_cov, "cov(r#minusd), data stat.", "pl");
+        // lg_reg->AddEntry(g_p_r,   "data #oplus refolded stat. (used)", "pl");   // until 2026-10-26
+        lg_reg->AddEntry(g_p_r,   "data #oplus refolded stat.", "pl");
+        // lg_reg->AddEntry(g_p_rcov, "V_{d} + V_{r}, full cov.", "pl");
         lg_reg->Draw();
         TLatex cms_reg; cms_reg.SetNDC();
         cms_reg.SetTextFont(62); cms_reg.SetTextSize(0.042); cms_reg.DrawLatex(0.13, 0.945, "CMS");
@@ -1962,7 +2735,10 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
         pad_c2->SetLogy();
         double c2_max = 1., c2_min = 1.;
         for (double c : v_chi2ndf_all) if (c > 0.) { c2_max = std::max(c2_max, c); c2_min = std::min(c2_min, c); }
-        for (double c : v_chi2ndf_all_mc) if (c > 0.) { c2_max = std::max(c2_max, c); c2_min = std::min(c2_min, c); }
+        // for (double c : v_chi2ndf_all_mc) if (c > 0.) { c2_max = std::max(c2_max, c); c2_min = std::min(c2_min, c); }
+        // for (double c : v_chi2ndf_all_cov) if (c > 0.) { c2_max = std::max(c2_max, c); c2_min = std::min(c2_min, c); }
+        for (double c : v_chi2ndf_all_r) if (c > 0.) { c2_max = std::max(c2_max, c); c2_min = std::min(c2_min, c); }
+        // for (double c : v_chi2ndf_all_rcov) if (c > 0.) { c2_max = std::max(c2_max, c); c2_min = std::min(c2_min, c); }
         TH1F *fr_c2 = pad_c2->DrawFrame(x_lo_it, c2_min * 0.5, x_hi_it, c2_max * 2.);
         fr_c2->GetYaxis()->SetTitle("#chi^{2}/ndf");
         fr_c2->GetYaxis()->CenterTitle(true);
@@ -1977,7 +2753,10 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
         fr_c2->GetXaxis()->SetTitleFont(font_code); fr_c2->GetXaxis()->SetTitleSize(title_size); fr_c2->GetXaxis()->SetTitleOffset(1.3);
         fr_c2->GetXaxis()->SetLabelFont(font_code); fr_c2->GetXaxis()->SetLabelSize(label_size);
         g_c2_all->Draw("PL SAME");
-        g_c2_mc ->Draw("PL SAME");
+        // g_c2_mc ->Draw("PL SAME");
+        // g_c2_cov->Draw("PL SAME");
+        g_c2_r  ->Draw("PL SAME");
+        // g_c2_rcov->Draw("PL SAME");
         TLine *l_one = new TLine(x_lo_it, 1., x_hi_it, 1.);
         l_one->SetLineColor(kGray + 2); l_one->SetLineStyle(2); l_one->Draw("same");
         pad_c2->RedrawAxis();
@@ -1995,6 +2774,12 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
         g_c2_pt ->Write(Form("g_chi2ndf_vs_niter_pt%d", ibin_pt));
         g_p_mc  ->Write("g_pvalue_vs_niter_2D_datamcstat");
         g_c2_mc ->Write("g_chi2ndf_vs_niter_2D_datamcstat");
+        g_p_cov ->Write("g_pvalue_vs_niter_2D_covtoys");
+        g_c2_cov->Write("g_chi2ndf_vs_niter_2D_covtoys");
+        g_p_r   ->Write("g_pvalue_vs_niter_2D_datarefoldedstat");
+        g_c2_r  ->Write("g_chi2ndf_vs_niter_2D_datarefoldedstat");
+        g_p_rcov ->Write("g_pvalue_vs_niter_2D_datarefoldedcov");
+        g_c2_rcov->Write("g_chi2ndf_vs_niter_2D_datarefoldedcov");
         f_reg->Close();
         delete f_reg;
         std::cout << "Wrote regularisation scan to " << reg_stem << ".{pdf,png,root}" << std::endl;
@@ -2049,7 +2834,9 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
             tx.DrawLatex(0.45, 0.74, Form("D'Agostini, converged at %.1f #sigma_{stat}", dchange_threshold));
             tx.DrawLatex(0.45, 0.68, best_conv > 0 ? Form("converged at N iter = %d (grey)", best_conv)
                                                    : "not converged in the scanned range");
-            if (best_an > 0) tx.DrawLatex(0.45, 0.62, Form("chosen N iter = %d (red, refolding p #geq 0.95)", best_an));
+            // if (best_an > 0) tx.DrawLatex(0.45, 0.62, Form("chosen N iter = %d (red, refolding p #geq 0.95)", best_an));   // until 2026-10-26
+            // if (best_an > 0) tx.DrawLatex(0.45, 0.62, Form("chosen N iter = %d (red, refolding p > %.2f)", best_an, an_threshold));   // 10-26 afternoon
+            if (best_an > 0) tx.DrawLatex(0.45, 0.62, Form("chosen N iter = %d (red, refolding p #geq %.2f)", best_an, an_threshold));
             TLatex cms; cms.SetNDC();
             cms.SetTextFont(62); cms.SetTextSize(0.042); cms.DrawLatex(0.13, 0.945, "CMS");
             cms.SetTextFont(52); cms.SetTextSize(0.034); cms.DrawLatex(0.205, 0.945, "Work In Progress");
@@ -2117,6 +2904,8 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
 //              Bayesian run needed niter = 7 for dr and 21-26 for B, two numbers tuned on two
 //              refolding scans, and a band built from variations unfolded at a regularisation
 //              strength of their own is not a band. Pass true to get the Bayesian result back.
+//              SINCE 2026-10-27: matrix inversion is commented out (non-square 3D response
+//              with under/overflow), the default is true and false is refused.
 // scan_niter:  true = scan niter = 1..100 and pick the optimal one from the refolding
 //              goodness-of-fit test; false = one unfolding at the nominal niter = 4.
 //              Bayesian only -- matrix inversion has no iterations to scan, so it is refused
@@ -2170,7 +2959,8 @@ void apply_unfolding(TString &label, TString &folder, bool btag, Int_t n, TStrin
 //                                        much of it cancels in the normalisation.
 //              Same input numbers used two ways -- never put both in the band at once.
 void apply_unfolding_2d(TString SAMPLE = "both", TString UNFOLDING_GENERATOR = "pythia",
-                        int test_mode = 2, bool unfoldBayes = false, bool scan_niter = false,
+                        // int test_mode = 2, bool unfoldBayes = false, bool scan_niter = false,   // until 2026-10-27
+                        int test_mode = 2, bool unfoldBayes = true, bool scan_niter = false,
                         // "pythia", the nominal. It was "herwig" until 2026-09-24, so the
                         // documented nominal call apply_unfolding_2d.C("both","pythia") in
                         // fact wrote the _tfherwig VARIATION, while the reader
@@ -2207,21 +2997,31 @@ void apply_unfolding_2d(TString SAMPLE = "both", TString UNFOLDING_GENERATOR = "
     // Matrix inversion has nothing to regularise, so there is no iteration count to scan.
     // Refuse rather than ignore the flag: a scan run that quietly did one inversion would
     // still write a "regularisation" plot, and that plot would mean nothing.
-    if (scan_niter && !unfoldBayes) {
-        std::cerr << "ERROR: scan_niter needs unfoldBayes = true -- matrix inversion has no "
-                  << "iterations to scan." << std::endl;
+    // if (scan_niter && !unfoldBayes) {   // until 2026-10-27
+    //     std::cerr << "ERROR: scan_niter needs unfoldBayes = true -- matrix inversion has no "
+    //               << "iterations to scan." << std::endl;
+    //     return;
+    // }
+    // Matrix inversion is commented out (2026-10-27, see the Unfold step in apply_unfolding):
+    // the 3D (jet pT, dR, A) response with under/overflow is non-square. Refuse instead of
+    // writing a "_MI" result that is not one.
+    if (!unfoldBayes) {
+        std::cerr << "ERROR: unfoldBayes = false -- matrix inversion is disabled (non-square 3D "
+                  << "response). Use unfoldBayes = true." << std::endl;
         return;
     }
     // The UParT scale factor is measured in reco dR bins and has no B equivalent, so there
     // is nothing to apply for B. This is a KNOWN GAP, not a silent skip: the dr result
     // carries a correction (0.933 -> 1.149 across its range) that a B result does not.
     // Refuse an explicit SF request rather than pretend to honour it.
+    /* ---- disabled 2026-10-19 (kept for reference): A now has its own UParT SF ----
     if (OBSERVABLE == "B" && SFUPART_VARIATION != "nominal" && SFUPART_VARIATION != "off") {
         std::cerr << "ERROR: SFUPART_VARIATION '" << SFUPART_VARIATION << "' is meaningless "
                   << "for OBSERVABLE 'B': the UParT SF is binned in reco dR and has no B "
                   << "equivalent. Use \"off\"." << std::endl;
         return;
     }
+    ---- end disabled ---- */
     // What the nominal run of this observable is -- both rules live in result_paths.h, so the
     // reader (apply_weights_and_systematics.C) builds the same paths from the same two
     // functions instead of reproducing the forcing below from memory.
@@ -2254,7 +3054,16 @@ void apply_unfolding_2d(TString SAMPLE = "both", TString UNFOLDING_GENERATOR = "
                   << "the signal fraction is only applied to data" << std::endl;
         return;
     }
-    if (sfupartHist(SFUPART_VARIATION).Length() == 0) {
+    // Same for TF_SAMPLE: it only picks the signal fraction, so a closure run would write a
+    // tagged folder that is just the nominal closure.
+    // TF_METHOD is allowed in the closure modes (2026-10-28): it does not touch them, but its chain
+    // runs at its own niter, so its closures need their own folder next to its results.
+    if (tfSampleTag().Length() && test_mode != 2) {
+        std::cerr << "ERROR: TF_SAMPLE needs test_mode 2 (data): the signal fraction is only "
+                  << "applied to data" << std::endl;
+        return;
+    }
+    if (sfupartHist(SFUPART_VARIATION, OBSERVABLE).Length() == 0) {
         std::cerr << "ERROR: unknown SFUPART_VARIATION '" << SFUPART_VARIATION
                   << "' (use nominal | off | jpcalib_hf | qqrate_up | qqrate_down | statup | "
                   << "statdn | jpsyst_up | jpsyst_dn)" << std::endl;
@@ -2269,8 +3078,8 @@ void apply_unfolding_2d(TString SAMPLE = "both", TString UNFOLDING_GENERATOR = "
     // Refuse before creating anything, as above: a missing SF file would otherwise surface
     // only in the log, after the results folder exists.
     if (test_mode == 2 && SFUPART_VARIATION != "off") {
-        if (gSystem->AccessPathName(sfupartFile())) {
-            std::cerr << "ERROR: missing UParT SF file " << sfupartFile() << std::endl;
+        if (gSystem->AccessPathName(sfupartFile(OBSERVABLE))) {
+            std::cerr << "ERROR: missing UParT SF file " << sfupartFile(OBSERVABLE) << std::endl;
             return;
         }
     }
@@ -2348,9 +3157,12 @@ void apply_unfolding_2d(TString SAMPLE = "both", TString UNFOLDING_GENERATOR = "
     // apply_weights_and_systematics.C will look for. Check here, at write time, that it
     // actually resolves -- otherwise a mismatch only shows up much later as a variation
     // that is "missing" or, worse, as one that silently resolved to something else.
-    const TString expected = resultFile(SAMPLE, GENERATOR, test_mode, unfoldBayes,
-                                        TF_GENERATOR, TRACK_EFF_UNC, TF_VARIATION,
-                                        SFUPART_VARIATION, EEC_WEIGHT_OFF, OBSERVABLE);
+    TString expected = resultFile(SAMPLE, GENERATOR, test_mode, unfoldBayes,
+                                  TF_GENERATOR, TRACK_EFF_UNC, TF_VARIATION,
+                                  SFUPART_VARIATION, EEC_WEIGHT_OFF, OBSERVABLE);
+    // A scan writes the "_iterative" file instead (out_label in apply_unfolding), which the
+    // systematics macro never reads -- check that one, so the scan does not report a missing result.
+    if (scan_niter) expected.ReplaceAll("_after_unfolding_2D.root", "_iterative_after_unfolding_2D.root");
     if (gSystem->AccessPathName(expected)) {
         std::cerr << "WARNING: the run finished but its result is not where the systematics "
                   << "macro will look for it:\n         " << expected
@@ -2361,6 +3173,426 @@ void apply_unfolding_2d(TString SAMPLE = "both", TString UNFOLDING_GENERATOR = "
         std::cout << "Result: " << expected << std::endl;
     }
 
+}
+
+// ============================================================================
+// 3D Bayesian unfolding in (dR, A, jet pT) -- MC closures only (added 2026-10-27)
+// ============================================================================
+//
+// Reads the Response3D objects of create_files_for_template_fit.cpp (the *_3d names): a
+// NON-SQUARE response, 450 reco bins (pT 80|90|100|125|150|200, dR 0.025, A 0.1) x 200 gen bins
+// (pT 60-80 | 80-100 | 100-200 | 200+, dR 0.05 plus a 0.45+ overflow, A 0.1) since 2026-10-29
+// (before: 360 reco bins, pT 80-120 in 10 GeV x gen 60|80|100|120|1000). The side bins
+// are at gen only -- see u3d_* in binning_histos_small.h.
+//
+// MC only for now: there is no 3D signal fraction (the template fit is per 2D bin) and no 3D
+// data histogram yet.
+//   test_mode 0  full-MC closure: the whole reco sample through the whole-sample response.
+//                Closes exactly at every niter (the prior IS the truth) -- a plumbing check.
+//   test_mode 1  split test: even-half reco (h_pseudodata_reco_3d) through the odd-half
+//                response, purity and efficiency, against the even-half truth.
+// Chain as in apply_unfolding(): x purity (reco bins) -> Bayes -> / efficiency (gen bins).
+// Both corrections rescale content and error by the same factor (MC treated as exact).
+//
+// EEC_WEIGHT_OFF picks the production: false = the EEC-weighted one (dr's), true = the
+// unweighted _noeecw one (A's). Which weight the 3D result uses is still open (2026-10-27).
+// NITER > 0 unfolds at that count. NITER = 0 scans 1..SCAN_NITER_MAX (env, default 200) and
+// takes the AN-2024-133 rule -- the first refolding p >= 0.95, input stat only -- over the
+// whole 3D reco space. The scan runs without error propagation; errors at the chosen niter only.
+//
+// Writes $P/results/unfolding_3d/<sample>_<gen><production>/: the 3D histograms, the scan, and
+// a PDF with the dR and A projections in gen pT 80-100 and 100-200 (dR < 0.45 only: the 0.45+
+// bin is a side bin) against the truth.
+//
+// e.g.  root -l -b -q -e '.L apply_unfolding_2d.C' -e 'apply_unfolding_3d("both","pythia",1)'
+void apply_unfolding_3d(TString SAMPLE = "both", TString GENERATOR = "pythia", int test_mode = 1,
+                        bool EEC_WEIGHT_OFF = false, int NITER = 0)
+{
+    if (test_mode != 0 && test_mode != 1) {
+        std::cerr << "ERROR: apply_unfolding_3d is MC only (test_mode 0 | 1): there is no 3D "
+                  << "signal fraction or 3D data histogram yet." << std::endl;
+        return;
+    }
+    if (SAMPLE != "qcd" && SAMPLE != "bjet" && SAMPLE != "both") {
+        std::cerr << "ERROR: unknown SAMPLE '" << SAMPLE << "' (use qcd | bjet | both)" << std::endl;
+        return;
+    }
+    gSystem->Load("libRooUnfold.so");
+    gStyle->SetOptStat(0);
+    gStyle->SetOptTitle(0);
+    const bool split = (test_mode == 1);
+
+    // ---- Inputs: the same block files and qcd+bjet mix as apply_unfolding() ----
+    const TString mc_base  = "/data_CMS/cms/zaidan/bJetAggRun3/PPRef2024";
+    const TString btag_tag = "btagWP0712";
+    const TString obs_name = EEC_WEIGHT_OFF ? "B" : "dr";   // only picks the production
+    const TString out_tag  = mcVarTag(false, EEC_WEIGHT_OFF) + obsProdTag(obs_name);
+    std::vector<TString> names = aggChunkFiles(mc_base, SAMPLE, GENERATOR, "RMatrix_", "", btag_tag, out_tag);
+    if (names.empty()) return;
+    gMixWeight.clear();
+    if (!setMixWeights(mc_base, SAMPLE, GENERATOR, btag_tag, out_tag, EEC_WEIGHT_OFF ? obsB() : obsDr())) return;
+    std::vector<TFile *> fin = openAllOrWarn(names);
+    if (fin.empty()) return;
+
+    const TString ps = split ? "_pseudo" : "";
+    TH3D *pur_num = sumOverFiles<TH3D>(fin, "h_full" + ps + "_purity_numerator_3d");
+    TH3D *pur_den = sumOverFiles<TH3D>(fin, "h_full" + ps + "_purity_denominator_3d");
+    TH3D *eff_num = sumOverFiles<TH3D>(fin, "h_full" + ps + "_efficiency_numerator_3d");
+    TH3D *eff_den = sumOverFiles<TH3D>(fin, "h_full" + ps + "_efficiency_denominator_3d");
+    TH3D *h_in    = sumOverFiles<TH3D>(fin, split ? "h_pseudodata_reco_3d"  : "h_full_purity_denominator_3d");
+    TH3D *h_truth = sumOverFiles<TH3D>(fin, split ? "h_pseudodata_truth_3d" : "h_full_efficiency_denominator_3d");
+    RooUnfoldResponse *response = sumResponseOverFiles(fin, split ? "response_pseudo_full_3d" : "response_full_3d");
+    if (!pur_num || !pur_den || !eff_num || !eff_den || !h_in || !h_truth || !response) {
+        std::cerr << "ERROR: 3D objects missing -- was step 1 re-run after 2026-10-27?" << std::endl;
+        return;
+    }
+    std::cout << "3D response: " << response->GetNbinsMeasured() << " reco x "
+              << response->GetNbinsTruth() << " gen bins" << std::endl;
+
+    // ---- The full (non-square) response, P(detector | particle) (2026-10-28, Zoe) ----
+    // RooUnfold flattens a TH3 with x fastest: global bin = dR + n_dR * (A + n_A * pT), so both
+    // axes are 4 pT blocks (thick lines), each holding 5 A blocks (thin lines) of dR bins. Rows
+    // (gen bins) normalised to 1 as in plot_purity_efficiency_response.cpp, colour scale 0-1.
+    {
+        const TString rfolder = mc_base + "/results/unfolding_3d/" + SAMPLE + "_" + GENERATOR + out_tag + "/";
+        gSystem->mkdir(rfolder, kTRUE);
+        TH2 *hR = (TH2 *) response->Hresponse()->Clone("h_response_3d_rownorm");
+        hR->SetDirectory(nullptr);
+        for (int iy = 1; iy <= hR->GetNbinsY(); ++iy) {
+            double row = 0.;
+            for (int ix = 1; ix <= hR->GetNbinsX(); ++ix) row += hR->GetBinContent(ix, iy);
+            if (row <= 0.) continue;
+            for (int ix = 1; ix <= hR->GetNbinsX(); ++ix) {
+                hR->SetBinContent(ix, iy, hR->GetBinContent(ix, iy) / row);
+                hR->SetBinError  (ix, iy, hR->GetBinError(ix, iy)   / row);
+            }
+        }
+        // same blue -> purple -> red scale as the 2D response plots
+        {
+            Double_t stops[3] = {0.00, 0.50, 1.00};
+            Double_t rr[3] = {0x4C / 255., 0x8C / 255., 0xC4 / 255.};
+            Double_t gg[3] = {0x72 / 255., 0x6B / 255., 0x4E / 255.};
+            Double_t bb[3] = {0xB0 / 255., 0xB1 / 255., 0x52 / 255.};
+            TColor::CreateGradientColorTable(3, stops, rr, gg, bb, 255);
+            gStyle->SetNumberContours(255);
+        }
+        const int ndr_r = u3d_reco_dr_size - 1, ndr_g = u3d_gen_dr_size - 1, nA = B_binsVectorSize - 1;
+        const int npt_r = u3d_reco_pt_size - 1, npt_g = u3d_gen_pt_size - 1;
+        hR->SetTitle("");
+        hR->GetXaxis()->SetTitle(Form("Detector-level bin (%d = %d #DeltaR #times %d A #times %d p_{T})",
+                                      hR->GetNbinsX(), ndr_r, nA, npt_r));
+        hR->GetYaxis()->SetTitle(Form("Particle-level bin (%d = %d #DeltaR #times %d A #times %d p_{T})",
+                                      hR->GetNbinsY(), ndr_g, nA, npt_g));
+        hR->GetZaxis()->SetTitle("P(detector | particle)");
+        hR->GetXaxis()->SetTitleSize(0.035); hR->GetYaxis()->SetTitleSize(0.035);
+        hR->GetYaxis()->SetTitleOffset(1.3); hR->GetZaxis()->SetTitleOffset(1.3);
+        // hR->SetMinimum(0.); hR->SetMaximum(1.);   // until 2026-10-28 evening
+        // hR->SetMinimum(0.); hR->SetMaximum(0.5);   // Zoe, then: 99% of the cells are below 0.063
+        hR->SetMinimum(0.); hR->SetMaximum(0.1);      // Zoe: 0-0.1, the few cells above saturate
+        {   // what the cells hold, to choose the scale
+            std::vector<double> v;
+            for (int ix = 1; ix <= hR->GetNbinsX(); ++ix) for (int iy = 1; iy <= hR->GetNbinsY(); ++iy)
+                if (hR->GetBinContent(ix, iy) > 0.) v.push_back(hR->GetBinContent(ix, iy));
+            std::sort(v.begin(), v.end());
+            if (!v.empty()) {
+                double rowmax = 0.; int nrow = 0;
+                for (int iy = 1; iy <= hR->GetNbinsY(); ++iy) {
+                    double m = 0.; for (int ix = 1; ix <= hR->GetNbinsX(); ++ix) m = std::max(m, hR->GetBinContent(ix, iy));
+                    if (m > 0.) { rowmax += m; ++nrow; }
+                }
+                std::cout << Form("3D response cells: %zu non-empty, max %.3f, 99%% below %.3f, 90%% below %.3f, median %.4f; mean of the row maxima %.3f",
+                                  v.size(), v.back(), v[(size_t) (0.99 * (v.size() - 1))], v[(size_t) (0.90 * (v.size() - 1))], v[v.size() / 2], rowmax / std::max(1, nrow)) << std::endl;
+            }
+        }
+        TCanvas *cr = new TCanvas("c_resp3d", "", 1300, 950);
+        cr->SetRightMargin(0.14); cr->SetLeftMargin(0.10); cr->SetTopMargin(0.09); cr->SetBottomMargin(0.10);
+        cr->SetFrameFillColor(kGray + 1);
+        hR->Draw("COLZ");
+        const double x0 = hR->GetXaxis()->GetXmin(), x1 = hR->GetXaxis()->GetXmax();
+        const double y0 = hR->GetYaxis()->GetXmin(), y1 = hR->GetYaxis()->GetXmax();
+        const double dx = (x1 - x0) / hR->GetNbinsX(), dy = (y1 - y0) / hR->GetNbinsY();
+        for (int k = 1; k < npt_r * nA; ++k) {   // A blocks thin, pT blocks thick
+            TLine *l = new TLine(x0 + k * ndr_r * dx, y0, x0 + k * ndr_r * dx, y1);
+            l->SetLineColor(kGray + 3); l->SetLineWidth(k % nA ? 1 : 3); l->SetLineStyle(k % nA ? 3 : 1); l->Draw();
+        }
+        for (int k = 1; k < npt_g * nA; ++k) {
+            TLine *l = new TLine(x0, y0 + k * ndr_g * dy, x1, y0 + k * ndr_g * dy);
+            l->SetLineColor(kGray + 3); l->SetLineWidth(k % nA ? 1 : 3); l->SetLineStyle(k % nA ? 3 : 1); l->Draw();
+        }
+        TLatex tl; tl.SetTextFont(42); tl.SetTextSize(0.022); tl.SetTextAlign(21);
+        for (int k = 0; k < npt_r; ++k)   // reco pT of each column block, above the frame
+            tl.DrawLatex(x0 + (k + 0.5) * nA * ndr_r * dx, y1 + 2. * dy,
+                         Form("reco %g-%g GeV", u3d_reco_pt[k], u3d_reco_pt[k + 1]));
+        tl.SetTextAlign(12); tl.SetTextColor(kWhite);
+        for (int k = 0; k < npt_g; ++k) {  // gen pT of each row block, inside the frame on the left
+            const bool of = (k == npt_g - 1), uf = (k == 0);
+            tl.DrawLatex(x0 + 3. * dx, y0 + (k + 0.5) * nA * ndr_g * dy,
+                         of ? Form("gen > %g GeV (overflow)", u3d_gen_pt[k])
+                            : Form("gen %g-%g GeV%s", u3d_gen_pt[k], u3d_gen_pt[k + 1], uf ? " (underflow)" : ""));
+        }
+        TLatex th; th.SetNDC(); th.SetTextSize(0.03);
+        th.SetTextFont(62); th.DrawLatex(0.10, 0.955, "CMS");
+        th.SetTextFont(52); th.DrawLatex(0.16, 0.955, "Work In Progress");
+        th.SetTextFont(42); th.SetTextAlign(31);
+        th.DrawLatex(0.86, 0.955, Form("3D response (%s, %s), %s", SAMPLE.Data(), GENERATOR.Data(),
+                                       EEC_WEIGHT_OFF ? "no EEC weight" : "EEC-weighted"));
+        cr->RedrawAxis();
+        const TString rstem = rfolder + (split ? "response_matrix_3d_pseudo" : "response_matrix_3d");
+        cr->Print(rstem + ".pdf");
+        cr->Print(rstem + ".png");
+        std::cout << "Wrote " << rstem << ".{pdf,png}" << std::endl;
+
+        // ---- (2026-10-29, Zoe's slides) two closer looks at the same matrix ----
+        auto header = [&](const char *what) {
+            TLatex t; t.SetNDC(); t.SetTextSize(0.03);
+            t.SetTextFont(62); t.DrawLatex(0.10, 0.955, "CMS");
+            t.SetTextFont(52); t.DrawLatex(0.16, 0.955, "Work In Progress");
+            t.SetTextFont(42); t.SetTextAlign(31); t.DrawLatex(0.86, 0.955, what);
+        };
+        // (a) zoom on the measured pT: the reco blocks from 100 GeV up x the gen 100-X bin, their A blocks.
+        // Since 2026-10-29 generic in the edges (was reco 100-120 = blocks 3-4 x gen 100-120).
+        {
+            int rb0 = 0; while (rb0 < npt_r && u3d_reco_pt[rb0] < 100. - 1e-6) ++rb0;   // first reco block >= 100 GeV
+            const int nrb = npt_r - rb0;                                              // reco blocks in the zoom
+            const int rx0 = rb0 * nA * ndr_r, gy0 = 2 * nA * ndr_g;                   // gen block 3 = the nominal one
+            TH2 *hz = (TH2 *) hR->Clone("h_response_3d_zoom"); hz->SetDirectory(nullptr);
+            hz->GetXaxis()->SetRange(rx0 + 1, rx0 + nrb * nA * ndr_r);
+            hz->GetYaxis()->SetRange(gy0 + 1, gy0 + nA * ndr_g);
+            TCanvas *cz = new TCanvas("c_resp3d_zoom", "", 1300, 950);
+            cz->SetRightMargin(0.14); cz->SetLeftMargin(0.10); cz->SetTopMargin(0.09); cz->SetBottomMargin(0.10);
+            cz->SetFrameFillColor(kGray + 1);
+            hz->Draw("COLZ");
+            const double xa = x0 + rx0 * dx, xb = x0 + (rx0 + nrb * nA * ndr_r) * dx;
+            const double ya = y0 + gy0 * dy, yb = y0 + (gy0 + nA * ndr_g) * dy;
+            for (int k = 1; k < nrb * nA; ++k) {
+                TLine *l = new TLine(xa + k * ndr_r * dx, ya, xa + k * ndr_r * dx, yb);
+                l->SetLineColor(kGray + 3); l->SetLineWidth(k % nA ? 1 : 3); l->Draw();
+            }
+            for (int k = 1; k < nA; ++k) {
+                TLine *l = new TLine(xa, ya + k * ndr_g * dy, xb, ya + k * ndr_g * dy);
+                l->SetLineColor(kGray + 3); l->SetLineWidth(1); l->Draw();
+            }
+            hz->GetXaxis()->SetLabelSize(0); hz->GetYaxis()->SetLabelSize(0);   // global bin numbers mean nothing here
+            hz->GetXaxis()->SetTickLength(0); hz->GetYaxis()->SetTickLength(0);
+            TLatex tz; tz.SetTextFont(42); tz.SetTextSize(0.022); tz.SetTextAlign(21);
+            for (int k = 0; k < nrb; ++k)
+                tz.DrawLatex(xa + (k + 0.5) * nA * ndr_r * dx, yb + 0.6 * dy, Form("reco %g-%g GeV", u3d_reco_pt[rb0 + k], u3d_reco_pt[rb0 + k + 1]));
+            tz.SetTextSize(0.018);
+            tz.SetTextSize(nrb > 2 ? 0.013 : 0.018);
+            for (int k = 0; k < nrb * nA; ++k)   // A bin of each reco column block
+                tz.DrawLatex(xa + (k + 0.5) * ndr_r * dx, ya - 1.6 * dy, Form("A %g-%g", B_binsVector[k % nA], B_binsVector[k % nA + 1]));
+            tz.SetTextAlign(32);
+            for (int k = 0; k < nA; ++k)       // A bin of each gen row block
+                tz.DrawLatex(xa - 1.5 * dx, ya + (k + 0.5) * ndr_g * dy, Form("A %g-%g", B_binsVector[k], B_binsVector[k + 1]));
+            hz->GetXaxis()->SetTitle("Detector-level bin (#DeltaR within each A block)");
+            hz->GetYaxis()->SetTitle(Form("Particle-level bin, gen %g-%g GeV", u3d_gen_pt[2], u3d_gen_pt[3]));
+            hz->GetXaxis()->SetTitleOffset(1.2); hz->GetYaxis()->SetTitleOffset(1.2);
+            header(Form("3D response, measured p_{T} (%s)", EEC_WEIGHT_OFF ? "no EEC weight" : "EEC-weighted"));
+            cz->RedrawAxis();
+            // const TString zs = rfolder + (split ? "response_matrix_3d_pseudo_zoom_pt100to120" : "response_matrix_3d_zoom_pt100to120");
+            const TString zs = rfolder + (split ? "response_matrix_3d_pseudo_zoom_nominal_pt" : "response_matrix_3d_zoom_nominal_pt");
+            cz->Print(zs + ".pdf"); cz->Print(zs + ".png");
+        }
+        // (b) projection on (dR, pT): the raw response summed over reco and gen A, then rows normalised
+        {
+            const TH2 *raw = response->Hresponse();
+            TH2D *hp = new TH2D("h_response_3d_proj_dr", "", ndr_r * npt_r, 0., ndr_r * npt_r, ndr_g * npt_g, 0., ndr_g * npt_g);
+            hp->SetDirectory(nullptr);
+            for (int ix = 1; ix <= raw->GetNbinsX(); ++ix)
+                for (int iy = 1; iy <= raw->GetNbinsY(); ++iy) {
+                    const int r = ix - 1, g = iy - 1;
+                    const int rdr = r % ndr_r, rpt = r / (ndr_r * nA), gdr = g % ndr_g, gpt = g / (ndr_g * nA);
+                    hp->AddBinContent(hp->GetBin(rdr + ndr_r * rpt + 1, gdr + ndr_g * gpt + 1), raw->GetBinContent(ix, iy));
+                }
+            for (int iy = 1; iy <= hp->GetNbinsY(); ++iy) {
+                double row = 0.;
+                for (int ix = 1; ix <= hp->GetNbinsX(); ++ix) row += hp->GetBinContent(ix, iy);
+                if (row > 0.) for (int ix = 1; ix <= hp->GetNbinsX(); ++ix) hp->SetBinContent(ix, iy, hp->GetBinContent(ix, iy) / row);
+            }
+            hp->SetMinimum(0.); hp->SetMaximum(0.3);
+            hp->GetXaxis()->SetTitle(Form("Detector-level bin (%d #DeltaR #times %d p_{T})", ndr_r, npt_r));
+            hp->GetYaxis()->SetTitle(Form("Particle-level bin (%d #DeltaR #times %d p_{T})", ndr_g, npt_g));
+            hp->GetZaxis()->SetTitle("P(detector | particle)");
+            hp->GetXaxis()->SetTitleSize(0.035); hp->GetYaxis()->SetTitleSize(0.035);
+            hp->GetYaxis()->SetTitleOffset(1.3); hp->GetZaxis()->SetTitleOffset(1.3);
+            TCanvas *cp = new TCanvas("c_resp3d_proj", "", 1300, 950);
+            cp->SetRightMargin(0.14); cp->SetLeftMargin(0.10); cp->SetTopMargin(0.09); cp->SetBottomMargin(0.10);
+            cp->SetFrameFillColor(kGray + 1);
+            hp->Draw("COLZ");
+            for (int k = 1; k < npt_r; ++k) { TLine *l = new TLine(k * ndr_r, 0., k * ndr_r, ndr_g * npt_g); l->SetLineColor(kGray + 3); l->SetLineWidth(3); l->Draw(); }
+            for (int k = 1; k < npt_g; ++k) { TLine *l = new TLine(0., k * ndr_g, ndr_r * npt_r, k * ndr_g); l->SetLineColor(kGray + 3); l->SetLineWidth(3); l->Draw(); }
+            TLatex tp; tp.SetTextFont(42); tp.SetTextSize(0.022); tp.SetTextAlign(21);
+            for (int k = 0; k < npt_r; ++k) tp.DrawLatex((k + 0.5) * ndr_r, ndr_g * npt_g + 0.6, Form("reco %g-%g GeV", u3d_reco_pt[k], u3d_reco_pt[k + 1]));
+            tp.SetTextAlign(12); tp.SetTextColor(kWhite);
+            for (int k = 0; k < npt_g; ++k)
+                tp.DrawLatex(0.5, (k + 0.5) * ndr_g, k == npt_g - 1 ? Form("gen > %g GeV", u3d_gen_pt[k]) : Form("gen %g-%g GeV", u3d_gen_pt[k], u3d_gen_pt[k + 1]));
+            header(Form("3D response projected on #DeltaR #times p_{T} (%s)", EEC_WEIGHT_OFF ? "no EEC weight" : "EEC-weighted"));
+            cp->RedrawAxis();
+            const TString ps = rfolder + (split ? "response_matrix_3d_pseudo_proj_dr_pt" : "response_matrix_3d_proj_dr_pt");
+            cp->Print(ps + ".pdf"); cp->Print(ps + ".png");
+            std::cout << "Wrote " << ps << ".png and the nominal-pT zoom" << std::endl;
+        }
+    }
+
+    // Bin-by-bin rescaling by num/den (or its inverse), content and error alike.
+    auto rescale = [](TH3D *h, const TH3D *num, const TH3D *den, bool divide) {
+        for (int i = 0; i < h->GetNcells(); ++i) {
+            const double d = den->GetBinContent(i);
+            const double r = (d > 0.) ? num->GetBinContent(i) / d : 0.;
+            const double f = divide ? ((r > 0.) ? 1. / r : 0.) : r;
+            h->SetBinContent(i, h->GetBinContent(i) * f);
+            h->SetBinError(i, h->GetBinError(i) * f);
+        }
+    };
+    TH3D *h_pc = (TH3D *) h_in->Clone("h_input_purity_corrected_3d");
+    h_pc->SetDirectory(nullptr);
+    rescale(h_pc, pur_num, pur_den, false);
+
+    // Refolding chi2 over every reco bin with input, input stat only (AN-2024-133).
+    auto refoldP = [&](const TH1 *h_unf, double &chi2, int &ndf) -> double {
+        TH1 *r = response->ApplyToTruth(h_unf, "h_refold_3d_tmp");
+        chi2 = 0.; ndf = 0;
+        for (int ix = 1; ix <= h_pc->GetNbinsX(); ++ix)
+            for (int iy = 1; iy <= h_pc->GetNbinsY(); ++iy)
+                for (int iz = 1; iz <= h_pc->GetNbinsZ(); ++iz) {
+                    const double d = h_pc->GetBinContent(ix, iy, iz), e = h_pc->GetBinError(ix, iy, iz);
+                    if (d == 0. || e <= 0.) continue;
+                    chi2 += std::pow((r->GetBinContent(ix, iy, iz) - d) / e, 2);
+                    ++ndf;
+                }
+        delete r;
+        return ndf > 0 ? TMath::Prob(chi2, ndf) : -1.;
+    };
+    // Closure in the measured region (gen pT 80-200, dR < 0.45, all A): rms of unfolded/truth - 1.
+    const int iz_lo = 2, iz_hi = 3, ix_hi = u3d_gen_dr_size - 2;
+    auto closureRms = [&](const TH3D *u) -> double {
+        double s = 0.; int n = 0;
+        for (int iz = iz_lo; iz <= iz_hi; ++iz)
+            for (int iy = 1; iy <= u->GetNbinsY(); ++iy)
+                for (int ix = 1; ix <= ix_hi; ++ix) {
+                    const double t = h_truth->GetBinContent(ix, iy, iz);
+                    if (t <= 0.) continue;
+                    s += std::pow(u->GetBinContent(ix, iy, iz) / t - 1., 2);
+                    ++n;
+                }
+        return n ? std::sqrt(s / n) : -1.;
+    };
+
+    // ---- niter: fixed, or the scan ----
+    const double an_threshold = 0.95;
+    int niter = NITER;
+    std::vector<double> v_n, v_p, v_rms;
+    if (NITER <= 0) {
+        const char *env = std::getenv("SCAN_NITER_MAX");
+        const int n_max = (env && std::atoi(env) > 0) ? std::atoi(env) : 200;
+        std::cout << "\n==== 3D niter scan 1.." << n_max << " (refolding, input stat; closure rms in gen pT 80-200, dR < 0.45) ====\n"
+                  << Form("  %5s %12s %5s %10s %12s\n", "niter", "chi2", "ndf", "p", "closure rms");
+        for (int n = 1; n <= n_max; ++n) {
+            RooUnfoldBayes unf(response, h_pc, n);
+            unf.SetVerbose(-1);
+            TH3D *u = (TH3D *) unf.Hreco(RooUnfold::kNoError)->Clone("h_unf_3d_scan");
+            double chi2 = 0.; int ndf = 0;
+            const double p = refoldP(u, chi2, ndf);
+            rescale(u, eff_num, eff_den, true);
+            const double rms = closureRms(u);
+            std::cout << Form("  %5d %12.2f %5d %10.3e %11.2f%%\n", n, chi2, ndf, p, 100. * rms);
+            v_n.push_back(n); v_p.push_back(p); v_rms.push_back(100. * rms);
+            if (niter <= 0 && p >= an_threshold) niter = n;
+            delete u;
+        }
+        if (niter <= 0) {
+            niter = n_max;
+            std::cout << "  ----> no niter reaches p >= " << an_threshold << " up to " << n_max
+                      << "; using " << n_max << std::endl;
+        } else {
+            std::cout << Form("  ----> OPTIMAL niter (AN-2024-133: first p >= %.2f, input stat) = %d\n", an_threshold, niter);
+        }
+    }
+
+    // ---- The unfolding at the chosen niter, with errors ----
+    std::cout << "\t---->Unfolding 3D, Bayesian (niter = " << niter << ")" << std::endl;
+    RooUnfoldBayes unf(response, h_pc, niter);
+    unf.SetVerbose(-1);
+    TH3D *h_unf = (TH3D *) unf.Hreco(RooUnfold::kCovariance)->Clone("h_unfolded_before_eff_3d");
+    h_unf->SetDirectory(nullptr);
+    double chi2 = 0.; int ndf = 0;
+    const double p = refoldP(h_unf, chi2, ndf);
+    TH3D *h_ref = (TH3D *) response->ApplyToTruth(h_unf, "h_refolded_3d");
+    TH3D *h_res = (TH3D *) h_unf->Clone("h_unfolded_3d");
+    h_res->SetDirectory(nullptr);
+    rescale(h_res, eff_num, eff_den, true);
+    std::cout << Form("\t---->Refolding GoF: chi2/ndf = %.2f/%d, p = %.3e; closure rms (gen pT 80-200, dR < 0.45) = %.2f%%",
+                      chi2, ndf, p, 100. * closureRms(h_res)) << std::endl;
+
+    // ---- Output ----
+    const TString folder = mc_base + "/results/unfolding_3d/" + SAMPLE + "_" + GENERATOR + out_tag + "/";
+    gSystem->mkdir(folder, kTRUE);
+    const TString stem = folder + (split ? "split_test" : "full_closure") + Form("_niter%d", niter);
+    TFile *fout = TFile::Open(stem + ".root", "RECREATE");
+    for (TH1 *h : std::initializer_list<TH1 *>{h_in, h_pc, h_unf, h_ref, h_res, h_truth}) h->Write();
+    if (!v_n.empty()) {
+        TGraph g_p((int) v_n.size(), v_n.data(), v_p.data());     g_p.Write("g_refold_p_vs_niter");
+        TGraph g_r((int) v_n.size(), v_n.data(), v_rms.data());   g_r.Write("g_closure_rms_vs_niter");
+    }
+    fout->Close();
+
+    // Projections in one gen pT bin: dR over A, or A over dR < 0.45.
+    auto proj = [&](const TH3D *h, bool dr, int iz, const char *tag) -> TH1D * {
+        TH1D *o = dr ? h->ProjectionX(Form("%s_dr_%d", tag, iz), 1, h->GetNbinsY(), iz, iz, "e")
+                     : h->ProjectionY(Form("%s_A_%d", tag, iz), 1, ix_hi, iz, iz, "e");
+        if (dr) o->GetXaxis()->SetRange(1, ix_hi);
+        o->SetDirectory(nullptr);
+        return o;
+    };
+    const Color_t red = ROCColor::red(), blue = ROCColor::blue();
+    TCanvas *c = new TCanvas("c_unf3d", "", 1200, 1000);
+    c->Divide(2, 2);
+    int pad = 0;
+    for (int dr = 1; dr >= 0; --dr)
+        for (int iz = iz_lo; iz <= iz_hi; ++iz) {
+            TPad *pp = (TPad *) c->cd(++pad);
+            TPad *top = new TPad(Form("t%d", pad), "", 0., 0.3, 1., 1.);
+            TPad *bot = new TPad(Form("b%d", pad), "", 0., 0., 1., 0.3);
+            top->SetBottomMargin(0.02); top->SetLeftMargin(0.15);
+            bot->SetTopMargin(0.02); bot->SetBottomMargin(0.3); bot->SetLeftMargin(0.15);
+            pp->cd(); top->Draw(); bot->Draw();
+            TH1D *hu = proj(h_res, dr, iz, "unf"), *ht = proj(h_truth, dr, iz, "truth");
+            hu->SetMarkerStyle(kFullCircle); hu->SetMarkerColor(red); hu->SetLineColor(red);
+            ht->SetLineColor(blue); ht->SetLineWidth(2);
+            top->cd();
+            ht->SetMaximum(1.3 * std::max(ht->GetMaximum(), hu->GetMaximum()));
+            ht->SetMinimum(0.);
+            ht->GetYaxis()->SetTitle(EEC_WEIGHT_OFF ? "weighted jets" : "EEC-weighted jets");
+            ht->GetXaxis()->SetLabelSize(0);
+            ht->Draw("hist");
+            hu->Draw("e1 same");
+            TLegend *lg = new TLegend(0.50, 0.62, 0.88, 0.84);
+            lg->SetBorderSize(0); lg->SetFillStyle(0);
+            lg->AddEntry(hu, Form("unfolded, 3D Bayes N = %d", niter), "pe");
+            lg->AddEntry(ht, split ? "truth (even half)" : "truth", "l");
+            lg->Draw();
+            TLatex tx; tx.SetNDC(); tx.SetTextSize(0.045);
+            tx.SetTextFont(62); tx.DrawLatex(0.15, 0.92, "CMS");
+            tx.SetTextFont(52); tx.DrawLatex(0.25, 0.92, "Work In Progress");
+            tx.SetTextFont(42);
+            tx.DrawLatex(0.50, 0.86, Form("%s, gen p_{T} %g-%g GeV", split ? "split test" : "full-MC closure",
+                                          u3d_gen_pt[iz - 1], u3d_gen_pt[iz]));
+            bot->cd();
+            TH1D *r = (TH1D *) hu->Clone(Form("ratio_%d", pad));
+            r->Divide(ht);
+            r->SetMinimum(0.8); r->SetMaximum(1.2);
+            r->GetYaxis()->SetTitle("unf. / truth"); r->GetYaxis()->SetNdivisions(505);
+            r->GetYaxis()->SetTitleSize(0.1); r->GetYaxis()->SetLabelSize(0.09); r->GetYaxis()->SetTitleOffset(0.6);
+            r->GetXaxis()->SetTitle(dr ? "#DeltaR" : "A = p_{T}^{b1}/(p_{T}^{b1} + p_{T}^{b2})");
+            r->GetXaxis()->SetTitleSize(0.11); r->GetXaxis()->SetLabelSize(0.1);
+            r->Draw("e1");
+            TLine *l1 = new TLine(r->GetXaxis()->GetBinLowEdge(r->GetXaxis()->GetFirst()), 1.,
+                                  r->GetXaxis()->GetBinUpEdge(r->GetXaxis()->GetLast()), 1.);
+            l1->SetLineStyle(2); l1->Draw();
+        }
+    c->Print(stem + ".pdf");
+    c->Print(stem + ".png");
+    std::cout << "Wrote " << stem << ".{root,pdf,png}" << std::endl;
 }
 
 // ============================================================================
@@ -2403,8 +3635,12 @@ void plot_tracking_eff_dr(TString SAMPLE = "both", TString GENERATOR = "pythia",
     const TString btag_tag = "btagWP0712";
 
     // The two productions: identical events, one with 3% of the reco tracks thrown away.
-    const TString tag_nom = mcVarTag(false) + "_upartv2";
-    const TString tag_trk = mcVarTag(true)  + "_upartv2";
+    // "_upartv2" was the pre-_rho era, which is no longer produced (fixed 2026-10-26): the
+    // current one is obsProdTag("dr"), the same production apply_unfolding() reads.
+    // const TString tag_nom = mcVarTag(false) + "_upartv2";
+    // const TString tag_trk = mcVarTag(true)  + "_upartv2";
+    const TString tag_nom = mcVarTag(false) + obsProdTag("dr");
+    const TString tag_trk = mcVarTag(true)  + obsProdTag("dr");
 
     std::cout << "Nominal production:" << std::endl;
     std::vector<TString> files_nom_n =
@@ -2423,12 +3659,26 @@ void plot_tracking_eff_dr(TString SAMPLE = "both", TString GENERATOR = "pythia",
     if (f_nom.empty() || f_trk.empty()) return;
 
     // h_count_bb = no EEC weight, h3D_bb = the EEC weight. Same events, same selection.
+    // Literal names, not obs.n(): this is a dR-only diagnostic, and dR's suffix is "".
+    //
+    // "both" is the weighted qcd + bjet combination, as in apply_unfolding() (2026-10-26; before,
+    // the two samples were summed raw). Each production gets its OWN weights: gMixWeight is keyed
+    // by sample directory, not by production, so it is set again before the second pair of sums.
+    /* ---- disabled (kept for reference): the raw sums, until 2026-10-26 ----
     TH3D *c_nom = sumOverFiles<TH3D>(f_nom, "h_count_bb");
     TH3D *c_trk = sumOverFiles<TH3D>(f_trk, "h_count_bb");
-    // Literal name, not obs.n(): plot_tracking_eff_dr is a dR-only diagnostic and reads the
-    // nominal _upartv2 production, which predates the observable axis and holds dR only.
     TH3D *e_nom = sumOverFiles<TH3D>(f_nom, "h3D_bb");
     TH3D *e_trk = sumOverFiles<TH3D>(f_trk, "h3D_bb");
+    ---- end disabled ---- */
+    gMixWeight.clear();
+    if (!setMixWeights(mc_base, SAMPLE, GENERATOR, btag_tag, tag_nom, obsDr())) return;
+    TH3D *c_nom = sumOverFiles<TH3D>(f_nom, "h_count_bb");
+    TH3D *e_nom = sumOverFiles<TH3D>(f_nom, "h3D_bb");
+    gMixWeight.clear();
+    if (!setMixWeights(mc_base, SAMPLE, GENERATOR, btag_tag, tag_trk, obsDr())) return;
+    TH3D *c_trk = sumOverFiles<TH3D>(f_trk, "h_count_bb");
+    TH3D *e_trk = sumOverFiles<TH3D>(f_trk, "h3D_bb");
+    gMixWeight.clear();
     if (!c_nom || !c_trk || !e_nom || !e_trk) return;
 
     // (mB, dr, jtpt) -> dr, integrating mB over everything and taking one jet-pT bin, which

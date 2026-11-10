@@ -14,6 +14,11 @@ struct KinematicConfig {
   float ptHigh;
   bool foldPtOverflow = true;
   ---- */
+  // 2026-10-29 (Zoe, "hard cut at 200"): RECO jets with pT >= ptHigh are dropped, so the last reco pT bin
+  // becomes 100-ptHigh. At gen there is no cut but an overflow bin (ptHigh-1000), so the migration across
+  // ptHigh goes through the response (non-square in pT).
+  // 0 = no cut (the open-ended last bin, as before). Set from JET_PT_MAX in create_files_for_template_fit.
+  float ptHigh = 0.;
 };
 
 // -- Dataset
@@ -102,7 +107,7 @@ bool passEventSelection(const tTree& t,
               t.HLT_AK4PFJet100_v8||
               t.HLT_AK4PFJet120_v8); // new trigger --> update 19 June 
 
-    if (isMC)
+    if (isMC) //check!!!!!
       return t.HLT_AK4PFJet60_v8;
   }
 
@@ -149,6 +154,9 @@ bool passGenJetKinematics(const tTree& t,
 
   if (fabs(eta) > cfg.kin.etaMax) return false;
   if (pt < cfg.kin.ptLow) return false;
+  // if (cfg.kin.ptHigh > 0. && pt >= cfg.kin.ptHigh) return false;   // JET_PT_MAX at gen too: first version
+  // Zoe (2026-10-29): the cut is a RECO cut, a selected jet can be above it at gen -> no upper cut here;
+  // the gen side gets an overflow bin instead (jtptGen* in binning_histos_small.h).
   /* ---- disabled (kept for reference): upper pT cut ----
   if (!cfg.kin.foldPtOverflow && pt > cfg.kin.ptHigh) return false;
   ---- */
@@ -173,6 +181,7 @@ bool passRecoJetKinematics(const tTree& t,
 
   if (fabs(eta) > cfg.kin.etaMax) return false;
   if (pt < cfg.kin.ptLow) return false;
+  if (cfg.kin.ptHigh > 0. && pt >= cfg.kin.ptHigh) return false;   // JET_PT_MAX (2026-10-29): reco only
   /* ---- disabled (kept for reference): upper pT cut ----
   if (!cfg.kin.foldPtOverflow && pt > cfg.kin.ptHigh) return false;
   ---- */
@@ -334,6 +343,12 @@ std::vector<TString> getActiveBranches(const AnalysisConfig& cfg)
         "trkPt",
         "trkEta",
         "trkPhi",
+        // Track impact parameters (2026-10-21): inputs of the aggregation NN, written to the
+        // per-track arrays of the aggregation ntuple. In both data and MC inputs;
+        // trkDistToAxisSig is NOT (absent from the _rho chunks), so it is not read.
+        "trkIp3d",
+        "trkIp3dSig",
+        "trkDistToAxis",
 
         "trkSvtxId",
 

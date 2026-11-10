@@ -52,6 +52,8 @@
 //   bbup / bbdn           central +/- h_..._syst_bb_model
 //   jpup / jpdn           central +/- h_..._syst_jpcalib_hf  (= |JP HF swap - central|, checked)
 //   qqup / qqdn           the h_..._qqrate_up / _qqrate_down curves themselves
+//   jphf                  the h_..._jpcalib_hf curve itself, the JP HF swap NOT symmetrised
+//                         (2026-11-09; its sign flips across pT). Replaces jpup/jpdn in the band.
 // jp* and qq* are varied TOGETHER with the UParT SF's jpsyst_up/dn and qqrate_up/down in the
 // same chain (the two SFs share those calibrations) -- that pairing is done by the driver
 // (run_svsf_components.sh) and the band, not here. The tag is written by the macro into its own filenames, the
@@ -78,7 +80,8 @@ inline TString file()
 }
 
 enum class Mode { Off, Nominal, Up, Down,
-                  StatUp, StatDn, NoMuonUp, NoMuonDn, BbUp, BbDn, JpUp, JpDn, QqUp, QqDn };
+                  StatUp, StatDn, NoMuonUp, NoMuonDn, BbUp, BbDn, JpUp, JpDn, QqUp, QqDn,
+                  JpHf };   // 2026-11-09: the measured JP HF swap curve itself, not symmetrised
 
 // variation name <-> mode <-> file tag, in one table.
 struct ModeName { const char *name; Mode mode; const char *tag; };
@@ -91,7 +94,8 @@ inline const std::vector<ModeName> &modeNames()
         {"nomuonup", Mode::NoMuonUp, "_svsfnomuonup"}, {"nomuondn", Mode::NoMuonDn, "_svsfnomuondn"},
         {"bbup", Mode::BbUp, "_svsfbbup"},           {"bbdn", Mode::BbDn, "_svsfbbdn"},
         {"jpup", Mode::JpUp, "_svsfjpup"},           {"jpdn", Mode::JpDn, "_svsfjpdn"},
-        {"qqup", Mode::QqUp, "_svsfqqup"},           {"qqdn", Mode::QqDn, "_svsfqqdn"} };
+        {"qqup", Mode::QqUp, "_svsfqqup"},           {"qqdn", Mode::QqDn, "_svsfqqdn"},
+        {"jphf", Mode::JpHf, "_svsfjphf"} };
     return t;
 }
 
@@ -148,6 +152,7 @@ inline void enable(const TString &variation, bool isMC)
         case Mode::JpUp:     case Mode::JpDn:     key = "h_SFb_singleb_sv_aggpt_syst_jpcalib_hf"; break;
         case Mode::QqUp:                          key = "h_SFb_singleb_sv_aggpt_qqrate_up";       break;
         case Mode::QqDn:                          key = "h_SFb_singleb_sv_aggpt_qqrate_down";     break;
+        case Mode::JpHf:                          key = "h_SFb_singleb_sv_aggpt_jpcalib_hf";      break;
         default: break;
     }
     if (key) {
@@ -178,7 +183,7 @@ inline double value(double pt)
         case Mode::StatDn: return sf - c.central->GetBinError(b);
         case Mode::NoMuonUp: case Mode::BbUp: case Mode::JpUp: return sf + c.shift->GetBinContent(b);
         case Mode::NoMuonDn: case Mode::BbDn: case Mode::JpDn: return sf - c.shift->GetBinContent(b);
-        case Mode::QqUp: case Mode::QqDn: return c.shift->GetBinContent(b);   // the curve itself
+        case Mode::QqUp: case Mode::QqDn: case Mode::JpHf: return c.shift->GetBinContent(b);   // the curve itself
         default: return 1.0;
     }
 }

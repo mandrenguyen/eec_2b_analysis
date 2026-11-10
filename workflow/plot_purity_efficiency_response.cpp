@@ -53,22 +53,43 @@ Int_t setBluePurpleRedPalette(Int_t ncontours = 255)
     return first;
 }
 
+// xvar (2026-10-28): the observable's axis name -- was always "#Deltar", also on the A maps.
 void drawCorrectionMap(TH2D *h, const char *ztitle, const char *level,
-                       double zmin, double zmax)
+                       double zmin, double zmax, const char *xvar = "#Deltar")
 {
     if (!h) return;
 
-    TH2D *hdraw = (TH2D*) h->Clone(Form("%s_clamped", h->GetName()));
+    // TH2D *hdraw = (TH2D*) h->Clone(Form("%s_clamped", h->GetName()));
+    // 2026-10-29: with the JET_PT_MAX gen overflow (pT up to 1000 GeV) a linear pT axis squeezes the
+    // 80-100 and 100-200 rows; then every pT bin is drawn as an equal-height row labelled with its range.
+    const bool pt_rows = (h->GetYaxis()->GetXmax() > 500.);
+    TH2D *hdraw = nullptr;
+    if (pt_rows) {
+        const int ny = h->GetNbinsY();
+        const TArrayD *xb = h->GetXaxis()->GetXbins();
+        hdraw = (xb->GetSize() > 0)
+              ? new TH2D(Form("%s_clamped", h->GetName()), "", h->GetNbinsX(), xb->GetArray(), ny, 0., ny)
+              : new TH2D(Form("%s_clamped", h->GetName()), "", h->GetNbinsX(), h->GetXaxis()->GetXmin(), h->GetXaxis()->GetXmax(), ny, 0., ny);
+        for (int ix = 0; ix <= h->GetNbinsX() + 1; ++ix)
+            for (int iy = 1; iy <= ny; ++iy) hdraw->SetBinContent(ix, iy, h->GetBinContent(ix, iy));
+        for (int iy = 1; iy <= ny; ++iy)
+            hdraw->GetYaxis()->SetBinLabel(iy, iy == ny ? Form("> %g", h->GetYaxis()->GetBinLowEdge(iy))
+                                                        : Form("%g-%g", h->GetYaxis()->GetBinLowEdge(iy), h->GetYaxis()->GetBinUpEdge(iy)));
+    } else {
+        hdraw = (TH2D*) h->Clone(Form("%s_clamped", h->GetName()));
+    }
     hdraw->SetDirectory(0);
     for (int ix = 1; ix <= hdraw->GetNbinsX(); ++ix)
         for (int iy = 1; iy <= hdraw->GetNbinsY(); ++iy)
             if (hdraw->GetBinContent(ix, iy) < zmin) hdraw->SetBinContent(ix, iy, zmin);
 
     hdraw->SetStats(0);
-    hdraw->GetXaxis()->SetTitle(Form("%s #Deltar", level));
+    // hdraw->GetXaxis()->SetTitle(Form("%s #Deltar", level));   // until 2026-10-28
+    hdraw->GetXaxis()->SetTitle(Form("%s %s", level, xvar));
     hdraw->GetYaxis()->SetTitle(Form("%s jet p_{T} (GeV)", level));
     hdraw->GetZaxis()->SetTitle(ztitle);
-    hdraw->GetZaxis()->SetTitleOffset(1.2);
+    // hdraw->GetZaxis()->SetTitleOffset(1.2);   // until 2026-10-28: title on the labels
+    hdraw->GetZaxis()->SetTitleOffset(1.45);
     hdraw->SetMinimum(zmin);
     hdraw->SetMaximum(zmax);
 
@@ -81,7 +102,7 @@ void drawCorrectionMap(TH2D *h, const char *ztitle, const char *level,
     hdraw->Draw("COLZ");
 
     gPad->Update();
-    hdraw->GetYaxis()->ChangeLabel(-1, -1, -1, -1, -1, -1, "#infty");
+    if (!pt_rows) hdraw->GetYaxis()->ChangeLabel(-1, -1, -1, -1, -1, -1, "#infty");
 
     TLatex t;
     t.SetTextAlign(22);          // centred on the cell
@@ -94,7 +115,7 @@ void drawCorrectionMap(TH2D *h, const char *ztitle, const char *level,
             const double v = h->GetBinContent(ix, iy);
             if (v == 0.) continue;
             t.DrawLatex(h->GetXaxis()->GetBinCenter(ix),
-                        h->GetYaxis()->GetBinCenter(iy),
+                        pt_rows ? iy - 0.5 : h->GetYaxis()->GetBinCenter(iy),
                         Form("%.2f", v));
         }
     }
@@ -244,7 +265,7 @@ void plot_purity_efficiency_response(const char *infile = nullptr,
       return;}
 
   
-    auto ratioFromCounts = [&](const char* num, const char* den, const char* name) -> TH2D* {
+    auto ratioFromCounts = [&](const TString &num, const TString &den, const char* name) -> TH2D* {
         TH2D* hn = (TH2D*) f->Get(num);
         TH2D* hd = (TH2D*) f->Get(den);
         if (!hn || !hd) { std::cout << "Missing " << num << " or " << den << std::endl; return nullptr; }
@@ -254,10 +275,19 @@ void plot_purity_efficiency_response(const char *infile = nullptr,
         return r;
     };
 
-    TH2D *h_purity     = ratioFromCounts("h_full_purity_numerator_tf",
-                                         "h_full_purity_denominator_tf",     "h_purity");
-    TH2D *h_efficiency = ratioFromCounts("h_full_efficiency_numerator_tf",
-                                         "h_full_efficiency_denominator_tf", "h_efficiency");
+    // TH2D *h_purity     = ratioFromCounts("h_full_purity_numerator_tf",
+    //                                      "h_full_purity_denominator_tf",     "h_purity");
+    // TH2D *h_efficiency = ratioFromCounts("h_full_efficiency_numerator_tf",
+    //                                      "h_full_efficiency_denominator_tf", "h_efficiency");
+    // 2026-10-28: the bug above read dR's purity/efficiency for EVERY observable, so the "B" call
+    // drew dR's (from the A production). Now the observable's own, as apply_unfolding_2d.C reads them.
+    TH2D *h_purity     = ratioFromCounts("h_full_purity_numerator_tf" + obs_sfx,
+                                         "h_full_purity_denominator_tf" + obs_sfx,     "h_purity");
+    TH2D *h_efficiency = ratioFromCounts("h_full_efficiency_numerator_tf" + obs_sfx,
+                                         "h_full_efficiency_denominator_tf" + obs_sfx, "h_efficiency");
+    const bool isA = (obs_sfx == "_B");
+    const char *xvar = isA ? "A" : "#Deltar";             // say A, not B (B is only the code's name)
+    const TString fsfx = isA ? "A" : "dr";                // file names: purity_jtpt_A, ...
 
     if(!h_purity || !h_efficiency)
       {std::cout << "Histograms not found" << std::endl;
@@ -273,20 +303,26 @@ void plot_purity_efficiency_response(const char *infile = nullptr,
     TCanvas *cPurity_jtpt_dr     = new TCanvas("cPurity_jtpt_dr",     "Purity vs jtpt and dR",     800, 700);
     TCanvas *cEfficiency_jtpt_dr = new TCanvas("cEfficiency_jtpt_dr", "Efficiency vs jtpt and dR", 800, 700);
 
-    const double z_lo = 0.75, z_hi = 1.0;
+    // const double z_lo = 0.75, z_hi = 1.0;   // until 2026-10-28: A's efficiency (down to 0.67) was clipped
+    const double lo_all = std::min(h_purity->GetMinimum(), h_efficiency->GetMinimum());
+    const double z_lo = std::min(0.75, std::floor(20. * lo_all) / 20.), z_hi = 1.0;
 
     cPurity_jtpt_dr->cd();
-    gPad->SetRightMargin(0.16);
+    // gPad->SetRightMargin(0.16);   // until 2026-10-28
+    gPad->SetRightMargin(0.18);
     gPad->SetLeftMargin(0.13);
     gPad->SetTopMargin(0.08);
-    drawCorrectionMap(h_purity, "Purity", "reco", z_lo, z_hi);
+    // drawCorrectionMap(h_purity, "Purity", "reco", z_lo, z_hi);
+    drawCorrectionMap(h_purity, "Purity", "reco", z_lo, z_hi, xvar);
     drawCMSHeader((TPad*) gPad);
 
     cEfficiency_jtpt_dr->cd();
-    gPad->SetRightMargin(0.16);
+    // gPad->SetRightMargin(0.16);   // until 2026-10-28
+    gPad->SetRightMargin(0.18);
     gPad->SetLeftMargin(0.13);
     gPad->SetTopMargin(0.08);
-    drawCorrectionMap(h_efficiency, "Efficiency", "gen", z_lo, z_hi);
+    // drawCorrectionMap(h_efficiency, "Efficiency", "gen", z_lo, z_hi);
+    drawCorrectionMap(h_efficiency, "Efficiency", "gen", z_lo, z_hi, xvar);
     drawCMSHeader((TPad*) gPad);
 
    
@@ -327,17 +363,20 @@ void plot_purity_efficiency_response(const char *infile = nullptr,
         e1->SetMarkerColor(col_eff);
 
         e1->SetTitle("");
-        e1->GetYaxis()->SetRangeUser(0.9, 1.0);
+        // e1->GetYaxis()->SetRangeUser(0.9, 1.0);   // until 2026-10-28
+        e1->GetYaxis()->SetRangeUser(std::min(0.9, std::floor(20. * (e1->GetMinimum() - e1->GetBinError(e1->GetMinimumBin()))) / 20.), 1.0);
         e1->GetYaxis()->SetTitle("efficiency");
         e1->GetYaxis()->CenterTitle(true);
         e1->GetYaxis()->SetTitleOffset(1.3);
-        e1->GetXaxis()->SetTitle("#Deltar");
+        // e1->GetXaxis()->SetTitle("#Deltar");
+        e1->GetXaxis()->SetTitle(xvar);
         e1->GetXaxis()->CenterTitle(true);
         e1->Draw("PE");
 
-        const TString pt_txt = (ipt == n_pt)
-            ? Form("p_{T}^{jet} > %.0f GeV", ptlo)
-            : Form("%.0f < p_{T}^{jet} < %.0f GeV", ptlo, pthi);
+        // const TString pt_txt = (ipt == n_pt)
+        //     ? Form("p_{T}^{jet} > %.0f GeV", ptlo)
+        //     : Form("%.0f < p_{T}^{jet} < %.0f GeV", ptlo, pthi);
+        const TString pt_txt = jetPtRangeLabel(ptlo, pthi);
         leg->AddEntry(e1, Form("Efficiency, %s", pt_txt.Data()), "lp");
     }
     leg->Draw();
@@ -385,7 +424,11 @@ void plot_purity_efficiency_response(const char *infile = nullptr,
     hResponse->GetXaxis()->SetTitle("Detector-level bin");
     hResponse->GetYaxis()->SetTitle("Particle-level bin");
     hResponse->GetZaxis()->SetTitle("P(detector | particle)");
-    hResponse->GetZaxis()->SetTitleOffset(1.2);
+    // hResponse->GetZaxis()->SetTitleOffset(1.2);   // until 2026-10-28: title on the labels (A)
+    hResponse->GetZaxis()->SetTitleOffset(1.45);
+    // 2026-10-28 (Zoe): a probability, so the colour scale is always 0-1 (was auto, i.e. 0-max)
+    hResponse->SetMinimum(0.);
+    hResponse->SetMaximum(1.);
 
     TCanvas *c = new TCanvas("c","response",800,700);
 
@@ -393,7 +436,8 @@ void plot_purity_efficiency_response(const char *infile = nullptr,
     c->SetFrameFillColor(kGray + 1);
     gPad->SetFrameFillColor(kGray + 1);
 
-    gPad->SetRightMargin(0.16);
+    // gPad->SetRightMargin(0.16);   // until 2026-10-28
+    gPad->SetRightMargin(0.18);
     gPad->SetLeftMargin(0.12);
     gPad->SetBottomMargin(0.12);
     gPad->SetTopMargin(0.08);
@@ -411,12 +455,17 @@ void plot_purity_efficiency_response(const char *infile = nullptr,
     diag->SetLineWidth(1);
     diag->Draw("same");
 
+    // 2026-10-29: reco and gen can have different pT bins (JET_PT_MAX: + a gen overflow), so the block
+    // lines are placed per axis: n_dr_resp observable bins per reco pT block, the same per gen block.
     for (int ib = n_dr_resp; ib < n; ib += n_dr_resp) {
         const double xb = hResponse->GetXaxis()->GetBinUpEdge(ib);
-        const double yb = hResponse->GetYaxis()->GetBinUpEdge(ib);
         TLine *lv = new TLine(xb, hResponse->GetYaxis()->GetXmin(), xb, hResponse->GetYaxis()->GetXmax());
+        lv->SetLineColor(kGray + 3); lv->SetLineWidth(1); lv->Draw("same");
+    }
+    for (int ib = n_dr_resp; ib < hResponse->GetNbinsY(); ib += n_dr_resp) {
+        const double yb = hResponse->GetYaxis()->GetBinUpEdge(ib);
         TLine *lh = new TLine(hResponse->GetXaxis()->GetXmin(), yb, hResponse->GetXaxis()->GetXmax(), yb);
-        for (TLine* l : {lv, lh}) { l->SetLineColor(kGray + 3); l->SetLineWidth(1); l->Draw("same"); }
+        for (TLine* l : {lh}) { l->SetLineColor(kGray + 3); l->SetLineWidth(1); l->Draw("same"); }
     }
     drawCMSHeader((TPad*) gPad);
     gPad->RedrawAxis();
@@ -426,12 +475,12 @@ void plot_purity_efficiency_response(const char *infile = nullptr,
     c->SaveAs(Form("%s/response_matrix.pdf", PLOT_OUTDIR));
     c->SaveAs(Form("%s/response_matrix.png", PLOT_OUTDIR));
 
-    cPurity_jtpt_dr->SaveAs(Form("%s/purity_jtpt_dr.pdf", PLOT_OUTDIR));
-    cPurity_jtpt_dr->SaveAs(Form("%s/purity_jtpt_dr.png", PLOT_OUTDIR));
-    cEfficiency_jtpt_dr->SaveAs(Form("%s/efficiency_jtpt_dr.pdf", PLOT_OUTDIR));
-    cEfficiency_jtpt_dr->SaveAs(Form("%s/efficiency_jtpt_dr.png", PLOT_OUTDIR));
-    cCorr1D->SaveAs(Form("%s/efficiency_vs_dr_nominal_pt.pdf", PLOT_OUTDIR));
-    cCorr1D->SaveAs(Form("%s/efficiency_vs_dr_nominal_pt.png", PLOT_OUTDIR));
+    // the _dr names were also used for A until 2026-10-28; dR keeps them, A gets _A
+    for (const char *e : {"pdf", "png"}) {
+        cPurity_jtpt_dr->SaveAs(Form("%s/purity_jtpt_%s.%s", PLOT_OUTDIR, fsfx.Data(), e));
+        cEfficiency_jtpt_dr->SaveAs(Form("%s/efficiency_jtpt_%s.%s", PLOT_OUTDIR, fsfx.Data(), e));
+        cCorr1D->SaveAs(Form("%s/efficiency_vs_%s_nominal_pt.%s", PLOT_OUTDIR, fsfx.Data(), e));
+    }
 }
 
 

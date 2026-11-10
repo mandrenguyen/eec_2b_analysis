@@ -125,3 +125,11 @@ block and `wait`s. Use it for ~10-block runs; use Condor when the job count is l
   delete stale ones before recompiling for this reason.
 - Emacs backup and lock files (`*~`, `#*#`) litter the tree and are gitignored — ignore them.
 - `._*` files are macOS AppleDouble metadata created by the mount, not real source files.
+- **Do not create new files unless it is truly unavoidable.** This includes one-off drivers in
+  `condor/`, comparison/check macros, and helper scripts. Extend the file that already does
+  the job: a new SF or variation goes into the header, run script, driver and plotting macro
+  that already do the same job (e.g. `sv_sf.h`, `tracking_efficiency_syst.h`,
+  `run_agg_ntuple_chunks.sh`, `run_svsf_chain.sh`, `plot_svsf_comparison.C`). A rerun is
+  launched by calling the existing drivers directly (with their env knobs), not through a new
+  wrapper script. A quick check is a `root -e` one-liner, not a new macro. If a new file
+  really seems necessary, ask first.

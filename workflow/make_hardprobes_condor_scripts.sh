@@ -82,6 +82,55 @@ case "${OUT_TAG}" in
   *)      [ "${APPLY_JETVETO}" = false ] || { echo "APPLY_JETVETO=true needs an OUT_TAG containing 'veto' (e.g. upartv2rhojecveto) -- refusing"; exit 1; } ;;
 esac
 [ "${APPLY_JETVETO}" = true ] && echo "JET VETO MAP ON: jets in the 2024 vetoed (eta, phi) cells rejected"
+# JET_PT_MAX (2026-10-29): the hard upper jet-pT cut of step 1 (read from the environment by the
+# macro). The OUT_TAG must say "ptmax<value>" exactly when it is set, so cut and uncut files never mix.
+JET_PT_MAX=${JET_PT_MAX:-}
+case "${OUT_TAG}" in
+  *ptmax*) [ -n "${JET_PT_MAX}" ] && [[ "${OUT_TAG}" == *ptmax${JET_PT_MAX}* ]] || { echo "OUT_TAG '${OUT_TAG}' says ptmax but JET_PT_MAX='${JET_PT_MAX}' -- refusing"; exit 1; } ;;
+  *)       [ -z "${JET_PT_MAX}" ] || { echo "JET_PT_MAX=${JET_PT_MAX} needs an OUT_TAG containing 'ptmax${JET_PT_MAX}' -- refusing"; exit 1; } ;;
+esac
+[ -n "${JET_PT_MAX}" ] && { export JET_PT_MAX; echo "JET PT CUT ON: jets with pT >= ${JET_PT_MAX} GeV dropped at reco and gen"; }
+# DR_MIN (2026-10-30): the lower dR cut of step 1, same rule as in run_agg_ntuple_chunks.sh. Written
+# into every job script below (not left to condor's getenv).
+DR_MIN=${DR_MIN:-}
+case "${OUT_TAG}" in
+  *drmin*) [ -n "${DR_MIN}" ] && [[ "${OUT_TAG}" == *drmin${DR_MIN/./p}* ]] || { echo "OUT_TAG '${OUT_TAG}' says drmin but DR_MIN='${DR_MIN}' -- refusing"; exit 1; } ;;
+  *)       [ -z "${DR_MIN}" ] || { echo "DR_MIN=${DR_MIN} needs an OUT_TAG containing 'drmin${DR_MIN/./p}' -- refusing"; exit 1; } ;;
+esac
+[ -n "${DR_MIN}" ] && echo "DR CUT ON: jets with dR <= ${DR_MIN} dropped at reco and gen, every observable"
+# SV_SEED (2026-11-05): same rule as in run_agg_ntuple_chunks.sh. Written into every job script below.
+SV_SEED=${SV_SEED:-}
+[ -z "${SV_SEED}" ] || [ "${SV_SEED}" = on ] || { echo "SV_SEED must be on or unset, got '${SV_SEED}'"; exit 1; }
+case "${OUT_TAG}" in
+  *svseed*) [ "${SV_SEED}" = on ] || { echo "OUT_TAG '${OUT_TAG}' says svseed but SV_SEED='${SV_SEED}' -- refusing"; exit 1; } ;;
+  *)        [ -z "${SV_SEED}" ]   || { echo "SV_SEED=on needs an OUT_TAG containing 'svseed' -- refusing"; exit 1; } ;;
+esac
+SV_SEED_M2B=${SV_SEED_M2B:-}   # 2026-11-06: nominal = the fit's m2B from the plain BDT selection; tag "svseednm"
+[ -z "${SV_SEED_M2B}" ] || { [ "${SV_SEED_M2B}" = nominal ] && [ "${SV_SEED}" = on ]; } || { echo "SV_SEED_M2B must be nominal (with SV_SEED=on) or unset, got '${SV_SEED_M2B}'"; exit 1; }
+case "${OUT_TAG}" in
+  *svseednm*) [ -n "${SV_SEED_M2B}" ] || { echo "OUT_TAG '${OUT_TAG}' says svseednm but SV_SEED_M2B is unset -- refusing"; exit 1; } ;;
+  *)          [ -z "${SV_SEED_M2B}" ] || { echo "SV_SEED_M2B needs an OUT_TAG containing 'svseednm' -- refusing"; exit 1; } ;;
+esac
+[ -n "${SV_SEED}" ] && echo "SV SEED ON: an SV with a track passing the BDT keeps all its tracks"
+[ -n "${SV_SEED_M2B}" ] && echo "m2B from the plain BDT selection"
+# SV_SEED_DIAG (2026-11-06): the data/MC histograms of the rule (h_diag_*). Own OUT_TAG, no chain reads them.
+SV_SEED_DIAG=${SV_SEED_DIAG:-}
+case "${OUT_TAG}" in
+  *svseednmdiag*) [ "${SV_SEED_DIAG}" = on ] || { echo "OUT_TAG '${OUT_TAG}' says diag but SV_SEED_DIAG='${SV_SEED_DIAG}' -- refusing"; exit 1; } ;;
+  *)              [ -z "${SV_SEED_DIAG}" ]   || { echo "SV_SEED_DIAG needs an OUT_TAG containing 'svseednmdiag' -- refusing"; exit 1; } ;;
+esac
+
+# Aggregation NN (agg_nn.h, 2026-10-22): same switch and OUT_TAG rule as run_agg_ntuple_chunks.sh.
+# Written into every job script below (not left to condor's getenv).
+AGG_NN=${AGG_NN:-off}   # on | off
+# DISABLED 2026-10-22 (Zoe): NN commented out (agg_nn.h, result_paths.h); only off is accepted.
+[ "${AGG_NN}" = off ] || { echo "AGG_NN=${AGG_NN}: the aggregation NN is disabled -- refusing"; exit 1; }
+# if [ "${AGG_NN}" != on ] && [ "${AGG_NN}" != off ]; then echo "AGG_NN must be exactly 'on' or 'off', got '${AGG_NN}'"; exit 1; fi
+case "${OUT_TAG}" in
+  *vetonn*) [ "${AGG_NN}" = on ]  || { echo "OUT_TAG '${OUT_TAG}' says vetonn but AGG_NN=off -- refusing"; exit 1; } ;;
+  *)        [ "${AGG_NN}" = off ] || { echo "AGG_NN=on needs an OUT_TAG containing 'vetonn' -- refusing"; exit 1; } ;;
+esac
+[ "${AGG_NN}" = on ] && echo "AGGREGATION NN ON: observables from the NN's two B candidates"
 # Staging dir only, so two productions can never share a staging area.
 STAGE_TAG="${EECW_TAG}${OUT_SUFFIX}"
 # The job scripts get their own directory per production too, so two productions (the EEC and
@@ -134,6 +183,11 @@ ACLIC_BUILD_DIR=${ACLIC_BUILD_DIR}
 
 cd "\${WORK}"
 source "\${WORK}/setup_roounfold_env.sh"
+export AGG_NN=${AGG_NN}
+${DR_MIN:+export DR_MIN=${DR_MIN}}
+${SV_SEED:+export SV_SEED=${SV_SEED}}
+${SV_SEED_M2B:+export SV_SEED_M2B=${SV_SEED_M2B}}
+${SV_SEED_DIAG:+export SV_SEED_DIAG=${SV_SEED_DIAG}}
 mkdir -p "\${OUTDIR}" "\${LOGDIR}"
 rm -rf "\${STAGEDIR}"
 mkdir -p "\${STAGEDIR}"

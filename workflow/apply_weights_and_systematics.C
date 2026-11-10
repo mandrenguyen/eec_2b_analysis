@@ -90,6 +90,14 @@ struct Variation {
     // TRACK_BDT_SF of that run. The nominal applies both SFb and SFl; "boff" and "loff"
     // remove one source at a time while retaining the other.
     TString trackBdtSfVariation = "";
+    // UNFOLD_PRIOR of that run (priorTag() in result_paths.h, 2026-10-16): "" = the response
+    // generator's own prior; "pythia" / "herwig" = that generator's truth as the prior.
+    TString priorVariation = "";
+    // 2026-11-09 (Zoe): entries sharing a non-empty sumGroup are PARTS of one source. Their
+    // signed shifts are ADDED bin by bin (so they can cancel) into ONE entry named after the
+    // sumGroup, which enters the band like any single signed source; the parts themselves
+    // become display only. Used for the JP HF swap: SV SF part + UParT SF part.
+    TString sumGroup = "";
 };
 
 // ---- Weights = scale factors ---------------------------------------------------------
@@ -347,8 +355,19 @@ void apply_weights_and_systematics(TString SAMPLE = "both", TString GENERATOR = 
         // were doing before"), replacing herwig_full below.
         { "template_fit",    SAMPLE, GENERATOR, other_gen,    "TF " + prettyGen(other_gen),        false,
           "nominal", SFUPART_NOM, "", "MC template modeling" },
+        /* ---- disabled 2026-10-16 (kept for reference): prior AND response from Herwig at once ----
         { "unfolding_model", SAMPLE, other_gen, TF_GENERATOR, "Unfolding " + prettyGen(other_gen), false,
           "nominal", SFUPART_NOM, "", "Detector response" },
+        ---- end disabled ---- */
+        // 2026-10-16 (Zoe): the Herwig unfolding split in its two parts (UNFOLD_PRIOR):
+        //   unfolding_model  Herwig response + corrections, the nominal (Pythia) prior
+        //   unfolding_prior  the nominal (Pythia) response + corrections, the Herwig prior
+        // Matrix inversion has no prior, so there unfolding_prior is identically 0.
+        { "unfolding_model", SAMPLE, other_gen, TF_GENERATOR,
+          "Response " + prettyGen(other_gen) + ", prior " + prettyGen(GENERATOR), false,
+          "nominal", SFUPART_NOM, "", "Detector response", true, false, "", "", GENERATOR },
+        { "unfolding_prior", SAMPLE, GENERATOR, TF_GENERATOR, "Prior " + prettyGen(other_gen), false,
+          "nominal", SFUPART_NOM, "", "Unfolding prior", true, false, "", "", other_gen },
         /* ---- disabled (kept for reference): herwig_full, 2026-09-29 -> 2026-10-01 ----
         // All the Herwig dependence in ONE source (Zoe, 2026-09-29): the whole chain redone
         // with Herwig -- template fit AND unfolding MC -- against the all-Pythia nominal.
@@ -381,8 +400,19 @@ void apply_weights_and_systematics(TString SAMPLE = "both", TString GENERATOR = 
         // were doing before"), replacing herwig_full below.
         { "template_fit",    SAMPLE, GENERATOR, other_gen,    "TF " + prettyGen(other_gen),        false,
           "nominal", SFUPART_NOM, "", "MC template modeling" },
+        /* ---- disabled 2026-10-16 (kept for reference): prior AND response from Herwig at once ----
         { "unfolding_model", SAMPLE, other_gen, TF_GENERATOR, "Unfolding " + prettyGen(other_gen), false,
           "nominal", SFUPART_NOM, "", "Detector response" },
+        ---- end disabled ---- */
+        // 2026-10-16 (Zoe): the Herwig unfolding split in its two parts (UNFOLD_PRIOR):
+        //   unfolding_model  Herwig response + corrections, the nominal (Pythia) prior
+        //   unfolding_prior  the nominal (Pythia) response + corrections, the Herwig prior
+        // Matrix inversion has no prior, so there unfolding_prior is identically 0.
+        { "unfolding_model", SAMPLE, other_gen, TF_GENERATOR,
+          "Response " + prettyGen(other_gen) + ", prior " + prettyGen(GENERATOR), false,
+          "nominal", SFUPART_NOM, "", "Detector response", true, false, "", "", GENERATOR },
+        { "unfolding_prior", SAMPLE, GENERATOR, TF_GENERATOR, "Prior " + prettyGen(other_gen), false,
+          "nominal", SFUPART_NOM, "", "Unfolding prior", true, false, "", "", other_gen },
         /* ---- disabled (kept for reference): herwig_full, 2026-09-29 -> 2026-10-01 ----
         // All the Herwig dependence in one source -- see the B branch above.
         { "herwig_full",     SAMPLE, other_gen, other_gen,    "Full " + prettyGen(other_gen) + " chain", false,
@@ -512,14 +542,22 @@ void apply_weights_and_systematics(TString SAMPLE = "both", TString GENERATOR = 
     //
     // JP HF and qq rate are calibrations SHARED with the UParT b-tag SF, so for dr each of
     // those chains moves BOTH SFs the same way: SV SF jp+/- with UParT jpsyst_up/dn (the same
-    // +/- |JP HF swap - central| treatment), SV SF qq up/down with UParT qqrate_up/down. B has
+    // +/- |JP HF swap - central| treatment) [since 2026-11-09: with UParT jpcalib_hf, the swap
+    // unsymmetrised, in both jp chains], SV SF qq up/down with UParT qqrate_up/down. B has
     // no UParT SF, so there they move the SV SF alone.
     //
     // The 2026-10-12 version (one pair: central +/- stat (+) syst_total) is kept below, off.
     // Produce with run_svsf_components.sh.
     if (svsfTag() == "_svsf" && (OBSERVABLE != "dr" || (rhoInputs() && !EEC_WEIGHT_OFF))) {
-        const bool    dr  = (OBSERVABLE == "dr");
-        const TString jpU = dr ? "jpsyst_up"   : SFUPART_NOM, jpD = dr ? "jpsyst_dn"   : SFUPART_NOM;
+        // 2026-10-19: A has its own UParT SF, so its JP HF / qq chains move both SFs too.
+        // const bool    dr  = (OBSERVABLE == "dr");
+        const bool    dr  = true;
+        // const TString jpU = dr ? "jpsyst_up"   : SFUPART_NOM, jpD = dr ? "jpsyst_dn"   : SFUPART_NOM;   // until 2026-11-09
+        // 2026-11-09 (Zoe): the UParT JP HF swap UNSYMMETRISED -- the measured alternative curve
+        // (jpcalib_hf, sign flipping across bins) instead of central +/- |swap - central|. The
+        // same curve in both members, so in each chain the SV jp+/- shift and the UParT swap
+        // shift add LINEARLY (same calibration, fully correlated), signed, not in quadrature.
+        const TString jpU = dr ? "jpcalib_hf"  : SFUPART_NOM, jpD = dr ? "jpcalib_hf"  : SFUPART_NOM;
         const TString qqU = dr ? "qqrate_up"   : SFUPART_NOM, qqD = dr ? "qqrate_down" : SFUPART_NOM;
         const TString jpLab = dr ? "JP HF swap (SV + UParT SF)" : "JP HF swap (SV SF)";
         const TString qqLab = dr ? "qq rate (SV + UParT SF)"    : "qq rate (SV SF)";
@@ -528,7 +566,7 @@ void apply_weights_and_systematics(TString SAMPLE = "both", TString GENERATOR = 
             { "sv_sf_stat",   "SV b SF stat",            "SV b SF: stat",     "statup",   "statdn",   SFUPART_NOM, SFUPART_NOM },
             { "sv_sf_nomuon", "SV b SF no-muon",         "SV b SF: no muon",  "nomuonup", "nomuondn", SFUPART_NOM, SFUPART_NOM },
             { "sv_sf_bb",     "SV b SF bb model",        "SV b SF: bb model", "bbup",     "bbdn",     SFUPART_NOM, SFUPART_NOM },
-            { "jp_hf",        jpLab,                     "JP HF swap",        "jpup",     "jpdn",     jpU, jpD },
+            // { "jp_hf",        jpLab,                     "JP HF swap",        "jpup",     "jpdn",     jpU, jpD },   // until 2026-11-09: symmetrised pair
             { "qq_rate",      qqLab,                     "qq rate",           "qqup",     "qqdn",     qqU, qqD },
         };
         for (const P &q : pairs) {
@@ -537,6 +575,15 @@ void apply_weights_and_systematics(TString SAMPLE = "both", TString GENERATOR = 
             variations.push_back({ q.name + "_down", SAMPLE, GENERATOR, TF_GENERATOR, q.label + " (#minus)", false,
                                    "nominal", q.sfD, q.name, q.sysLabel, true, false, q.svDn });
         }
+        // 2026-11-09 (Zoe): the JP HF swap "just as before but without symmetrising". Each SF takes
+        // its MEASURED swap curve (jpcalib_hf) instead of central +/- |swap - central|, so each part
+        // gives ONE signed shift per bin, no up/down: the SV part (SV_SF=jphf, UParT nominal) and the
+        // UParT part (SV nominal, SFUPART jpcalib_hf). sumGroup "jp_hf": the two shifts are ADDED
+        // with their signs into one JP HF entry (up OR down per bin); the parts are display only.
+        variations.push_back({ "jp_hf_sv",    SAMPLE, GENERATOR, TF_GENERATOR, "JP HF swap: SV SF part", false,
+                               "nominal", SFUPART_NOM, "", "JP HF swap", true, false, "jphf", "", "", "jp_hf" });
+        variations.push_back({ "jp_hf_upart", SAMPLE, GENERATOR, TF_GENERATOR, "JP HF swap: UParT SF part", false,
+                               "nominal", "jpcalib_hf", "", "JP HF swap", true, false, "", "", "", "jp_hf" });
         /* ---- disabled 2026-10-13 (kept for reference): the total SV SF as ONE pair ----
         variations.push_back({ "sv_sf_up",   SAMPLE, GENERATOR, TF_GENERATOR, "SV b SF (+1#sigma)", false,
                                "nominal", SFUPART_NOM, "sv_sf", "SV b scale factor", true, false, "up" });
@@ -548,13 +595,16 @@ void apply_weights_and_systematics(TString SAMPLE = "both", TString GENERATOR = 
     // ---- Track-BDT SF on/off systematics ---------------------------------------------
     // With no dedicated uncertainties, use the full correction as the uncertainty. SFb
     // and SFl are independent, while the in-SV and out-of-SV values move together.
+    // 2026-10-16 (Zoe): ONE-SIDED, like every source but tracking_eff -- in each bin the
+    // with - without shift goes only into the side it pushes the result towards, in
+    // quadrature with the others (symmetrise = false; Matt's first version had true).
     if (trackBdtSfTag() == "_trkbdtsf") {
         variations.push_back({ "track_bdt_sfb_off", SAMPLE, GENERATOR, TF_GENERATOR,
                                "Track-BDT SF_{b} off", false, "nominal", SFUPART_NOM,
-                               "", "Track-BDT SF_{b}", true, true, "", "boff" });
+                               "", "Track-BDT SF_{b}", true, /*symmetrise*/ false, "", "boff" });
         variations.push_back({ "track_bdt_sfl_off", SAMPLE, GENERATOR, TF_GENERATOR,
                                "Track-BDT SF_{l} off", false, "nominal", SFUPART_NOM,
-                               "", "Track-BDT SF_{l}", true, true, "", "loff" });
+                               "", "Track-BDT SF_{l}", true, /*symmetrise*/ false, "", "loff" });
     }
 
     // ---- Correction-level variations (no second unfolding; see the loop below) --------
@@ -686,6 +736,8 @@ void apply_weights_and_systematics(TString SAMPLE = "both", TString GENERATOR = 
     std::vector<bool> shift_in_band;
     // Parallel to h_shifts: true = |delta| into both sides (Variation::symmetrise).
     std::vector<bool> shift_symm;
+    // Parallel to h_shifts: Variation::sumGroup ("" = not a part of a summed source).
+    std::vector<TString> shift_sumgroups;
     // Particle-level MC curves, filled by the data-vs-gen plot below and written out with
     // the rest so the comparison can be redrawn from the final file alone.
     std::vector<TH1D *> h_gen_curves;
@@ -713,6 +765,10 @@ void apply_weights_and_systematics(TString SAMPLE = "both", TString GENERATOR = 
         if (v.svsfVariation.Length()) gSystem->Setenv("SV_SF", v.svsfVariation);
         if (v.trackBdtSfVariation.Length())
             gSystem->Setenv("TRACK_BDT_SF", v.trackBdtSfVariation);
+        const char *prior_env = std::getenv("UNFOLD_PRIOR");
+        const bool prior_had = (prior_env != nullptr);
+        const TString prior_prev = prior_had ? TString(prior_env) : TString("");
+        if (v.priorVariation.Length()) gSystem->Setenv("UNFOLD_PRIOR", v.priorVariation);
         const TString varFile =
             resultFile(v.sample, v.generator, test_mode, unfoldBayes, v.tfGenerator,
                        v.trackEffUnc, v.tfVariation, v.sfupartVariation, EEC_WEIGHT_OFF,
@@ -725,6 +781,10 @@ void apply_weights_and_systematics(TString SAMPLE = "both", TString GENERATOR = 
             if (trkbdt_had) gSystem->Setenv("TRACK_BDT_SF", trkbdt_prev);
             else            gSystem->Unsetenv("TRACK_BDT_SF");
         }
+        if (v.priorVariation.Length()) {
+            if (prior_had) gSystem->Setenv("UNFOLD_PRIOR", prior_prev);
+            else           gSystem->Unsetenv("UNFOLD_PRIOR");
+        }
         std::cout << "Variation '" << v.name << "' : " << varFile << std::endl;
 
         TH1D *h_var = loadWeighted(varFile, histname, "h_var_" + v.name, w);
@@ -736,6 +796,7 @@ void apply_weights_and_systematics(TString SAMPLE = "both", TString GENERATOR = 
                       << (v.svsfVariation.Length() ? "SV_SF=" + v.svsfVariation + " " : TString(""))
                       << (v.trackBdtSfVariation.Length()
                               ? "TRACK_BDT_SF=" + v.trackBdtSfVariation + " " : TString(""))
+                      << (v.priorVariation.Length() ? "UNFOLD_PRIOR=" + v.priorVariation + " " : TString(""))
                       << "apply_unfolding_2d.C(\"" << v.sample << "\",\""
                       << v.generator << "\"," << test_mode << "," << (unfoldBayes ? "true" : "false")
                       << ",false,\"" << v.tfGenerator << "\","
@@ -772,8 +833,59 @@ void apply_weights_and_systematics(TString SAMPLE = "both", TString GENERATOR = 
         shift_groups.push_back(v.group);
         shift_in_band.push_back(v.inBand);
         shift_symm.push_back(v.symmetrise);
+        shift_sumgroups.push_back(v.sumGroup);
         if (v.inBand) addTagLabel(v.sysLabel);
         else std::cout << "   -> display only, not in the band" << std::endl;
+    }
+
+    // ---- sumGroup: parts of one source, their signed shifts ADDED (2026-11-09, Zoe) ------
+    // One value per bin, up OR down by its sign, entered once. Only when every booked part
+    // was found: a partial sum would silently drop a part, so then nothing enters and it says so.
+    {
+        std::vector<TString> keys;
+        for (const Variation &v : variations)
+            if (v.sumGroup.Length() && std::find(keys.begin(), keys.end(), v.sumGroup) == keys.end())
+                keys.push_back(v.sumGroup);
+        for (const TString &key : keys) {
+            int booked = 0, found = 0;
+            for (const Variation &v : variations) if (v.sumGroup == key) ++booked;
+            for (const TString &s : shift_sumgroups) if (s == key) ++found;
+            if (found != booked) {
+                std::cerr << "ERROR: sum '" << key << "': " << found << " of " << booked
+                          << " parts found -- NOT in the band (skipped)" << std::endl;
+                for (size_t k = 0; k < shift_sumgroups.size(); ++k)
+                    if (shift_sumgroups[k] == key) shift_in_band[k] = false;
+                continue;
+            }
+            TH1D *h_sum = nullptr;
+            TString lbl;
+            for (size_t k = 0; k < shift_sumgroups.size(); ++k) {
+                if (shift_sumgroups[k] != key) continue;
+                if (!h_sum) { h_sum = (TH1D *) h_deltas[k]->Clone("h_delta_" + key); h_sum->SetDirectory(nullptr); }
+                else h_sum->Add(h_deltas[k]);
+                shift_in_band[k] = false;   // the part: shown, not counted
+                lbl = shift_syslabels[k];
+            }
+            TH1D *h_abs = (TH1D *) h_sum->Clone("h_syst_" + key);
+            TH1D *h_v   = (TH1D *) h_nom->Clone("h_var_" + key);   // variation = nominal - delta
+            h_abs->SetDirectory(nullptr); h_v->SetDirectory(nullptr);
+            for (int i = 1; i <= nbins; ++i) {
+                h_abs->SetBinContent(i, std::fabs(h_sum->GetBinContent(i)));
+                h_v->SetBinContent(i, h_nom->GetBinContent(i) - h_sum->GetBinContent(i));
+            }
+            h_shifts.push_back(h_abs);
+            h_deltas.push_back(h_sum);
+            h_vars.push_back(h_v);
+            shift_names.push_back(key);
+            shift_labels.push_back(lbl + " (sum)");
+            shift_syslabels.push_back(lbl);
+            shift_groups.push_back("");
+            shift_in_band.push_back(true);
+            shift_symm.push_back(false);
+            shift_sumgroups.push_back("");
+            addTagLabel(lbl);
+            std::cout << "Sum '" << key << "' : " << booked << " parts added with their signs, one entry" << std::endl;
+        }
     }
 
     // ---- Correction-level variations, evaluated on the final result -------------------
@@ -855,6 +967,7 @@ void apply_weights_and_systematics(TString SAMPLE = "both", TString GENERATOR = 
         shift_groups.push_back("");   // correction variations are independent sources
         shift_in_band.push_back(true);
         shift_symm.push_back(false);  // signed, like every source except tracking_eff
+        shift_sumgroups.push_back("");
         addTagLabel(cv.sysLabel);
     }
 
@@ -1237,10 +1350,14 @@ void apply_weights_and_systematics(TString SAMPLE = "both", TString GENERATOR = 
         }
         // The GROUPED view (Zoe, 2026-10-13): one bar per category, its sources added in
         // quadrature side by side. b tagging = every SV SF contribution (+ the UParT SF they
-        // move with, for dr); anything not listed keeps its own bar.
+        // move with, for dr); Reconstruction = the track-BDT SF_b and SF_l (Zoe, 2026-10-16);
+        // anything not listed keeps its own bar.
         auto category = [&](const TString &key) -> TString {
-            if (key.BeginsWith("sv_sf") || key == "jp_hf" || key == "qq_rate")
-                return (OBSERVABLE == "dr") ? "b tagging (UParT + SV SF)" : "b tagging (SV SF)";
+            // Light-jet mistagging belongs to b tagging too (Zoe, 2026-10-19); A carries the
+            // UParT SF as well since 2026-10-19.
+            if (key.BeginsWith("sv_sf") || key == "jp_hf" || key == "qq_rate" || key == "mistag_0B")
+                return "b tagging (UParT + SV SF)";
+            if (key.BeginsWith("track_bdt_sf")) return "Reconstruction";
             return "";
         };
         std::vector<BarSrc> bcat;
@@ -1257,15 +1374,18 @@ void apply_weights_and_systematics(TString SAMPLE = "both", TString GENERATOR = 
             }
         }
         // Display order (Zoe, 2026-10-13): b tagging, tracking efficiency, light-jet mistag,
-        // MC template modeling, detector response, then anything else. Stable, so the b-tag
+        // MC template modeling, detector response, then anything else. Reconstruction (the
+        // track-BDT SFs, 2026-10-16) right after b tagging. Stable, so the b-tag
         // contributions keep their booking order (stat, no muon, bb, JP HF, qq) in "detailed".
         auto rank = [&](const BarSrc &b) -> int {
             if (b.key.BeginsWith("sv_sf") || b.key == "jp_hf" || b.key == "qq_rate" || b.key.BeginsWith("b tagging")) return 0;
-            if (b.key == "tracking_eff")    return 1;
-            if (b.key == "mistag_0B")       return 2;
-            if (b.key == "template_fit")    return 3;
-            if (b.key == "unfolding_model") return 4;
-            return 5;
+            if (b.key.BeginsWith("track_bdt_sf") || b.key == "Reconstruction") return 1;
+            if (b.key == "tracking_eff")    return 2;
+            if (b.key == "mistag_0B")       return 3;
+            if (b.key == "template_fit")    return 4;
+            if (b.key == "unfolding_model") return 5;
+            if (b.key == "unfolding_prior") return 6;
+            return 7;
         };
         auto byRank = [&](const BarSrc &a, const BarSrc &b) { return rank(a) < rank(b); };
         std::stable_sort(bsrc.begin(), bsrc.end(), byRank);
@@ -1329,7 +1449,8 @@ void apply_weights_and_systematics(TString SAMPLE = "both", TString GENERATOR = 
             t.SetTextFont(52); t.SetTextSize(0.040); t.DrawLatex(0.20, 0.795, "Work In Progress");
             t.SetTextFont(42); t.SetTextSize(0.034);
             t.DrawLatex(0.20, 0.745, obs_title + ", 2B jets");
-            t.DrawLatex(0.20, 0.705, Form("p_{T}^{jet} > %g GeV, |#eta_{jet}| < 2", jtpt_binsVector[ibin_pt - 1]));
+            // t.DrawLatex(0.20, 0.705, Form("p_{T}^{jet} > %g GeV, |#eta_{jet}| < 2", jtpt_binsVector[ibin_pt - 1]));
+            t.DrawLatex(0.20, 0.705, Form("%s, |#eta_{jet}| < 2", jetPtRangeLabel(jtpt_binsVector[ibin_pt - 1], jtpt_binsVector[ibin_pt]).Data()));
             t.DrawLatex(0.20, 0.665, unfoldBayes ? "Bayesian unfolding" : "Matrix inversion");
             t.SetTextSize(0.034); t.DrawLatex(0.66, 0.945, "pp #sqrt{s} = 5.36 TeV");
             c_br->RedrawAxis();
@@ -2589,7 +2710,9 @@ void plot_final_generator_band(TString SAMPLE = "both", bool unfoldBayes = false
 void plot_unfolding_method_comparison(TString OBSERVABLE = "dr", int NITER = -1,
                                       TString SAMPLE = "both")
 {
-  if (NITER < 0) NITER = (OBSERVABLE == "dr") ? 14 : 29;   // refolding p >= 0.95 (data + MC stat), JEC inputs
+  // if (NITER < 0) NITER = (OBSERVABLE == "dr") ? 14 : 29;   // refolding p >= 0.95 (data + MC stat), JEC inputs
+  // if (NITER < 0) NITER = (OBSERVABLE == "dr") ? 19 : 94;   // 2026-10-26: CMS-SMP-22-007 rule (first p > 0.05, data stat)
+  if (NITER < 0) NITER = (OBSERVABLE == "dr") ? 36 : 188;  // 2026-10-26 evening: AN-2024-133 rule (first p >= 0.95, data stat)
   const bool    eecOff = nominalEecWeightOff(OBSERVABLE);
   const TString sfNom  = nominalSfupart(OBSERVABLE);
   auto bandFile = [&](bool bayes) -> TString {
@@ -2625,8 +2748,10 @@ void plot_unfolding_method_comparison(TString OBSERVABLE = "dr", int NITER = -1,
   struct Src { TString name, title; };
   const std::vector<Src> srcs = {
     { "template_fit",    "MC template modeling (Herwig fit)" },
-    { "unfolding_model", "Detector response (Herwig unfolding)" },
-    { "herwig_full",     "MC generator (full Herwig chain)" },
+    // { "unfolding_model", "Detector response (Herwig unfolding)" },   // until 2026-10-16
+    { "unfolding_model", "Detector response (Herwig resp.)" },
+    { "unfolding_prior", "Unfolding prior (Herwig prior)" },
+    // { "herwig_full",     "MC generator (full Herwig chain)" },       // off since 2026-10-01
     { "tracking_eff",    "Tracking efficiency" },
     { "mistag_0B_up",   "Light-jet mistag (0B #times 2 / #times 0)" },
     // { "sv_sf_up",       "SV b scale factor (#pm1#sigma)" },   // the one-pair version, off since 2026-10-13
@@ -2635,6 +2760,8 @@ void plot_unfolding_method_comparison(TString OBSERVABLE = "dr", int NITER = -1,
     { "sv_sf_bb_up",     "SV b SF: bb model" },
     { "jp_hf_up",        "JP HF swap" },
     { "qq_rate_up",      "qq rate" },
+    { "track_bdt_sfb_off", "Track-BDT SF_{b}" },   // 2026-10-19
+    { "track_bdt_sfl_off", "Track-BDT SF_{l}" },
   };
 
   // ---- printout ----
@@ -2769,8 +2896,10 @@ void plot_unfolding_method_comparison(TString OBSERVABLE = "dr", int NITER = -1,
 
   // ================= plot 2: uncertainty breakdown =================
   {
-    TCanvas *c = new TCanvas("c_meth_unc", "", 1600, 800);
-    c->Divide(4, 2, 0.002, 0.002);
+    // 5 x 3 (2026-10-19): the 4 x 2 grid held 7 panels and dropped every source after the 6th,
+    // the total included. 14 panels + the legend pad now.
+    TCanvas *c = new TCanvas("c_meth_unc", "", 2000, 1200);
+    c->Divide(5, 3, 0.002, 0.002);
     // Each panel: x = observable, y = shift of the result in % of that method's nominal.
     auto relShift = [&](TFile *f, TH1D *nom, const TString &name, const char *tag) -> TH1D * {
       TH1D *d = dynamic_cast<TH1D *>(f->Get("h_delta_" + name));
@@ -2826,8 +2955,8 @@ void plot_unfolding_method_comparison(TString OBSERVABLE = "dr", int NITER = -1,
         for (int i = 1; i <= nbins; ++i) amax = std::max(amax, std::fabs(h->GetBinContent(i)));
     amax = std::min(100., 1.2 * amax);
 
-    // Up to 7 panels; the last pad of the 4x2 grid holds the legend.
-    const size_t n_pan = std::min<size_t>(panels.size(), 7);
+    // Up to 14 panels; the last pad of the 5x3 grid holds the legend.
+    const size_t n_pan = std::min<size_t>(panels.size(), 14);
     for (size_t k = 0; k < n_pan; ++k) {
       c->cd(k + 1);
       gPad->SetMargin(0.17, 0.04, 0.15, 0.10); gPad->SetTicks(1, 1);
@@ -2847,7 +2976,7 @@ void plot_unfolding_method_comparison(TString OBSERVABLE = "dr", int NITER = -1,
       t.DrawLatex(0.20, 0.92, panels[k].title);
     }
     // Last pad: legend + labels.
-    c->cd(8);
+    c->cd(15);
     cmsLabel(0.08, 0.82, 0.08);
     TLatex t; t.SetNDC(); t.SetTextFont(42); t.SetTextSize(0.06);
     t.DrawLatex(0.08, 0.72, "pp #sqrt{s} = 5.36 TeV");

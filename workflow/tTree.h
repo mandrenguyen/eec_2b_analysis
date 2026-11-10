@@ -672,8 +672,11 @@ void tTree::Init(TString rootf, bool isMC, Int_t RunN)
      tree->SetBranchAddress("geny", geny, &b_geny);
      tree->SetBranchAddress("genphi", genphi, &b_genphi);
      if (tree->GetBranch("genm")) tree->SetBranchAddress("genm", genm, &b_genm);
-     tree->SetBranchAddress("gendphijt", gendphijt, &b_gendphijt);
-     tree->SetBranchAddress("gendrjt", gendrjt, &b_gendrjt);
+     // tree->SetBranchAddress("gendphijt", gendphijt, &b_gendphijt);   // until 2026-10-27
+     // tree->SetBranchAddress("gendrjt", gendrjt, &b_gendrjt);
+     // Absent from the _rho forests ("unknown branch" Error in every step-1 log) and read nowhere.
+     if (tree->GetBranch("gendphijt")) tree->SetBranchAddress("gendphijt", gendphijt, &b_gendphijt);
+     if (tree->GetBranch("gendrjt")) tree->SetBranchAddress("gendrjt", gendrjt, &b_gendrjt);
 
 
      tree->SetBranchAddress("jtNbHad", jtNbHad, &b_jtNbHad);

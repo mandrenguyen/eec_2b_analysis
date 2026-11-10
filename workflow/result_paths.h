@@ -123,7 +123,7 @@ inline TString svsfTag()
     if (v == "down")            return "_svsfdn";
     // The per-contribution variations (2026-10-13), tag "_svsf<name>" -- SvSF::modeNames().
     for (const char *c : {"statup", "statdn", "nomuonup", "nomuondn", "bbup", "bbdn",
-                          "jpup", "jpdn", "qqup", "qqdn"})
+                          "jpup", "jpdn", "qqup", "qqdn", "jphf"})   // jphf 2026-11-09
         if (v == c) return "_svsf" + v;
     warnUnknown("SV_SF", v, "off | nominal | up | down | stat|nomuon|bb|jp|qq + up|dn");
     return kUnknownTag();
@@ -142,6 +142,67 @@ inline TString trackBdtSfTag()
     if (v == "loff")    return "_trkbdtsf_loff";
     warnUnknown("TRACK_BDT_SF", v, "off | nominal | boff | loff");
     return kUnknownTag();
+}
+
+// UNFOLD_PRIOR (added 2026-10-16): the generator whose particle-level truth the Bayesian
+// unfolding starts from, when it is not the unfolding (response) generator's own. Unset = the
+// response's own truth, tag "". "pythia" / "herwig" -> "_prior<gen>": apply_unfolding_2d.C
+// reweights each truth column of the response to that generator's truth (same migrations and
+// efficiencies, different prior). Matrix inversion does not depend on it.
+inline TString priorTag()
+{
+    const char *env = std::getenv("UNFOLD_PRIOR");
+    const TString v = (env && *env) ? TString(env) : TString("");
+    if (v == "") return "";
+    if (v == "pythia" || v == "herwig") return "_prior" + v;
+    warnUnknown("UNFOLD_PRIOR", v, "unset | pythia | herwig");
+    return kUnknownTag();
+}
+
+// TF_SAMPLE (diagnostic, added 2026-10-24): take the template fit of this SAMPLE whatever the
+// response sample is (templateFitFile() in apply_unfolding_2d.C). Unset = the response's own fit,
+// tag "". Tagged since 2026-10-26: untagged, a TF_SAMPLE run wrote over the nominal result.
+inline TString tfSampleTag()
+{
+    const char *env = std::getenv("TF_SAMPLE");
+    const TString v = (env && *env) ? TString(env) : TString("");
+    if (v == "") return "";
+    if (v == "qcd" || v == "both") return "_tfsample" + v;
+    warnUnknown("TF_SAMPLE", v, "unset | qcd | both");
+    return kUnknownTag();
+}
+
+// TF_METHOD (added 2026-10-27): which template fit supplies the signal fraction. Unset = the
+// RooFit fits (the directories the chain has always read); chi2scan = template_fit.cpp's
+// AN-2025/114 chi2 scan, written to "<fit dir>_chi2scan" (templateFitFile() in
+// apply_unfolding_2d.C). Tagged, so a chi2scan run never lands on the RooFit result.
+inline TString tfMethodTag()
+{
+    const char *env = std::getenv("TF_METHOD");
+    const TString v = (env && *env) ? TString(env) : TString("");
+    if (v == "") return "";
+    if (v == "chi2scan") return "_tfchi2scan";
+    warnUnknown("TF_METHOD", v, "unset | chi2scan");
+    return kUnknownTag();
+}
+
+// SFUPART_SMOOTH (added 2026-10-30, A only): replace the A-binned UParT SF -- and whatever curve a
+// variation makes of it (JP HF +/- syst, qq rate, stat) -- by a straight-line fit in A over its 5
+// bins (apply_unfolding_2d.C). The measured SF zigzags bin to bin (0.888/0.946/0.898/0.918/0.962,
+// per-bin SF fits chi2/ndf 7-30), and the A unfolding amplifies neighbour differences ~5x: the
+// JP HF swap was the largest A systematic. Unset = the per-bin SF, tag "". dr is never touched.
+inline TString sfupartSmooth()
+{
+    const char *env = std::getenv("SFUPART_SMOOTH");
+    const TString v = (env && *env) ? TString(env) : TString("");
+    if (v == "" || v == "line") return v;
+    warnUnknown("SFUPART_SMOOTH", v, "unset | line");
+    return kUnknownTag();
+}
+inline TString sfupartSmoothTag(const TString &observable)
+{
+    if (observable != "B" || sfupartSmooth() == "") return "";
+    return sfupartSmooth() == "line" ? TString("_sfupartline") : kUnknownTag();
 }
 
 // TF_VARIATION: the template-fit variation supplying the signal fraction.
@@ -178,8 +239,14 @@ inline TString sfupartVarTag(const TString &sfupartVariation)
 }
 
 // ---- The UParT scale factor itself ---------------------------------------------------
-inline TString sfupartFile()
+// 2026-10-19: one file per observable -- A (internal name B) has its own UParT SF measured in reco
+// A bins (lifetime_jp_sfb_agg_B_wp712_finalbins_systematics.root, 5 bins 0.5-1.0 = the analysis
+// binning; same keys as the dr file with "_B_" for "_dr_").
+inline TString sfupartFile(const TString &observable = "dr")
 {
+    if (observable == "B")
+        return "/home/llr/cms/zaidan/analysis_lise/eec_2b_analysis/workflow/"
+               "lifetime_jp_sfb_agg_B_wp712_finalbins_systematics.root";
     // "finalbins": source bins 8-9 merged into one output bin, so this file has 8 dr bins
     // against the analysis's 9. Its last bin spans 0.35-0.45 and therefore applies to BOTH
     // of the analysis's last two bins -- the application maps by bin centre so that happens
@@ -194,8 +261,9 @@ inline TString sfupartFile()
 // (key "h_SFb_dr_central" holds a histogram named "h_SFb_dr_wp712_eec_central"), and
 // TFile::Get() takes the key -- the internal name returns null.
 // "off" returns the marker "(none)": no SF is applied, the caller checks for it.
-inline TString sfupartHist(const TString &sfupartVariation)
+inline TString sfupartHist(const TString &sfupartVariation, const TString &observable = "dr")
 {
+    const TString o = "h_SFb_" + observable + "_";   // key prefix of that observable's file
     if (!isKnownSfupartVariation(sfupartVariation)) {
         warnUnknown("SFUPART_VARIATION", sfupartVariation,
                     "nominal | off | jpcalib_hf | qqrate_up | qqrate_down | statup | statdn "
@@ -214,10 +282,10 @@ inline TString sfupartHist(const TString &sfupartVariation)
      || sfupartVariation == "statup"
      || sfupartVariation == "statdn"
      || sfupartVariation == "jpsyst_up"
-     || sfupartVariation == "jpsyst_dn")   return "h_SFb_dr_central";
-    if (sfupartVariation == "jpcalib_hf")  return "h_SFb_dr_jpcalib_hf";
-    if (sfupartVariation == "qqrate_up")   return "h_SFb_dr_qqrate_up";
-    if (sfupartVariation == "qqrate_down") return "h_SFb_dr_qqrate_down";
+     || sfupartVariation == "jpsyst_dn")   return o + "central";
+    if (sfupartVariation == "jpcalib_hf")  return o + "jpcalib_hf";
+    if (sfupartVariation == "qqrate_up")   return o + "qqrate_up";
+    if (sfupartVariation == "qqrate_down") return o + "qqrate_down";
     return "";
 }
 
@@ -228,10 +296,10 @@ inline TString sfupartHist(const TString &sfupartVariation)
 // h_SFb_dr_syst_jpcalib_hf is |h_SFb_dr_jpcalib_hf - h_SFb_dr_central| bin by bin (checked
 // 2026-09-14, all 8 bins). That is why this is NOT a duplicate of jpcalib_hf: the same
 // magnitudes are applied with one coherent sign instead of the measured, sign-flipping one.
-inline TString sfupartSystHist(const TString &sfupartVariation)
+inline TString sfupartSystHist(const TString &sfupartVariation, const TString &observable = "dr")
 {
     if (sfupartVariation == "jpsyst_up" || sfupartVariation == "jpsyst_dn")
-        return "h_SFb_dr_syst_jpcalib_hf";
+        return "h_SFb_" + observable + "_syst_jpcalib_hf";
     return "";
 }
 
@@ -333,14 +401,98 @@ inline bool jecInputs() { return true; }
 // the _upartv2rhojec results (no veto), which are untouched.
 inline bool vetoInputs() { return true; }
 
+// ---- Aggregation NN (added 2026-10-22) ----------------------------------------------------
+// true = read the productions made with AGG_NN=on (agg_nn.h: the observables -- dR, A, the EEC
+// weight, mB -- from the aggregation NN's two B candidates; selection and SV SF nominal), tagged
+// "vetonn" at every level, so the NN chain and the nominal (BDT + 2SV) chain sit side by side.
+// Only on top of the veto era. Follows the SAME environment variable as step 1 (AGG_NN = on|off,
+// default off), so a production and its readers can never disagree; unset = the nominal chain.
+// DISABLED 2026-10-22 (Zoe): NN commented out, every reader is on the nominal (BDT + 2SV) chain.
+inline bool aggnnInputs()
+{
+    // 2026-10-24: AGG_NN_READ=on lets a READER (e.g. plot_svsf_comparison.C kind "nn") open the
+    // 22 Oct NN-chain results. Productions stay refused (AggNN::enabled() in agg_nn.h).
+    { const char *r = std::getenv("AGG_NN_READ"); if (r && TString(r) == "on") return true; }
+    return false;
+    // const char *e = std::getenv("AGG_NN");
+    // return e && TString(e) == "on";
+}
+
+// ---- Real b-enriched Pythia (added 2026-10-22, two flavours 2026-10-23) --------------------
+// Until 10-23 Matt's "bJet" Pythia _rho chunks were a copy of QCD (every event of all 8 blocks),
+// so Pythia "both" was QCD twice; every _upartv2rhojec* result on disk is that. On 10-23 Matt
+// replaced them, same names, with the real QCD_BEnriched_pThat-15to500 _rho production (task
+// 261022_162002, 9 blocks). The benr eras are the chains made from those, kept apart by tag:
+//   BENR=jec    "_upartv2rhojecvetobenr"  L1L2 JEC on (with rho), veto, SV SF -- the nominal recipe
+//   BENR=nojec  "_upartv2vetobenr"        JEC OFF everywhere, data included (rho unused)
+// (no "jec" in the second: the run scripts refuse one without APPLY_JEC). Overrides
+// jecInputs()/vetoInputs().
+// 2026-10-26 (Zoe: "the qcd copy should not be there"): unset BENR = "jec", the nominal. Until
+// then unset meant the old chain whose bJet Pythia was a QCD copy; that era is no longer reachable
+// (eraTag() below), its results stay on disk and in final_results/archive_20261023_bjet_QCD_copy.
+inline TString benrMode()
+{
+    const char *e = std::getenv("BENR");
+    return (e && *e) ? TString(e) : TString("jec");
+    // return e ? TString(e) : TString("");   // before 2026-10-26: unset = the QCD-copy chain
+}
+inline bool benrInputs() { return benrMode() == "jec" || benrMode() == "nojec"; }
+
 // "_upartv2rho" in the rho era, "_upartv2" before it, "_upartv2rhojec" with the JEC,
-// "_upartv2rhojecveto" with the JEC and the jet veto map. Ends every production name, every
-// template-fit directory and every result folder.
+// "_upartv2rhojecveto" with the JEC and the jet veto map, "_upartv2rhojecvetonn" with the
+// aggregation NN on top, "_upartv2rhojecvetobenr" / "_upartv2vetobenr" for the real b-enriched
+// chains with / without the JEC. Ends every production name, every template-fit directory and
+// every result folder.
+// JET_PT_MAX (2026-10-29): the hard upper jet-pT cut of step 1 is part of the era, so a cut chain
+// never reads or overwrites the open-ended one. Unset = "" (every existing name unchanged).
+inline TString ptMaxTag()
+{
+    const char *e = std::getenv("JET_PT_MAX");
+    if (!e || !*e) return "";
+    return TString::Format("ptmax%g", std::atof(e));
+}
+// DR_MIN (2026-10-30): the lower dR cut of step 1 (binning_histos_small.h), same idea. "drmin0p05" for
+// 0.05 -- no "." in the names. Unset = "".
+inline TString drMinTag()
+{
+    const char *e = std::getenv("DR_MIN");
+    if (!e || !*e) return "";
+    TString v = TString::Format("%g", std::atof(e));
+    v.ReplaceAll(".", "p");
+    return "drmin" + v;
+}
+// SV_SEED=on (2026-11-05, Zoe): an SV with >= 1 track passing the BDT keeps ALL its tracks, also those
+// failing it (makeSvtxs_withBDT, data and MC). Same idea: part of the era. Unset = "". A test so far: the
+// track-BDT, SV and UParT scale factors are the ones derived with the nominal selection.
+inline bool svSeedOn() { const char *e = std::getenv("SV_SEED"); return e && TString(e) == "on"; }
+// inline TString svSeedTag() { return svSeedOn() ? "svseed" : ""; }   // until 2026-11-06
+// SV_SEED_M2B=nominal (2026-11-06): + the fit's m2B from the plain BDT selection, for both observables -> "svseednm".
+inline TString svSeedTag()
+{
+    if (!svSeedOn()) return "";
+    const char *e = std::getenv("SV_SEED_M2B");
+    return (e && TString(e) == "nominal") ? "svseednm" : "svseed";
+}
+
 inline TString eraTag()
 {
+    // if (benrMode() == "jec")   return TString("_upartv2rhojecvetobenr");   // until 2026-10-29
+    // if (benrMode() == "nojec") return TString("_upartv2vetobenr");
+    // if (benrMode() == "jec")   return TString("_upartv2rhojecvetobenr") + ptMaxTag();   // until 2026-10-30
+    // if (benrMode() == "nojec") return TString("_upartv2vetobenr") + ptMaxTag();
+    // if (benrMode() == "jec")   return TString("_upartv2rhojecvetobenr") + ptMaxTag() + drMinTag();   // until 2026-11-05
+    // if (benrMode() == "nojec") return TString("_upartv2vetobenr") + ptMaxTag() + drMinTag();
+    if (benrMode() == "jec")   return TString("_upartv2rhojecvetobenr") + ptMaxTag() + drMinTag() + svSeedTag();
+    if (benrMode() == "nojec") return TString("_upartv2vetobenr") + ptMaxTag() + drMinTag() + svSeedTag();
+    warnUnknown("BENR", benrMode(), "jec | nojec (unset = jec)");
+    return kUnknownTag();   // never one of the QCD-copy eras below
+    /* ---- disabled 2026-10-26 (kept for reference): the eras before the real b-enriched sample,
+       whose bJet Pythia was a copy of QCD (_upartv2rho*, incl. the 22 Oct NN chain) ----
     if (!rhoInputs()) return TString("_upartv2");
     if (!jecInputs()) return TString("_upartv2rho");
+    if (vetoInputs() && aggnnInputs()) return TString("_upartv2rhojecvetonn");
     return vetoInputs() ? TString("_upartv2rhojecveto") : TString("_upartv2rhojec");
+    ---- end disabled ---- */
 }
 
 inline TString obsProdTag(const TString &observable)
@@ -404,7 +556,10 @@ inline TString dataTemplateFile(bool eecWeightOff, const TString &observable = "
 // covered by it if one of them comes back: the SF exists in reco dR and nowhere else.
 inline TString nominalSfupart(const TString &observable)
 {
-    return (observable == "dr") ? TString("nominal") : TString("off");
+    // return (observable == "dr") ? TString("nominal") : TString("off");   // until 2026-10-19
+    // 2026-10-19 (Zoe): A has its own UParT SF now (sfupartFile("B")), applied in the nominal.
+    (void) observable;
+    return "nominal";
 }
 
 // The momentum balance is a YIELD measurement: B is measured with the (pt1*pt2)^n EEC weight
@@ -427,9 +582,12 @@ inline TString variationTag(const TString &tfGenerator, bool trackEffUnc,
                             bool eecWeightOff = false,
                             const TString &observable = "dr")
 {
-    return observableTag(observable) + tfTag(tfGenerator) + trkTag(trackEffUnc) + svsfTag()
-         + trackBdtSfTag()
-         + tfVarTag(tfVariation) + sfupartVarTag(sfupartVariation)
+    // return observableTag(observable) + tfTag(tfGenerator) + trkTag(trackEffUnc) + svsfTag()
+    //      + trackBdtSfTag() + priorTag()   // until 2026-10-26: TF_SAMPLE untagged
+    // return observableTag(observable) + tfTag(tfGenerator) + tfSampleTag() + trkTag(trackEffUnc)   // until 2026-10-27: no TF_METHOD
+    return observableTag(observable) + tfTag(tfGenerator) + tfSampleTag() + tfMethodTag() + trkTag(trackEffUnc)
+         + svsfTag() + trackBdtSfTag() + priorTag()
+         + tfVarTag(tfVariation) + sfupartVarTag(sfupartVariation) + sfupartSmoothTag(observable)
          + eecWeightTag(eecWeightOff);
 }
 

@@ -22,6 +22,18 @@ root -l -b -q -e ".L create_files_for_template_fit.cpp++"   # compile the .so on
 
 ## ⚠️ Recent changes — read before running anything
 
+### 2026-10-01 — jet energy corrections, whole chain re-run
+
+- **JEC in step 1.** `create_files_for_template_fit.cpp` can recompute `jtpt` from `rawpt` with the 2024 pp-reference JEC (L1FastJet + L2Relative on MC and data, + L2Residual on data), exactly as Matt's `*_JEC_Prompt24HIpp` productions do — checked jet by jet, identical. Switched by the new last argument `apply_jec` (default off) and by `APPLY_JEC=true` in both run scripts, which then require an `OUT_TAG` containing `jec`. The correction files come from the `Run3HeavyIonJetCalibrations` submodule (`git submodule update --init` if it is empty).
+- **Everything re-produced with it** as `_upartv2rhojec` / `_upartv2rhojec_B` (drivers: `condor/run_rhojec_production.sh`, `condor/run_rhojec_analysis.sh` on `/data_CMS`). `jecInputs()` in `result_paths.h` is **on**, so every macro reads the JEC results; set it false to read the uncorrected `_upartv2rho` ones, which are untouched.
+
+### 2026-09-28 — both observables re-produced on the `_rho` inputs
+
+- **Input era.** Marc's chunks are now `merged_block_*_UParTV2_rho.root` (the old ones are gone). EEC(ΔR) and dN/dB are both re-produced on them, so they come from the same MC. The switch is `rhoInputs()` in `result_paths.h`, and everything carries `eraTag()` = `_upartv2rho`: the productions (`OUT_TAG=upartv2rho` for ΔR, `upartv2rho_B` for B), the template-fit directories and the result folders. The pre-`_rho` results are untouched; set `rhoInputs()` to false to read them. ΔR data is now our own `_upartv2rho` production (no longer Afnan's).
+- **Run scripts.** Both read `INPUT_SUFFIX` (default `_rho`). `SKIP_COMPILE=true ./run_agg_ntuple_chunks.sh` reuses the built `.so`, so several productions (and the data jobs) can run at once. Data job scripts go in one directory per production; submit with the `condor_submit condor.submit -append 'Executable = …'` line the script prints.
+- **Same band on both.** In the rho era the ΔR band books exactly B's four sources: MC template modelling, detector response, tracking efficiency and the light-jet mistag pair. UParT SF and EEC-weight modelling are out of the ΔR band. The UParT SF *correction* is still applied to the ΔR nominal.
+- **Labels.** Every plot says **CMS Work In Progress**, MC-only plots included. The pre-fit first-look plots (1–4) now carry the header too.
+
 ### 2026-09-25 — fewer files
 
 The two readmes (this file and `workflow/readme_workflow.md`) are now this one file.

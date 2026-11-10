@@ -2117,9 +2117,31 @@ void Build_templates(const AnalysisConfig& cfg, bool isMakeTemplates = true, boo
             if (!(t.jtpt[ijet] > 0) || !std::isfinite(t.jtpt[ijet])) continue;
             const int igen = genMatch[ijet];
             const double genPt = igen >= 0 ? t.genpt[igen] : -1.0;
-            const double smearedPt = jerSmearer->SmearedPt(
+            JetSmearing::Result smear = jerSmearer->Smear(
                 t.jtpt[ijet], t.jteta[ijet], eventRho, genPt,
                 static_cast<std::int64_t>(t.evt), JerSyst::variation());
+            // Correlate the stochastic JER draw across JES variations.  The
+            // correctionlib-compatible default hashes reco pT into the random
+            // seed, so shifting JES would otherwise give the same jet a new
+            // Gaussian draw.  Event number and reco-jet index are stable under
+            // these variations and distinguish jets within an event.
+            if (!smear.matched) {
+              const std::uint64_t eventKey = static_cast<std::uint64_t>(t.evt);
+              const std::uint64_t jetKey =
+                  (static_cast<std::uint64_t>(ijet) + 1ULL)
+                  * 0x9e3779b97f4a7c15ULL;
+              const std::int64_t stableSeed =
+                  static_cast<std::int64_t>(eventKey ^ jetKey
+                                            ^ 0x4a45525f32303234ULL);
+              const double gaussian =
+                  JetSmearing::HashNormal(0.0, 0.0, 0.0, stableSeed);
+              const double variance =
+                  std::max(smear.scaleFactor * smear.scaleFactor - 1.0, 0.0);
+              smear.smearFactor =
+                  1.0 + smear.resolution * std::sqrt(variance) * gaussian;
+            }
+            const double smearedPt =
+                JetSmearing::SmearedPt(t.jtpt[ijet], smear.smearFactor);
             t.jtpt[ijet] = std::isfinite(smearedPt) && smearedPt > 0
                                ? smearedPt : -999.0f;
           }

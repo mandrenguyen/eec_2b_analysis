@@ -22,6 +22,43 @@ root -l -b -q -e ".L create_files_for_template_fit.cpp++"   # compile the .so on
 
 ## ⚠️ Recent changes — read before running anything
 
+### 2026-11-10 — JES and hybrid JER variations
+
+- **MC only.** Data stay fixed. Reconstructed MC jets can be shifted with
+  `JES_VARIATION=up|down`, or smeared with the hybrid JER method using
+  `JER_VARIATION=nominal|up|down`. Generator jets are never changed.
+- **JER inputs.** The MC resolution was derived from corrected, matched QCD jets with
+  `workflow/derive_jer_resolution.cpp`. The JER scale factors are 1.10 nominal, 1.15 up,
+  and 1.05 down. The payloads live in `workflow/calibrations/`.
+- **Independent nuisances.** A JES-up/down production keeps JER nominal; a JER-up/down
+  production keeps JES nominal. The script and C++ macro reject simultaneous JES and JER
+  uncertainty shifts. `JER_VARIATION=off` reproduces the historical unsmeared MC.
+- **Both MC components are required.** Run every configuration once with `SAMPLE=qcd` and
+  once with `SAMPLE=bjet`. The b-enriched tag must contain `benr`. Data are not re-run.
+
+Run the following configurations one at a time with `APPLY_JEC=true` and
+`APPLY_JETVETO=true`:
+
+| result | `JES_VARIATION` | `JER_VARIATION` | QCD `OUT_TAG` | b-enriched `OUT_TAG` |
+|---|---|---|---|---|
+| nominal | `nominal` | `nominal` | `upartv2rhojecveto_jernominal` | `upartv2rhojecvetobenr_jernominal` |
+| JES up | `up` | `nominal` | `upartv2rhojecveto_jesup_jernominal` | `upartv2rhojecvetobenr_jesup_jernominal` |
+| JES down | `down` | `nominal` | `upartv2rhojecveto_jesdown_jernominal` | `upartv2rhojecvetobenr_jesdown_jernominal` |
+| JER up | `nominal` | `up` | `upartv2rhojecveto_jerup` | `upartv2rhojecvetobenr_jerup` |
+| JER down | `nominal` | `down` | `upartv2rhojecveto_jerdown` | `upartv2rhojecvetobenr_jerdown` |
+
+For each row, run QCD and then b-enriched, substituting the values from the table:
+
+```bash
+SAMPLE=qcd GENERATOR=pythia APPLY_JEC=true APPLY_JETVETO=true \
+  JES_VARIATION=<jes> JER_VARIATION=<jer> OUT_TAG=<qcd-tag> \
+  ./run_agg_ntuple_chunks.sh
+
+SAMPLE=bjet GENERATOR=pythia APPLY_JEC=true APPLY_JETVETO=true \
+  JES_VARIATION=<jes> JER_VARIATION=<jer> OUT_TAG=<bjet-tag> \
+  SKIP_COMPILE=true ./run_agg_ntuple_chunks.sh
+```
+
 ### 2026-10-01 — jet energy corrections, whole chain re-run
 
 - **JEC in step 1.** `create_files_for_template_fit.cpp` can recompute `jtpt` from `rawpt` with the 2024 pp-reference JEC (L1FastJet + L2Relative on MC and data, + L2Residual on data), exactly as Matt's `*_JEC_Prompt24HIpp` productions do — checked jet by jet, identical. Switched by the new last argument `apply_jec` (default off) and by `APPLY_JEC=true` in both run scripts, which then require an `OUT_TAG` containing `jec`. The correction files come from the `Run3HeavyIonJetCalibrations` submodule (`git submodule update --init` if it is empty).
